@@ -184,13 +184,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let team = config.resolve_team(team.as_deref())?;
             let client = EsaClient::from_env()?;
             let post = client.get_post(team, number).await?;
-            if post.wip {
-                println!("[WIP] {}", post.full_name);
-            } else {
-                println!("{}", post.full_name);
-            }
-            println!("{}", post.url);
             println!("---");
+            println!("title: \"{}\"", post.full_name.replace('"', "\\\""));
+            if let Some(ref cat) = post.category {
+                if !cat.is_empty() {
+                    println!("category: \"{}\"", cat.replace('"', "\\\""));
+                }
+            }
+            if !post.tags.is_empty() {
+                let tags: Vec<String> = post.tags.iter().map(|t| format!("\"{}\"", t.replace('"', "\\\""))).collect();
+                println!("tags: [{}]", tags.join(", "));
+            }
+            println!("author: \"@{}\"", post.created_by.screen_name);
+            if post.updated_by.screen_name != post.created_by.screen_name {
+                println!("updated_by: \"@{}\"", post.updated_by.screen_name);
+            }
+            println!("updated_at: \"{}\"", post.updated_at);
+            if post.wip {
+                println!("wip: true");
+            }
+            println!("number: {}", post.number);
+            println!("url: {}", post.url);
+            println!("---");
+            println!();
             println!("{}", post.body_md.as_deref().unwrap_or("(empty)"));
         }
         Command::Create {
