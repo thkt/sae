@@ -1,0 +1,133 @@
+use rusqlite::Connection;
+
+use super::StorageError;
+
+pub fn add_embeddings(
+    conn: &Connection,
+    embeddings: &[(i64, Vec<f32>)],
+) -> Result<u32, StorageError> {
+    let tx = conn.unchecked_transaction().map_err(super::StorageError::Db)?;
+    let mut count = 0u32;
+    for (chunk_id, embedding) in embeddings {
+        let exists: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM vec_chunks WHERE chunk_id = ?1)",
+            [chunk_id],
+            |row| row.get(0),
+        )?;
+        if exists {
+            continue;
+        }
+        let bytes: &[u8] = bytemuck::cast_slice(embedding);
+        tx.execute(
+            "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
+            rusqlite::params![chunk_id, bytes],
+        )?;
+        count += 1;
+    }
+    tx.commit().map_err(super::StorageError::Db)?;
+    Ok(count)
+}
+
+pub fn get_unembedded_chunks(
+    conn: &Connection,
+    limit: u32,
+) -> Result<Vec<(i64, String)>, StorageError> {
+    let mut stmt = conn.prepare(
+        "SELECT c.id, c.content FROM chunks c \
+         LEFT JOIN vec_chunks v ON c.id = v.chunk_id \
+         WHERE v.chunk_id IS NULL \
+         LIMIT ?1",
+    )?;
+    let rows: Vec<(i64, String)> = stmt
+        .query_map([limit], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn has_embeddings(conn: &Connection) -> bool {
+    conn.query_row("SELECT EXISTS(SELECT 1 FROM vec_chunks)", [], |row| {
+        row.get(0)
+    })
+    .unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embedder::EMBEDDING_DIMS;
+    use crate::storage::Db;
+
+    fn make_embedding(val: f32) -> Vec<f32> {
+        vec![val; EMBEDDING_DIMS]
+    }
+
+    #[test]
+    fn add_and_query_embeddings() {
+        let db = Db::open_memory().unwrap();
+
+        crate::storage::upsert_post(
+            db.conn(),
+            &crate::storage::EsaPostRow {
+                number: 1,
+                name: "Test".into(),
+                full_name: "dev/Test".into(),
+                body_md: "# Hello\nWorld".into(),
+                category: None,
+                tags: "[]".into(),
+                wip: false,
+                kind: "stock".into(),
+                url: "https://example.esa.io/posts/1".into(),
+                created_at: "2025-01-01T00:00:00+09:00".into(),
+                updated_at: "2025-01-01T00:00:00+09:00".into(),
+                created_by: "alice".into(),
+                updated_by: "alice".into(),
+                revision_number: 1,
+            },
+        )
+        .unwrap();
+        crate::storage::rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
+
+        let unembedded = get_unembedded_chunks(db.conn(), 100).unwrap();
+        assert_eq!(unembedded.len(), 1);
+
+        let emb = vec![(unembedded[0].0, make_embedding(0.5))];
+        let added = add_embeddings(db.conn(), &emb).unwrap();
+        assert_eq!(added, 1);
+
+        assert!(get_unembedded_chunks(db.conn(), 100).unwrap().is_empty());
+        assert!(has_embeddings(db.conn()));
+    }
+
+    #[test]
+    fn skip_already_embedded() {
+        let db = Db::open_memory().unwrap();
+        crate::storage::upsert_post(
+            db.conn(),
+            &crate::storage::EsaPostRow {
+                number: 1,
+                name: "T".into(),
+                full_name: "T".into(),
+                body_md: "# A\nB".into(),
+                category: None,
+                tags: "[]".into(),
+                wip: false,
+                kind: "stock".into(),
+                url: "u".into(),
+                created_at: "t".into(),
+                updated_at: "t".into(),
+                created_by: "a".into(),
+                updated_by: "a".into(),
+                revision_number: 1,
+            },
+        )
+        .unwrap();
+        crate::storage::rechunk_post(db.conn(), 1, "# A\nB").unwrap();
+
+        let chunks = get_unembedded_chunks(db.conn(), 100).unwrap();
+        let emb = vec![(chunks[0].0, make_embedding(1.0))];
+        add_embeddings(db.conn(), &emb).unwrap();
+
+        let added = add_embeddings(db.conn(), &emb).unwrap();
+        assert_eq!(added, 0);
+    }
+}
