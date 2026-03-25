@@ -17,7 +17,7 @@ pub fn add_embeddings(
         if exists {
             continue;
         }
-        let bytes: &[u8] = bytemuck::cast_slice(embedding);
+        let bytes: &[u8] = rurico::storage::f32_as_bytes(embedding);
         tx.execute(
             "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?1, ?2)",
             rusqlite::params![chunk_id, bytes],
@@ -54,11 +54,11 @@ pub fn has_embeddings(conn: &Connection) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::embedder::EMBEDDING_DIMS;
+    use rurico::embed::EMBEDDING_DIMS;
     use crate::storage::Db;
 
     fn make_embedding(val: f32) -> Vec<f32> {
-        vec![val; EMBEDDING_DIMS]
+        vec![val; EMBEDDING_DIMS as usize]
     }
 
     #[test]

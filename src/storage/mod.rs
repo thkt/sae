@@ -6,15 +6,11 @@ pub use search::{hybrid_search, SearchResult};
 pub use types::*;
 
 use std::path::Path;
-use std::sync::OnceLock;
 
 use rusqlite::Connection;
 use tracing::warn;
 
-use crate::embedder::EMBEDDING_DIMS;
-
-#[cfg(not(target_endian = "little"))]
-compile_error!("sae requires little-endian for f32<->u8 embedding storage");
+use rurico::embed::EMBEDDING_DIMS;
 
 const SCHEMA_VERSION: &str = "3";
 
@@ -66,26 +62,7 @@ pub struct Db {
 }
 
 fn ensure_sqlite_vec() -> Result<(), StorageError> {
-    static INIT: OnceLock<Result<(), i32>> = OnceLock::new();
-    let result = INIT.get_or_init(|| {
-        let rc = unsafe {
-            rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute::<
-                unsafe extern "C" fn(),
-                unsafe extern "C" fn(
-                    *mut rusqlite::ffi::sqlite3,
-                    *mut *mut std::os::raw::c_char,
-                    *const rusqlite::ffi::sqlite3_api_routines,
-                ) -> std::os::raw::c_int,
-            >(sqlite_vec::sqlite3_vec_init)))
-        };
-        if rc == 0 { Ok(()) } else { Err(rc) }
-    });
-    if let Err(rc) = result {
-        return Err(StorageError::Open(format!(
-            "sqlite-vec extension failed (rc={rc})"
-        )));
-    }
-    Ok(())
+    rurico::storage::ensure_sqlite_vec().map_err(StorageError::Open)
 }
 
 impl Db {

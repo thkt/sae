@@ -1,9 +1,7 @@
 use clap::{Parser, Subcommand};
+use rurico::embed::{Embed, Embedder};
 use sae::client::EsaClient;
 use sae::config::Config;
-use sae::embedder::{Embed, Embedder, ModelPaths};
-
-const HF_REPO: &str = "cl-nagoya/ruri-v3-310m";
 
 #[derive(Parser)]
 #[command(name = "sae", about = "esa semantic search CLI")]
@@ -145,8 +143,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 std::process::exit(1);
             }
             let db = sae::storage::Db::open(&db_path)?;
-            let mut embedder = try_load_embedder();
-            let query_embedding = embedder.as_mut().and_then(|e| {
+            let embedder = try_load_embedder();
+            let query_embedding = embedder.as_ref().and_then(|e| {
                 match e.embed_query(&query) {
                     Ok(v) => Some(v),
                     Err(e) => {
@@ -258,14 +256,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let db = sae::storage::Db::open(&db_path)?;
 
             eprintln!("Checking model...");
-            let paths = ensure_model()?;
-            let mut embedder = Embedder::new(&paths)
+            let paths = rurico::embed::download_model()
+                .map_err(|e| format!("Failed to download model: {e}"))?;
+            let embedder = Embedder::new(&paths)
                 .map_err(|e| format!("Failed to load model: {e}"))?;
             eprintln!("Model ready");
 
             const BATCH_SIZE: u32 = 500;
             let mut total_added = 0u32;
-            let mut total_failed = 0u32;
             let mut done = 0u32;
             loop {
                 let batch = sae::storage::get_unembedded_chunks(db.conn(), BATCH_SIZE)?;
@@ -275,30 +273,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if done == 0 {
                     eprintln!("Embedding chunks...");
                 }
-                let mut embeddings = Vec::with_capacity(batch.len());
-                for (chunk_id, content) in &batch {
-                    match embedder.embed_document(content) {
-                        Ok(embedding) => embeddings.push((*chunk_id, embedding)),
-                        Err(e) => {
-                            eprintln!("Warning: chunk {chunk_id} failed: {e}");
-                            total_failed += 1;
-                        }
+                let texts: Vec<&str> = batch.iter().map(|(_, content)| content.as_str()).collect();
+                let batch_len = batch.len() as u32;
+                match embedder.embed_documents_batch(&texts) {
+                    Ok(embs) => {
+                        let embeddings: Vec<(i64, Vec<f32>)> = batch
+                            .iter()
+                            .map(|(id, _)| *id)
+                            .zip(embs)
+                            .collect();
+                        total_added += sae::storage::add_embeddings(db.conn(), &embeddings)?;
                     }
-                    done += 1;
-                    if done % 100 == 0 {
-                        eprintln!("  {done} chunks processed");
+                    Err(e) => {
+                        eprintln!("Error: batch embedding failed: {e}. Aborting.");
+                        std::process::exit(1);
                     }
                 }
-                if embeddings.is_empty() && !batch.is_empty() {
-                    eprintln!("Error: all chunks in batch failed. Aborting.");
-                    std::process::exit(1);
-                }
-                total_added += sae::storage::add_embeddings(db.conn(), &embeddings)?;
+                done += batch_len;
+                eprintln!("  {done} chunks processed");
             }
             if done == 0 {
                 println!("All chunks already embedded");
             } else {
-                println!("Embedded {total_added} chunks ({total_failed} failed)");
+                println!("Embedded {total_added} chunks");
             }
         }
         Command::Archive { number, team } => {
@@ -369,10 +366,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 fn try_load_embedder() -> Option<Embedder> {
-    let paths = cached_model_paths().or_else(|| {
-        eprintln!("Note: embedding model not cached. Run `sae embed <team>` to enable semantic search.");
-        None
-    })?;
+    let paths = match rurico::embed::download_model() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!(error = %e, "embedding model not available");
+            eprintln!("Note: embedding model not available. Run `sae embed <team>` to enable semantic search.");
+            return None;
+        }
+    };
     match Embedder::new(&paths) {
         Ok(e) => Some(e),
         Err(e) => {
@@ -380,27 +381,4 @@ fn try_load_embedder() -> Option<Embedder> {
             None
         }
     }
-}
-
-fn ensure_model() -> Result<ModelPaths, Box<dyn std::error::Error>> {
-    let api = hf_hub::api::sync::Api::new()?;
-    let repo = api.model(HF_REPO.to_string());
-    let model = repo.get("model.safetensors")?;
-    let config = repo.get("config.json")?;
-    let tokenizer = repo.get("tokenizer.json")?;
-    Ok(ModelPaths {
-        model,
-        config,
-        tokenizer,
-    })
-}
-
-fn cached_model_paths() -> Option<ModelPaths> {
-    let cache = hf_hub::Cache::from_env();
-    let repo = cache.repo(hf_hub::Repo::model(HF_REPO.to_string()));
-    Some(ModelPaths {
-        model: repo.get("model.safetensors")?,
-        config: repo.get("config.json")?,
-        tokenizer: repo.get("tokenizer.json")?,
-    })
 }

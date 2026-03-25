@@ -22,7 +22,7 @@ pub fn fts_search(
     limit: u32,
 ) -> Result<Vec<FtsHit>, StorageError> {
     let sanitized = sanitize_fts(query);
-    let expanded = expand_short_terms(conn, &sanitized);
+    let expanded = rurico::storage::fts_expand_short_terms(conn, &sanitized);
 
     if expanded.trim().is_empty() {
         return Ok(Vec::new());
@@ -57,7 +57,7 @@ pub fn vec_search(
     query_embedding: &[f32],
     limit: u32,
 ) -> Result<Vec<VecHit>, StorageError> {
-    let bytes: &[u8] = bytemuck::cast_slice(query_embedding);
+    let bytes: &[u8] = rurico::storage::f32_as_bytes(query_embedding);
 
     let mut stmt = conn.prepare(
         "SELECT v.chunk_id, v.distance, c.post_number, c.section_title, c.content \
@@ -104,7 +104,10 @@ pub fn hybrid_search(
         _ => Vec::new(),
     };
 
-    let merged = rrf_merge(&fts_hits, &vec_hits);
+    // RRF scores from rank position only; the f64 value is ignored by rurico::rrf_merge
+    let fts_ranked: Vec<(u32, f64)> = fts_hits.iter().map(|h| (h.post_number, 0.0)).collect();
+    let vec_ranked: Vec<(u32, f64)> = vec_hits.iter().map(|h| (h.post_number, 0.0)).collect();
+    let merged = rurico::storage::rrf_merge(&fts_ranked, &vec_ranked);
 
     let post_numbers: Vec<u32> = merged
         .iter()
@@ -171,8 +174,6 @@ fn batch_fetch_post_meta(
     Ok(rows.into_iter().map(|(n, name, url)| (n, (name, url))).collect())
 }
 
-const RRF_K: f64 = 60.0;
-
 #[derive(Debug, Clone)]
 pub struct FtsHit {
     pub chunk_id: i64,
@@ -191,71 +192,11 @@ pub struct VecHit {
     pub content: String,
 }
 
-fn rrf_merge(fts_hits: &[FtsHit], vec_hits: &[VecHit]) -> Vec<(u32, f64)> {
-    let mut scores: HashMap<u32, f64> = HashMap::new();
-
-    for (rank, hit) in fts_hits.iter().enumerate() {
-        *scores.entry(hit.post_number).or_default() += 1.0 / (RRF_K + rank as f64);
-    }
-    for (rank, hit) in vec_hits.iter().enumerate() {
-        *scores.entry(hit.post_number).or_default() += 1.0 / (RRF_K + rank as f64);
-    }
-
-    let mut results: Vec<(u32, f64)> = scores.into_iter().collect();
-    results.sort_by(|a, b| b.1.total_cmp(&a.1));
-    results
-}
-
-fn fts_quote(s: &str) -> String {
-    format!("\"{}\"", s.replace('"', "\"\""))
-}
-
 fn sanitize_fts(query: &str) -> String {
     query
         .chars()
         .filter(|c| c.is_alphanumeric() || c.is_whitespace())
         .collect()
-}
-
-fn expand_short_terms(conn: &Connection, sanitized: &str) -> String {
-    let mut parts = Vec::new();
-    for token in sanitized.split_whitespace() {
-        let upper = token.to_ascii_uppercase();
-        if matches!(upper.as_str(), "AND" | "OR" | "NOT") {
-            parts.push(token.to_string());
-            continue;
-        }
-        if token.is_empty() {
-            continue;
-        }
-        if token.chars().count() >= 3 {
-            parts.push(fts_quote(token));
-            continue;
-        }
-        let escaped = token
-            .replace('\\', "\\\\")
-            .replace('%', "\\%")
-            .replace('_', "\\_");
-        let pattern = format!("{escaped}%");
-        let expanded: Vec<String> = conn
-            .prepare(
-                "SELECT term FROM fts_chunks_vocab \
-                 WHERE term LIKE ?1 ESCAPE '\\' \
-                 ORDER BY cnt DESC LIMIT 25",
-            )
-            .and_then(|mut stmt| {
-                stmt.query_map([&pattern], |row| row.get::<_, String>(0))?
-                    .collect::<Result<Vec<_>, _>>()
-            })
-            .unwrap_or_default();
-        if expanded.is_empty() {
-            parts.push(fts_quote(token));
-        } else {
-            let quoted: Vec<String> = expanded.iter().map(|t| fts_quote(t)).collect();
-            parts.push(format!("({})", quoted.join(" OR ")));
-        }
-    }
-    parts.join(" ")
 }
 
 fn truncate_snippet(s: &str, max_chars: usize) -> String {
@@ -334,16 +275,9 @@ mod tests {
 
     #[test]
     fn rrf_merge_combines_sources() {
-        let fts = vec![
-            FtsHit { chunk_id: 1, post_number: 1, section_title: None, content: String::new(), rank: -1.0 },
-            FtsHit { chunk_id: 2, post_number: 2, section_title: None, content: String::new(), rank: -0.5 },
-        ];
-        let vec = vec![
-            VecHit { chunk_id: 3, post_number: 2, distance: 0.1, section_title: None, content: String::new() },
-            VecHit { chunk_id: 4, post_number: 3, distance: 0.2, section_title: None, content: String::new() },
-        ];
-
-        let merged = rrf_merge(&fts, &vec);
+        let fts: Vec<(u32, f64)> = vec![(1, 0.0), (2, 0.0)];
+        let vec: Vec<(u32, f64)> = vec![(2, 0.0), (3, 0.0)];
+        let merged = rurico::storage::rrf_merge(&fts, &vec);
         assert_eq!(merged[0].0, 2);
         assert!(merged[0].1 > merged[1].1);
         assert_eq!(merged.len(), 3);
