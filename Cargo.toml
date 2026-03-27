@@ -4,10 +4,6 @@ version = "0.1.0"
 edition = "2024"
 description = "esa semantic search CLI"
 
-[features]
-default = ["mlx"]
-mlx = ["rurico/mlx"]
-
 [dependencies]
 clap = { version = "4.6", features = ["derive"] }
 reqwest = { version = "0.13", features = ["json"] }
@@ -18,7 +14,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
-rurico = { git = "https://github.com/thkt/rurico", rev = "56320e3", default-features = false }
+rurico = { git = "https://github.com/thkt/rurico", rev = "cd4f2ad" }
 
 [dev-dependencies]
 wiremock = "0.6"
