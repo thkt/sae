@@ -15,7 +15,6 @@ pub struct SearchResult {
     pub score: f64,
 }
 
-/// FTS5 trigram search with fts5vocab short-term expansion.
 pub fn fts_search(
     conn: &Connection,
     query: &str,
@@ -82,7 +81,6 @@ pub fn vec_search(
     Ok(rows)
 }
 
-/// Hybrid search: merge FTS5 + vector results via Reciprocal Rank Fusion.
 pub fn hybrid_search(
     conn: &Connection,
     query: &str,
@@ -104,7 +102,6 @@ pub fn hybrid_search(
         _ => Vec::new(),
     };
 
-    // RRF scores from rank position only; the f64 value is ignored by rurico::rrf_merge
     let fts_ranked: Vec<(u32, f64)> = fts_hits.iter().map(|h| (h.post_number, 0.0)).collect();
     let vec_ranked: Vec<(u32, f64)> = vec_hits.iter().map(|h| (h.post_number, 0.0)).collect();
     let merged = rurico::storage::rrf_merge(&fts_ranked, &vec_ranked);
@@ -156,10 +153,9 @@ fn batch_fetch_post_meta(
     if post_numbers.is_empty() {
         return Ok(HashMap::new());
     }
-    let placeholders: Vec<String> = (1..=post_numbers.len()).map(|i| format!("?{i}")).collect();
     let sql = format!(
         "SELECT number, name, url FROM posts WHERE number IN ({})",
-        placeholders.join(", ")
+        super::in_placeholders(post_numbers.len())
     );
     let mut stmt = conn.prepare(&sql)?;
     let params: Vec<&dyn rusqlite::types::ToSql> = post_numbers
@@ -226,7 +222,7 @@ mod tests {
                     full_name: format!("dev/{name}"),
                     body_md: body.to_string(),
                     category: Some("dev".into()),
-                    tags: "[]".into(),
+                    tags: vec![],
                     wip: false,
                     kind: "stock".into(),
                     url: format!("https://example.esa.io/posts/{num}"),
@@ -327,5 +323,49 @@ mod tests {
         let db = Db::open_memory().unwrap();
         let meta = batch_fetch_post_meta(db.conn(), &[]).unwrap();
         assert!(meta.is_empty());
+    }
+
+    #[test]
+    fn hybrid_search_with_embeddings() {
+        use rurico::embed::EMBEDDING_DIMS;
+
+        let db = Db::open_memory().unwrap();
+        setup_db_with_posts(&db);
+
+        let unembedded = storage::get_unembedded_chunks(db.conn(), 100).unwrap();
+        assert!(!unembedded.is_empty());
+        let embeddings: Vec<(i64, Vec<f32>)> = unembedded
+            .iter()
+            .map(|(id, _)| (*id, vec![0.1; EMBEDDING_DIMS as usize]))
+            .collect();
+        storage::add_embeddings(db.conn(), &embeddings).unwrap();
+
+        let query_emb = vec![0.1; EMBEDDING_DIMS as usize];
+        let results = hybrid_search(db.conn(), "認証", Some(&query_emb), 10).unwrap();
+        assert!(!results.is_empty());
+        assert!(!results[0].post_name.is_empty());
+        assert!(!results[0].post_url.is_empty());
+    }
+
+    #[test]
+    fn truncate_snippet_short() {
+        assert_eq!(truncate_snippet("hello", 10), "hello");
+    }
+
+    #[test]
+    fn truncate_snippet_exact() {
+        assert_eq!(truncate_snippet("hello", 5), "hello");
+    }
+
+    #[test]
+    fn truncate_snippet_truncates() {
+        assert_eq!(truncate_snippet("hello world", 5), "hello...");
+    }
+
+    #[test]
+    fn truncate_snippet_japanese() {
+        let s = "日本語テスト";
+        let result = truncate_snippet(s, 3);
+        assert_eq!(result, "日本語...");
     }
 }

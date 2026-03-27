@@ -14,6 +14,13 @@ use rurico::embed::EMBEDDING_DIMS;
 
 const SCHEMA_VERSION: &str = "3";
 
+pub(crate) fn in_placeholders(len: usize) -> String {
+    (1..=len)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 const DDL: &str = "
     CREATE TABLE IF NOT EXISTS posts (
         number INTEGER PRIMARY KEY,
@@ -73,8 +80,11 @@ impl Db {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                if let Err(e) =
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                {
+                    warn!(path = %parent.display(), error = %e, "failed to restrict data directory permissions");
+                }
             }
         }
         let conn = open_with_wal_recovery(path)?;
@@ -100,7 +110,6 @@ impl Db {
     fn init_schema(&self) -> Result<(), StorageError> {
         self.conn.execute_batch(DDL)?;
 
-        // FTS5 trigram for Japanese full-text search
         self.conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(\
                  content, tokenize='trigram'\
@@ -179,7 +188,7 @@ pub fn upsert_post(conn: &Connection, post: &EsaPostRow) -> Result<(), StorageEr
             post.full_name,
             post.body_md,
             post.category,
-            post.tags,
+            post.tags_json(),
             post.wip,
             post.kind,
             post.url,
@@ -306,7 +315,7 @@ mod tests {
             full_name: format!("dev/Post {number}"),
             body_md: format!("# Post {number}"),
             category: Some("dev".into()),
-            tags: r#"["test"]"#.into(),
+            tags: vec!["test".into()],
             wip: false,
             kind: "stock".into(),
             url: format!("https://example.esa.io/posts/{number}"),

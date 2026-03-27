@@ -47,7 +47,6 @@ pub async fn harvest(
 ) -> Result<HarvestResult, SyncError> {
     let state = storage::get_sync_state(db.conn())?;
 
-    // Clear stale checkpoint so full sync re-fetches from page 1
     if full {
         storage::save_sync_state(db.conn(), None, 0, 0, None)?;
     }
@@ -200,7 +199,7 @@ fn post_to_row(post: &EsaPost) -> EsaPostRow {
         full_name: post.full_name.clone(),
         body_md: post.body_md.clone().unwrap_or_default(),
         category: post.category.clone(),
-        tags: serde_json::to_string(&post.tags).unwrap_or_else(|_| "[]".into()),
+        tags: post.tags.clone(),
         wip: post.wip,
         kind: post.kind.clone(),
         url: post.url.clone(),
@@ -451,5 +450,61 @@ mod tests {
         let (page, q) = resolve_start(true, &state);
         assert_eq!(page, 1);
         assert!(q.is_none());
+    }
+
+    #[test]
+    fn build_window_query_none_none() {
+        assert!(build_window_query(None, None).is_none());
+    }
+
+    #[test]
+    fn build_window_query_base_only() {
+        assert_eq!(
+            build_window_query(Some("updated:>2025-01-01"), None),
+            Some("updated:>2025-01-01".into())
+        );
+    }
+
+    #[test]
+    fn build_window_query_boundary_only() {
+        assert_eq!(
+            build_window_query(None, Some("2025-06-01")),
+            Some("updated:<=2025-06-01".into())
+        );
+    }
+
+    #[test]
+    fn build_window_query_both() {
+        assert_eq!(
+            build_window_query(Some("updated:>2025-01-01"), Some("2025-06-01")),
+            Some("updated:>2025-01-01 updated:<=2025-06-01".into())
+        );
+    }
+
+    #[test]
+    fn harvest_result_display_no_gap() {
+        let r = HarvestResult {
+            posts_fetched: 10,
+            posts_stored: 10,
+            total_count: 100,
+            local_count: 100,
+            gap_detected: false,
+        };
+        let s = r.to_string();
+        assert!(s.contains("Fetched 10"));
+        assert!(!s.contains("gap"));
+    }
+
+    #[test]
+    fn harvest_result_display_with_gap() {
+        let r = HarvestResult {
+            posts_fetched: 5,
+            posts_stored: 5,
+            total_count: 100,
+            local_count: 90,
+            gap_detected: true,
+        };
+        let s = r.to_string();
+        assert!(s.contains("gap detected: 10 missing"));
     }
 }

@@ -6,15 +6,14 @@ pub fn add_embeddings(
     conn: &Connection,
     embeddings: &[(i64, Vec<f32>)],
 ) -> Result<u32, StorageError> {
+    if embeddings.is_empty() {
+        return Ok(0);
+    }
+    let existing = existing_chunk_ids(conn, embeddings)?;
     let tx = conn.unchecked_transaction().map_err(super::StorageError::Db)?;
     let mut count = 0u32;
     for (chunk_id, embedding) in embeddings {
-        let exists: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM vec_chunks WHERE chunk_id = ?1)",
-            [chunk_id],
-            |row| row.get(0),
-        )?;
-        if exists {
+        if existing.contains(chunk_id) {
             continue;
         }
         let bytes: &[u8] = rurico::storage::f32_as_bytes(embedding);
@@ -26,6 +25,25 @@ pub fn add_embeddings(
     }
     tx.commit().map_err(super::StorageError::Db)?;
     Ok(count)
+}
+
+fn existing_chunk_ids(
+    conn: &Connection,
+    embeddings: &[(i64, Vec<f32>)],
+) -> Result<std::collections::HashSet<i64>, StorageError> {
+    let sql = format!(
+        "SELECT chunk_id FROM vec_chunks WHERE chunk_id IN ({})",
+        super::in_placeholders(embeddings.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params: Vec<&dyn rusqlite::types::ToSql> = embeddings
+        .iter()
+        .map(|(id, _)| id as &dyn rusqlite::types::ToSql)
+        .collect();
+    let ids = stmt
+        .query_map(params.as_slice(), |row| row.get::<_, i64>(0))?
+        .collect::<Result<std::collections::HashSet<_>, _>>()?;
+    Ok(ids)
 }
 
 pub fn get_unembedded_chunks(
@@ -73,7 +91,7 @@ mod tests {
                 full_name: "dev/Test".into(),
                 body_md: "# Hello\nWorld".into(),
                 category: None,
-                tags: "[]".into(),
+                tags: vec![],
                 wip: false,
                 kind: "stock".into(),
                 url: "https://example.esa.io/posts/1".into(),
@@ -109,7 +127,7 @@ mod tests {
                 full_name: "T".into(),
                 body_md: "# A\nB".into(),
                 category: None,
-                tags: "[]".into(),
+                tags: vec![],
                 wip: false,
                 kind: "stock".into(),
                 url: "u".into(),

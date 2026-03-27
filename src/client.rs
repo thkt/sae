@@ -44,6 +44,14 @@ pub struct EsaUser {
     pub screen_name: String,
 }
 
+pub struct CreatePostParams<'a> {
+    pub name: &'a str,
+    pub body_md: Option<&'a str>,
+    pub category: Option<&'a str>,
+    pub tags: Vec<String>,
+    pub wip: bool,
+}
+
 #[derive(Serialize)]
 struct CreatePostRequest {
     post: CreatePostBody,
@@ -59,6 +67,15 @@ struct CreatePostBody {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     tags: Vec<String>,
     wip: bool,
+}
+
+#[derive(Default)]
+pub struct UpdatePostParams<'a> {
+    pub name: Option<&'a str>,
+    pub body_md: Option<&'a str>,
+    pub category: Option<&'a str>,
+    pub tags: Option<Vec<String>>,
+    pub wip: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -180,22 +197,18 @@ impl EsaClient {
     pub async fn create_post(
         &self,
         team: &str,
-        name: &str,
-        body_md: Option<&str>,
-        category: Option<&str>,
-        tags: Vec<String>,
-        wip: bool,
+        params: &CreatePostParams<'_>,
     ) -> Result<EsaPost, ClientError> {
         let url = self
             .build_url(&format!("teams/{team}/posts"))?
             .to_string();
         let body = CreatePostRequest {
             post: CreatePostBody {
-                name: name.to_string(),
-                body_md: body_md.map(str::to_string),
-                category: category.map(str::to_string),
-                tags,
-                wip,
+                name: params.name.to_string(),
+                body_md: params.body_md.map(str::to_string),
+                category: params.category.map(str::to_string),
+                tags: params.tags.clone(),
+                wip: params.wip,
             },
         };
         self.send(|http| http.post(&url).json(&body)).await
@@ -205,22 +218,18 @@ impl EsaClient {
         &self,
         team: &str,
         post_number: u32,
-        name: Option<&str>,
-        body_md: Option<&str>,
-        category: Option<&str>,
-        tags: Option<Vec<String>>,
-        wip: Option<bool>,
+        params: &UpdatePostParams<'_>,
     ) -> Result<EsaPost, ClientError> {
         let url = self
             .build_url(&format!("teams/{team}/posts/{post_number}"))?
             .to_string();
         let body = UpdatePostRequest {
             post: UpdatePostBody {
-                name: name.map(str::to_string),
-                body_md: body_md.map(str::to_string),
-                category: category.map(str::to_string),
-                tags,
-                wip,
+                name: params.name.map(str::to_string),
+                body_md: params.body_md.map(str::to_string),
+                category: params.category.map(str::to_string),
+                tags: params.tags.clone(),
+                wip: params.wip,
             },
         };
         self.send(|http| http.patch(&url).json(&body)).await
@@ -319,12 +328,12 @@ fn retry_wait(status: u16, retry_after: Option<&str>, attempt: u32) -> Option<Du
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn test_post_json() -> serde_json::Value {
+    fn test_post_json(number: u32) -> serde_json::Value {
         serde_json::json!({
-            "number": 1,
+            "number": number,
             "name": "Getting Started",
             "full_name": "dev/Getting Started",
             "body_md": "# Hello",
@@ -351,7 +360,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/teams/myteam/posts"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "posts": [test_post_json()],
+                "posts": [test_post_json(1)],
                 "next_page": null,
                 "total_count": 1
             })))
@@ -376,7 +385,7 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/teams/myteam/posts"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "posts": [test_post_json()],
+                "posts": [test_post_json(1)],
                 "next_page": 2,
                 "total_count": 150
             })))
@@ -397,7 +406,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/teams/myteam/posts/42"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(test_post_json()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(test_post_json(42)))
             .mount(&server)
             .await;
 
@@ -406,7 +415,7 @@ mod tests {
             .get_post("myteam", 42)
             .await
             .unwrap();
-        assert_eq!(post.number, 1);
+        assert_eq!(post.number, 42);
         assert_eq!(post.name, "Getting Started");
     }
 
@@ -415,13 +424,19 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("POST"))
             .and(path("/teams/myteam/posts"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(test_post_json()))
+            .respond_with(ResponseTemplate::new(201).set_body_json(test_post_json(1)))
             .mount(&server)
             .await;
 
         let post = test_client(&server)
             .await
-            .create_post("myteam", "Test", Some("# Body"), None, vec![], true)
+            .create_post("myteam", &CreatePostParams {
+                name: "Test",
+                body_md: Some("# Body"),
+                category: None,
+                tags: vec![],
+                wip: true,
+            })
             .await
             .unwrap();
         assert_eq!(post.name, "Getting Started");
@@ -432,13 +447,13 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))
             .and(path("/teams/myteam/posts/1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(test_post_json()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(test_post_json(1)))
             .mount(&server)
             .await;
 
         let post = test_client(&server)
             .await
-            .update_post("myteam", 1, Some("New Name"), None, None, None, None)
+            .update_post("myteam", 1, &UpdatePostParams { name: Some("New Name"), ..Default::default() })
             .await
             .unwrap();
         assert_eq!(post.name, "Getting Started");
@@ -477,7 +492,7 @@ mod tests {
             .await;
         Mock::given(method("GET"))
             .and(path("/teams/myteam/posts/1"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(test_post_json()))
+            .respond_with(ResponseTemplate::new(200).set_body_json(test_post_json(1)))
             .mount(&server)
             .await;
 
@@ -535,5 +550,46 @@ mod tests {
     fn retry_wait_non_retryable() {
         assert!(retry_wait(400, None, 0).is_none());
         assert!(retry_wait(404, None, 0).is_none());
+    }
+
+    #[tokio::test]
+    async fn max_retries_exhausted() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/teams/myteam/posts/1"))
+            .respond_with(
+                ResponseTemplate::new(429).insert_header("retry-after", "0"),
+            )
+            .mount(&server)
+            .await;
+
+        let err = test_client(&server)
+            .await
+            .get_post("myteam", 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ClientError::MaxRetries(MAX_RETRIES)));
+    }
+
+    #[tokio::test]
+    async fn list_posts_with_query() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/teams/myteam/posts"))
+            .and(query_param("q", "updated:>2025-01-01"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "posts": [test_post_json(1)],
+                "next_page": null,
+                "total_count": 1
+            })))
+            .mount(&server)
+            .await;
+
+        let resp = test_client(&server)
+            .await
+            .list_posts("myteam", 1, Some("updated:>2025-01-01"))
+            .await
+            .unwrap();
+        assert_eq!(resp.posts.len(), 1);
     }
 }
