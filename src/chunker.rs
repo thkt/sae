@@ -50,9 +50,7 @@ pub fn chunk_markdown(body_md: &str) -> Vec<Chunk> {
     }
 
     for (idx, (line_idx, title)) in headings.iter().enumerate() {
-        let end = headings
-            .get(idx + 1)
-            .map_or(lines.len(), |(next, _)| *next);
+        let end = headings.get(idx + 1).map_or(lines.len(), |(next, _)| *next);
         let content: String = lines[*line_idx..end].join("\n");
         if !content.trim().is_empty() {
             chunks.push(Chunk {

@@ -2,7 +2,7 @@ pub mod embed;
 pub mod search;
 pub mod types;
 pub use embed::{add_embeddings, get_unembedded_chunks, has_embeddings};
-pub use search::{hybrid_search, SearchResult};
+pub use search::{SearchResult, hybrid_search};
 pub use types::*;
 
 use std::path::Path;
@@ -73,8 +73,7 @@ impl Db {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                let _ =
-                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
             }
         }
         let conn = open_with_wal_recovery(path)?;
@@ -86,8 +85,7 @@ impl Db {
 
     pub fn open_memory() -> Result<Self, StorageError> {
         ensure_sqlite_vec()?;
-        let conn =
-            Connection::open_in_memory().map_err(|e| StorageError::Open(e.to_string()))?;
+        let conn = Connection::open_in_memory().map_err(|e| StorageError::Open(e.to_string()))?;
         let db = Self { conn };
         db.init_schema()?;
         Ok(db)
@@ -157,9 +155,7 @@ fn is_recoverable_open_error(err: &rusqlite::Error) -> bool {
         err,
         rusqlite::Error::SqliteFailure(
             rusqlite::ffi::Error {
-                code: ErrorCode::DatabaseCorrupt
-                    | ErrorCode::CannotOpen
-                    | ErrorCode::NotADatabase,
+                code: ErrorCode::DatabaseCorrupt | ErrorCode::CannotOpen | ErrorCode::NotADatabase,
                 ..
             },
             _,
@@ -226,7 +222,14 @@ pub fn save_sync_state(
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before epoch")
         .as_secs() as i64;
-    save_sync_state_at(conn, latest_updated_at, total_count, local_count, last_page, epoch)
+    save_sync_state_at(
+        conn,
+        latest_updated_at,
+        total_count,
+        local_count,
+        last_page,
+        epoch,
+    )
 }
 
 pub(crate) fn save_sync_state_at(
@@ -241,20 +244,24 @@ pub(crate) fn save_sync_state_at(
         "INSERT OR REPLACE INTO sync_state \
          (id, latest_updated_at, total_count, local_count, last_page, updated_at) \
          VALUES (1, ?1, ?2, ?3, ?4, datetime(?5, 'unixepoch'))",
-        rusqlite::params![latest_updated_at, total_count, local_count, last_page, epoch_secs],
+        rusqlite::params![
+            latest_updated_at,
+            total_count,
+            local_count,
+            last_page,
+            epoch_secs
+        ],
     )?;
     Ok(())
 }
 
 pub fn count_posts(conn: &Connection) -> Result<u32, StorageError> {
-    let count: u32 =
-        conn.query_row("SELECT COUNT(*) FROM posts", [], |row| row.get(0))?;
+    let count: u32 = conn.query_row("SELECT COUNT(*) FROM posts", [], |row| row.get(0))?;
     Ok(count)
 }
 
 pub fn count_chunks(conn: &Connection) -> Result<u32, StorageError> {
-    let count: u32 =
-        conn.query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
+    let count: u32 = conn.query_row("SELECT COUNT(*) FROM chunks", [], |row| row.get(0))?;
     Ok(count)
 }
 
@@ -409,11 +416,13 @@ mod tests {
         );
 
         save_sync_state(db.conn(), None, 10, 10, None).unwrap();
-        assert!(get_sync_state(db.conn())
-            .unwrap()
-            .unwrap()
-            .last_page
-            .is_none());
+        assert!(
+            get_sync_state(db.conn())
+                .unwrap()
+                .unwrap()
+                .last_page
+                .is_none()
+        );
     }
 
     #[test]

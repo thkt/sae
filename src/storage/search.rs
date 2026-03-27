@@ -16,11 +16,7 @@ pub struct SearchResult {
 }
 
 /// FTS5 trigram search with fts5vocab short-term expansion.
-pub fn fts_search(
-    conn: &Connection,
-    query: &str,
-    limit: u32,
-) -> Result<Vec<FtsHit>, StorageError> {
+pub fn fts_search(conn: &Connection, query: &str, limit: u32) -> Result<Vec<FtsHit>, StorageError> {
     let sanitized = sanitize_fts(query);
     let expanded = rurico::storage::fts_expand_short_terms(conn, &sanitized);
 
@@ -168,10 +164,17 @@ fn batch_fetch_post_meta(
         .collect();
     let rows = stmt
         .query_map(params.as_slice(), |row| {
-            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?))
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(rows.into_iter().map(|(n, name, url)| (n, (name, url))).collect())
+    Ok(rows
+        .into_iter()
+        .map(|(n, name, url)| (n, (name, url)))
+        .collect())
 }
 
 #[derive(Debug, Clone)]
@@ -213,8 +216,16 @@ mod tests {
 
     fn setup_db_with_posts(db: &Db) {
         let posts = [
-            (1, "認証ガイド", "# 認証フロー\n認証の仕組みを説明します\n# 実装手順\nコードの書き方"),
-            (2, "API設計", "# エンドポイント\nREST APIの設計方針\n# 認証\nトークン認証の詳細"),
+            (
+                1,
+                "認証ガイド",
+                "# 認証フロー\n認証の仕組みを説明します\n# 実装手順\nコードの書き方",
+            ),
+            (
+                2,
+                "API設計",
+                "# エンドポイント\nREST APIの設計方針\n# 認証\nトークン認証の詳細",
+            ),
             (3, "デプロイ", "# 手順\nデプロイの手順ガイド"),
         ];
         for (num, name, body) in &posts {

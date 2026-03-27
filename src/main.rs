@@ -114,8 +114,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("sae=info".parse()?),
+            tracing_subscriber::EnvFilter::from_default_env().add_directive("sae=info".parse()?),
         )
         .init();
 
@@ -131,11 +130,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let result = sae::sync::harvest(&client, &db, team, full).await?;
             println!("{result}");
         }
-        Command::Search {
-            query,
-            team,
-            limit,
-        } => {
+        Command::Search { query, team, limit } => {
             let team = config.resolve_team(team.as_deref())?;
             let db_path = config.team_db_path(team)?;
             if !db_path.exists() {
@@ -144,21 +139,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let db = sae::storage::Db::open(&db_path)?;
             let embedder = try_load_embedder();
-            let query_embedding = embedder.as_ref().and_then(|e| {
-                match e.embed_query(&query) {
-                    Ok(v) => Some(v),
-                    Err(e) => {
-                        eprintln!("Warning: embed_query failed: {e}");
-                        None
-                    }
+            let query_embedding = embedder.as_ref().and_then(|e| match e.embed_query(&query) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    eprintln!("Warning: embed_query failed: {e}");
+                    None
                 }
             });
-            let results = sae::storage::hybrid_search(
-                db.conn(),
-                &query,
-                query_embedding.as_deref(),
-                limit,
-            )?;
+            let results =
+                sae::storage::hybrid_search(db.conn(), &query, query_embedding.as_deref(), limit)?;
             if results.is_empty() {
                 println!("No results for '{query}'");
             } else {
@@ -184,13 +173,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let post = client.get_post(team, number).await?;
             println!("---");
             println!("title: \"{}\"", post.full_name.replace('"', "\\\""));
-            if let Some(ref cat) = post.category {
-                if !cat.is_empty() {
-                    println!("category: \"{}\"", cat.replace('"', "\\\""));
-                }
+            if let Some(ref cat) = post.category
+                && !cat.is_empty()
+            {
+                println!("category: \"{}\"", cat.replace('"', "\\\""));
             }
             if !post.tags.is_empty() {
-                let tags: Vec<String> = post.tags.iter().map(|t| format!("\"{}\"", t.replace('"', "\\\""))).collect();
+                let tags: Vec<String> = post
+                    .tags
+                    .iter()
+                    .map(|t| format!("\"{}\"", t.replace('"', "\\\"")))
+                    .collect();
                 println!("tags: [{}]", tags.join(", "));
             }
             println!("author: \"@{}\"", post.created_by.screen_name);
@@ -258,8 +251,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             eprintln!("Checking model...");
             let paths = rurico::embed::download_model()
                 .map_err(|e| format!("Failed to download model: {e}"))?;
-            let embedder = Embedder::new(&paths)
-                .map_err(|e| format!("Failed to load model: {e}"))?;
+            let embedder =
+                Embedder::new(&paths).map_err(|e| format!("Failed to load model: {e}"))?;
             eprintln!("Model ready");
 
             const BATCH_SIZE: u32 = 500;
@@ -277,11 +270,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let batch_len = batch.len() as u32;
                 match embedder.embed_documents_batch(&texts) {
                     Ok(embs) => {
-                        let embeddings: Vec<(i64, Vec<f32>)> = batch
-                            .iter()
-                            .map(|(id, _)| *id)
-                            .zip(embs)
-                            .collect();
+                        let embeddings: Vec<(i64, Vec<f32>)> =
+                            batch.iter().map(|(id, _)| *id).zip(embs).collect();
                         total_added += sae::storage::add_embeddings(db.conn(), &embeddings)?;
                     }
                     Err(e) => {
@@ -304,7 +294,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let post = client.get_post(team, number).await?;
             let current_category = post.category.as_deref().unwrap_or("");
             if current_category.starts_with("Archived/") || current_category == "Archived" {
-                println!("Already archived: {} (#{}) {}", post.name, post.number, post.url);
+                println!(
+                    "Already archived: {} (#{}) {}",
+                    post.name, post.number, post.url
+                );
             } else {
                 let archived_category = if current_category.is_empty() {
                     "Archived".to_string()
@@ -312,7 +305,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     format!("Archived/{current_category}")
                 };
                 let post = client
-                    .update_post(team, number, None, None, Some(&archived_category), None, None)
+                    .update_post(
+                        team,
+                        number,
+                        None,
+                        None,
+                        Some(&archived_category),
+                        None,
+                        None,
+                    )
                     .await?;
                 println!("Archived: {} (#{}) {}", post.name, post.number, post.url);
             }
@@ -370,7 +371,9 @@ fn try_load_embedder() -> Option<Embedder> {
         Ok(p) => p,
         Err(e) => {
             tracing::warn!(error = %e, "embedding model not available");
-            eprintln!("Note: embedding model not available. Run `sae embed <team>` to enable semantic search.");
+            eprintln!(
+                "Note: embedding model not available. Run `sae embed <team>` to enable semantic search."
+            );
             return None;
         }
     };

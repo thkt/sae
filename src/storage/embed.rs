@@ -6,7 +6,9 @@ pub fn add_embeddings(
     conn: &Connection,
     embeddings: &[(i64, Vec<f32>)],
 ) -> Result<u32, StorageError> {
-    let tx = conn.unchecked_transaction().map_err(super::StorageError::Db)?;
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(super::StorageError::Db)?;
     let mut count = 0u32;
     for (chunk_id, embedding) in embeddings {
         let exists: bool = tx.query_row(
@@ -54,8 +56,8 @@ pub fn has_embeddings(conn: &Connection) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rurico::embed::EMBEDDING_DIMS;
     use crate::storage::Db;
+    use rurico::embed::EMBEDDING_DIMS;
 
     fn make_embedding(val: f32) -> Vec<f32> {
         vec![val; EMBEDDING_DIMS as usize]

@@ -25,8 +25,8 @@ impl Config {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| ConfigError::ReadFailed(path.clone(), e))?;
+        let content =
+            std::fs::read_to_string(&path).map_err(|e| ConfigError::ReadFailed(path.clone(), e))?;
         let config: Self =
             serde_json::from_str(&content).map_err(|e| ConfigError::ParseFailed(path, e))?;
         config.validate()?;
@@ -41,12 +41,12 @@ impl Config {
                 ));
             }
         }
-        if let Some(ref default) = self.default_team {
-            if !self.teams.contains(default) {
-                return Err(ConfigError::InvalidValue(format!(
-                    "default_team '{default}' not found in teams list"
-                )));
-            }
+        if let Some(ref default) = self.default_team
+            && !self.teams.contains(default)
+        {
+            return Err(ConfigError::InvalidValue(format!(
+                "default_team '{default}' not found in teams list"
+            )));
         }
         Ok(())
     }
@@ -80,13 +80,11 @@ pub(crate) fn data_dir() -> Result<PathBuf, ConfigError> {
 fn data_dir_with(
     get_var: impl Fn(&str) -> Result<String, std::env::VarError>,
 ) -> Result<PathBuf, ConfigError> {
-    let base = get_var("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| {
-            get_var("HOME")
-                .map(|h| PathBuf::from(h).join(".local").join("share"))
-                .map_err(|_| ConfigError::HomeDirNotFound)
-        })?;
+    let base = get_var("XDG_DATA_HOME").map(PathBuf::from).or_else(|_| {
+        get_var("HOME")
+            .map(|h| PathBuf::from(h).join(".local").join("share"))
+            .map_err(|_| ConfigError::HomeDirNotFound)
+    })?;
     Ok(base.join("sae"))
 }
 
