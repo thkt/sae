@@ -2,7 +2,7 @@ mod output;
 
 use clap::{CommandFactory, Parser, Subcommand};
 use rurico::embed::{Embed, Embedder};
-use sae::client::EsaClient;
+use sae::client::{CreatePostParams, EsaClient, UpdatePostParams};
 use sae::config::Config;
 
 #[derive(Parser)]
@@ -236,8 +236,36 @@ where
     Cli::try_parse_from(args)
 }
 
+type AppError = Box<dyn std::error::Error>;
+
+fn resolve_client<'a>(config: &'a Config, team: Option<&'a str>) -> Result<(&'a str, EsaClient), AppError> {
+    let team = config.resolve_team(team)?;
+    let client = EsaClient::from_env()?;
+    Ok((team, client))
+}
+
+fn require_db(config: &Config, team: &str) -> Result<sae::storage::Db, AppError> {
+    let db_path = config.team_db_path(team)?;
+    if !db_path.exists() {
+        return Err(format!("No data for team '{team}'. Run `sae harvest {team}` first.").into());
+    }
+    Ok(sae::storage::Db::open(&db_path)?)
+}
+
+fn archive_category(current: Option<&str>) -> Option<String> {
+    let current = current.unwrap_or("");
+    if current.starts_with("Archived/") || current == "Archived" {
+        return None;
+    }
+    Some(if current.is_empty() {
+        "Archived".to_string()
+    } else {
+        format!("Archived/{current}")
+    })
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> Result<(), AppError> {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
@@ -251,8 +279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match cli.command {
         Command::Harvest { team, full } => {
-            let team = config.resolve_team(Some(&team))?;
-            let client = EsaClient::from_env()?;
+            let (team, client) = resolve_client(&config, Some(&team))?;
             let db_path = config.team_db_path(team)?;
             let db = sae::storage::Db::open(&db_path)?;
             let result = sae::sync::harvest(&client, &db, team, full).await?;
@@ -260,14 +287,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Command::Search { query, team, limit } => {
             let team = config.resolve_team(team.as_deref())?;
-            let db_path = config.team_db_path(team)?;
-            require_db(&db_path, team);
-            let db = sae::storage::Db::open(&db_path)?;
+            let db = require_db(&config, team)?;
             let embedder = try_load_embedder();
             let query_embedding = embedder.as_ref().and_then(|e| match e.embed_query(&query) {
                 Ok(v) => Some(v),
                 Err(e) => {
-                    eprintln!("Warning: embed_query failed: {e}");
+                    tracing::warn!(error = %e, "embed_query failed, falling back to FTS");
                     None
                 }
             });
@@ -285,8 +310,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             team,
             with_body,
         } => {
-            let team = config.resolve_team(team.as_deref())?;
-            let client = EsaClient::from_env()?;
+            let (team, client) = resolve_client(&config, team.as_deref())?;
             let post = client.get_post(team, number).await?;
             output::get(&post, json, with_body)?;
         }
@@ -311,18 +335,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 println!("{}", serde_json::to_string(&payload)?);
             } else {
-                let team = config.resolve_team(team.as_deref())?;
-                let client = EsaClient::from_env()?;
-                let post = client
-                    .create_post(
-                        team,
-                        &name,
-                        resolved_body.as_deref(),
-                        category.as_deref(),
-                        tag,
-                        wip,
-                    )
-                    .await?;
+                let (team, client) = resolve_client(&config, team.as_deref())?;
+                let params = CreatePostParams {
+                    name: &name,
+                    body_md: resolved_body.as_deref(),
+                    category: category.as_deref(),
+                    tags: tag,
+                    wip,
+                };
+                let post = client.create_post(team, &params).await?;
                 output::post("Created", &post, json)?;
             }
         }
@@ -348,28 +369,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 println!("{}", serde_json::to_string(&payload)?);
             } else {
-                let team = config.resolve_team(team.as_deref())?;
-                let client = EsaClient::from_env()?;
+                let (team, client) = resolve_client(&config, team.as_deref())?;
                 let tags = if tag.is_empty() { None } else { Some(tag) };
-                let post = client
-                    .update_post(
-                        team,
-                        number,
-                        name.as_deref(),
-                        resolved_body.as_deref(),
-                        category.as_deref(),
-                        tags,
-                        None,
-                    )
-                    .await?;
+                let params = UpdatePostParams {
+                    name: name.as_deref(),
+                    body_md: resolved_body.as_deref(),
+                    category: category.as_deref(),
+                    tags,
+                    ..Default::default()
+                };
+                let post = client.update_post(team, number, &params).await?;
                 output::post("Updated", &post, json)?;
             }
         }
         Command::Embed { team } => {
             let team = config.resolve_team(Some(&team))?;
-            let db_path = config.team_db_path(team)?;
-            require_db(&db_path, team);
-            let db = sae::storage::Db::open(&db_path)?;
+            let db = require_db(&config, team)?;
 
             let paths = require_embed_model()?;
             eprintln!("Loading model...");
@@ -390,17 +405,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
                 let texts: Vec<&str> = batch.iter().map(|(_, content)| content.as_str()).collect();
                 let batch_len = batch.len() as u32;
-                match embedder.embed_documents_batch(&texts) {
-                    Ok(embs) => {
-                        let embeddings: Vec<(i64, Vec<f32>)> =
-                            batch.iter().map(|(id, _)| *id).zip(embs).collect();
-                        total_added += sae::storage::add_embeddings(db.conn(), &embeddings)?;
-                    }
-                    Err(e) => {
-                        eprintln!("Error: batch embedding failed: {e}. Aborting.");
-                        std::process::exit(1);
-                    }
-                }
+                let embs = embedder
+                    .embed_documents_batch(&texts)
+                    .map_err(|e| format!("Batch embedding failed: {e}"))?;
+                let embeddings: Vec<(i64, Vec<f32>)> =
+                    batch.iter().map(|(id, _)| *id).zip(embs).collect();
+                total_added += sae::storage::add_embeddings(db.conn(), &embeddings)?;
                 done += batch_len;
                 eprintln!("  {done} chunks processed");
             }
@@ -414,47 +424,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             team,
             dry_run,
         } => {
-            let team = config.resolve_team(team.as_deref())?;
-            let client = EsaClient::from_env()?;
+            let (team, client) = resolve_client(&config, team.as_deref())?;
             let post = client.get_post(team, number).await?;
-            let current_category = post.category.as_deref().unwrap_or("");
-            if current_category.starts_with("Archived/") || current_category == "Archived" {
-                if dry_run {
-                    let payload = serde_json::json!({
-                        "number": number,
-                        "already_archived": true,
-                        "category": current_category,
-                    });
-                    println!("{}", serde_json::to_string(&payload)?);
-                } else {
-                    output::post("Already archived", &post, json)?;
+            match archive_category(post.category.as_deref()) {
+                None => {
+                    if dry_run {
+                        let payload = serde_json::json!({
+                            "number": number,
+                            "already_archived": true,
+                            "category": post.category.as_deref().unwrap_or(""),
+                        });
+                        println!("{}", serde_json::to_string(&payload)?);
+                    } else {
+                        output::post("Already archived", &post, json)?;
+                    }
                 }
-            } else {
-                let archived_category = if current_category.is_empty() {
-                    "Archived".to_string()
-                } else {
-                    format!("Archived/{current_category}")
-                };
-                if dry_run {
-                    let payload = serde_json::json!({
-                        "number": number,
-                        "from_category": current_category,
-                        "to_category": archived_category,
-                    });
-                    println!("{}", serde_json::to_string(&payload)?);
-                } else {
-                    let post = client
-                        .update_post(
-                            team,
-                            number,
-                            None,
-                            None,
-                            Some(&archived_category),
-                            None,
-                            None,
-                        )
-                        .await?;
-                    output::post("Archived", &post, json)?;
+                Some(new_category) => {
+                    if dry_run {
+                        let payload = serde_json::json!({
+                            "number": number,
+                            "from_category": post.category.as_deref().unwrap_or(""),
+                            "to_category": new_category,
+                        });
+                        println!("{}", serde_json::to_string(&payload)?);
+                    } else {
+                        let params = UpdatePostParams {
+                            category: Some(&new_category),
+                            ..Default::default()
+                        };
+                        let post = client.update_post(team, number, &params).await?;
+                        output::post("Archived", &post, json)?;
+                    }
                 }
             }
         }
@@ -470,21 +470,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 });
                 println!("{}", serde_json::to_string(&payload)?);
             } else {
-                let team = config.resolve_team(team.as_deref())?;
-                let client = EsaClient::from_env()?;
-                let post = client
-                    .update_post(team, number, None, None, None, None, Some(false))
-                    .await?;
+                let (team, client) = resolve_client(&config, team.as_deref())?;
+                let params = UpdatePostParams {
+                    wip: Some(false),
+                    ..Default::default()
+                };
+                let post = client.update_post(team, number, &params).await?;
                 output::post("Shipped", &post, json)?;
             }
         }
         Command::Status { team } => {
-            let teams: Vec<&str> = if let Some(ref t) = team {
+            let target_teams: Vec<&str> = if let Some(ref t) = team {
                 vec![config.resolve_team(Some(t))?]
             } else {
-                config.teams.iter().map(String::as_str).collect()
+                config
+                    .teams
+                    .iter()
+                    .filter(|t| sae::config::validate_team_name(t).is_ok())
+                    .map(String::as_str)
+                    .collect()
             };
-            let statuses = collect_team_statuses(&config, &teams)?;
+            let statuses = collect_team_statuses(&config, &target_teams)?;
             output::status(&statuses, json)?;
         }
         Command::Model { command } => match command {
@@ -543,13 +549,6 @@ fn collect_team_statuses(
     Ok(statuses)
 }
 
-fn require_db(db_path: &std::path::Path, team: &str) {
-    if !db_path.exists() {
-        eprintln!("No data for team '{team}'. Run `sae harvest {team}` first.");
-        std::process::exit(1);
-    }
-}
-
 fn query_team_status(
     team: &str,
     path: &std::path::Path,
@@ -588,6 +587,43 @@ fn resolve_body(
         }
         (None, None) => Ok(None),
         (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
+    }
+}
+
+fn require_embed_model() -> Result<rurico::embed::ModelPaths, Box<dyn std::error::Error>> {
+    let auto_download = std::env::var("SAE_AUTO_DOWNLOAD_MODEL").as_deref() == Ok("1");
+    if auto_download {
+        eprintln!("Downloading model (SAE_AUTO_DOWNLOAD_MODEL=1)...");
+        return rurico::embed::download_model()
+            .map_err(|e| format!("Failed to download model: {e}").into());
+    }
+    match rurico::embed::model_paths_if_cached() {
+        Ok(Some(p)) => Ok(p),
+        Ok(None) => Err("Model not found. Run 'sae model download' first.".into()),
+        Err(e) => Err(format!("Failed to check model cache: {e}").into()),
+    }
+}
+
+fn try_load_embedder() -> Option<Embedder> {
+    let paths = match rurico::embed::model_paths_if_cached() {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            eprintln!(
+                "Hint: run 'sae model download && sae embed <team>' to enable semantic search"
+            );
+            return None;
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "embedding model not available");
+            return None;
+        }
+    };
+    match Embedder::new(&paths) {
+        Ok(e) => Some(e),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to load embedding model");
+            None
+        }
     }
 }
 
@@ -848,41 +884,34 @@ mod tests {
             other => panic!("[T-005] expected Embed, got {other:?}"),
         }
     }
-}
 
-fn require_embed_model() -> Result<rurico::embed::ModelPaths, Box<dyn std::error::Error>> {
-    let auto_download = std::env::var("SAE_AUTO_DOWNLOAD_MODEL").as_deref() == Ok("1");
-    if auto_download {
-        eprintln!("Downloading model (SAE_AUTO_DOWNLOAD_MODEL=1)...");
-        return rurico::embed::download_model()
-            .map_err(|e| format!("Failed to download model: {e}").into());
-    }
-    match rurico::embed::model_paths_if_cached() {
-        Ok(Some(p)) => Ok(p),
-        Ok(None) => Err("Model not found. Run 'sae model download' first.".into()),
-        Err(e) => Err(format!("Failed to check model cache: {e}").into()),
-    }
-}
+    // --- archive_category ---
 
-fn try_load_embedder() -> Option<Embedder> {
-    let paths = match rurico::embed::model_paths_if_cached() {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            eprintln!(
-                "Hint: run 'sae model download && sae embed <team>' to enable semantic search"
-            );
-            return None;
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "embedding model not available");
-            return None;
-        }
-    };
-    match Embedder::new(&paths) {
-        Ok(e) => Some(e),
-        Err(e) => {
-            eprintln!("Warning: failed to load embedding model: {e}");
-            None
-        }
+    #[test]
+    fn archive_no_category() {
+        assert_eq!(archive_category(None), Some("Archived".into()));
+        assert_eq!(archive_category(Some("")), Some("Archived".into()));
+    }
+
+    #[test]
+    fn archive_with_category() {
+        assert_eq!(
+            archive_category(Some("dev/guide")),
+            Some("Archived/dev/guide".into())
+        );
+    }
+
+    #[test]
+    fn archive_already_archived() {
+        assert_eq!(archive_category(Some("Archived")), None);
+        assert_eq!(archive_category(Some("Archived/dev")), None);
+    }
+
+    #[test]
+    fn archive_not_prefix_match() {
+        assert_eq!(
+            archive_category(Some("ArchivedData")),
+            Some("Archived/ArchivedData".into())
+        );
     }
 }

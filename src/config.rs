@@ -100,7 +100,7 @@ fn dirs_fallback_config_home() -> Result<PathBuf, ConfigError> {
 }
 
 /// esa team name: lowercase alphanumeric + hyphen, must start with alphanumeric.
-fn validate_team_name(name: &str) -> Result<(), ConfigError> {
+pub fn validate_team_name(name: &str) -> Result<(), ConfigError> {
     if name.is_empty() {
         return Err(ConfigError::InvalidValue(
             "team name must not be empty".into(),

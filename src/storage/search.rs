@@ -15,7 +15,6 @@ pub struct SearchResult {
     pub score: f64,
 }
 
-/// FTS5 trigram search with fts5vocab short-term expansion.
 pub fn fts_search(conn: &Connection, query: &str, limit: u32) -> Result<Vec<FtsHit>, StorageError> {
     let normalized = normalize_punctuation(query);
     let matched = match rurico::storage::prepare_match_query(conn, &normalized) {
@@ -86,8 +85,6 @@ const RECENCY_HALF_LIFE: f64 = 30.0;
 const RECENCY_WEIGHT: f64 = 0.2;
 const SECS_PER_DAY: f64 = 86_400.0;
 
-/// Hybrid search: merge FTS5 + vector results via Reciprocal Rank Fusion,
-/// then apply recency decay boost based on `updated_at`.
 pub fn hybrid_search(
     conn: &Connection,
     query: &str,
@@ -110,7 +107,6 @@ pub fn hybrid_search(
         _ => Vec::new(),
     };
 
-    // RRF scores from rank position only; the f64 value is ignored by rurico::rrf_merge
     let fts_ranked: Vec<(u32, f64)> = fts_hits.iter().map(|h| (h.post_number, 0.0)).collect();
     let vec_ranked: Vec<(u32, f64)> = vec_hits.iter().map(|h| (h.post_number, 0.0)).collect();
     let merged = rurico::storage::rrf_merge(&fts_ranked, &vec_ranked);
@@ -193,10 +189,9 @@ fn batch_fetch_post_meta(
     if post_numbers.is_empty() {
         return Ok(HashMap::new());
     }
-    let placeholders: Vec<String> = (1..=post_numbers.len()).map(|i| format!("?{i}")).collect();
     let sql = format!(
         "SELECT number, name, url, updated_at FROM posts WHERE number IN ({})",
-        placeholders.join(", ")
+        super::in_placeholders(post_numbers.len())
     );
     let mut stmt = conn.prepare(&sql)?;
     let params: Vec<&dyn rusqlite::types::ToSql> = post_numbers
@@ -586,12 +581,10 @@ mod tests {
     fn hybrid_search_recency_boost_recent_post_scores_higher() {
         let db = Db::open_memory().unwrap();
 
-        // Post A: updated 1 day ago, Post B: updated 30 days ago.
-        // Both match the same query so raw RRF scores are equal.
         let shared_body = "# 認証フロー\n認証の仕組みを説明します";
         let posts = [
-            (1u32, "PostA", "2025-01-31T00:00:00+09:00"), // 1 day before "now"
-            (2u32, "PostB", "2025-01-02T00:00:00+09:00"), // 30 days before "now"
+            (1u32, "PostA", "2025-01-31T00:00:00+09:00"),
+            (2u32, "PostB", "2025-01-02T00:00:00+09:00"),
         ];
         for (num, name, updated) in &posts {
             let mut post = test_post(*num, name, shared_body);
@@ -631,8 +624,6 @@ mod tests {
             .with_timezone(&chrono::Utc);
         let results = hybrid_search(db.conn(), "認証の仕組み", None, 10, now).unwrap();
 
-        // Must not panic. With decay=0.0 the boost factor is
-        // (1.0 + 0.2 * 0.0) = 1.0, so score equals raw RRF score.
         assert!(!results.is_empty(), "post should still be returned");
         assert!(
             results[0].score > 0.0,
@@ -687,7 +678,6 @@ mod tests {
         storage::upsert_post(db.conn(), &post).unwrap();
         storage::rechunk_post(db.conn(), 1, body).unwrap();
 
-        // "認証ガイド" は section_title にのみ存在、content には含まれない
         let hits = fts_search(db.conn(), "認証ガイド", 10).unwrap();
         assert!(
             !hits.is_empty(),
@@ -732,9 +722,30 @@ mod tests {
 
     #[test]
     fn truncate_snippet_multibyte_boundary() {
-        // 3 chars of Japanese = 9 bytes; truncation must be on char boundary
         let s = "あいうえお";
         let result = truncate_snippet(s, 3);
         assert_eq!(result, "あいう...");
+    }
+
+    #[test]
+    fn hybrid_search_with_embeddings() {
+        use rurico::embed::EMBEDDING_DIMS;
+
+        let db = Db::open_memory().unwrap();
+        setup_db_with_posts(&db);
+
+        let unembedded = storage::get_unembedded_chunks(db.conn(), 100).unwrap();
+        assert!(!unembedded.is_empty());
+        let embeddings: Vec<(i64, Vec<f32>)> = unembedded
+            .iter()
+            .map(|(id, _)| (*id, vec![0.1; EMBEDDING_DIMS as usize]))
+            .collect();
+        storage::add_embeddings(db.conn(), &embeddings).unwrap();
+
+        let query_emb = vec![0.1; EMBEDDING_DIMS as usize];
+        let results = hybrid_search(db.conn(), "認証", Some(&query_emb), 10, chrono::Utc::now()).unwrap();
+        assert!(!results.is_empty());
+        assert!(!results[0].post_name.is_empty());
+        assert!(!results[0].post_url.is_empty());
     }
 }
