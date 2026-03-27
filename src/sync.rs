@@ -96,7 +96,7 @@ pub async fn harvest(
             Err(e) => return Err(e.into()),
         };
         api_total = resp.total_count;
-        let est_pages = (api_total + 99) / 100;
+        let est_pages = api_total.div_ceil(100);
 
         let tx = db
             .conn()
@@ -127,7 +127,12 @@ pub async fn harvest(
         tx.commit().map_err(StorageError::Db)?;
 
         eprintln!("  page {page}/{est_pages} — {total_fetched} posts fetched");
-        info!(page, fetched = resp.posts.len(), total_fetched, "harvested page");
+        info!(
+            page,
+            fetched = resp.posts.len(),
+            total_fetched,
+            "harvested page"
+        );
 
         match resp.next_page {
             Some(np) => page = np,
@@ -175,10 +180,7 @@ fn build_window_query(base: Option<&str>, boundary: Option<&str>) -> Option<Stri
     }
 }
 
-fn resolve_start(
-    full: bool,
-    state: &Option<storage::SyncState>,
-) -> (u32, Option<String>) {
+fn resolve_start(full: bool, state: &Option<storage::SyncState>) -> (u32, Option<String>) {
     if full {
         return (1, None);
     }

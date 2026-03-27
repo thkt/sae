@@ -166,11 +166,7 @@ impl EsaClient {
         self.send(|http| http.get(&url)).await
     }
 
-    pub async fn get_post(
-        &self,
-        team: &str,
-        post_number: u32,
-    ) -> Result<EsaPost, ClientError> {
+    pub async fn get_post(&self, team: &str, post_number: u32) -> Result<EsaPost, ClientError> {
         let url = self
             .build_url(&format!("teams/{team}/posts/{post_number}"))?
             .to_string();
@@ -186,9 +182,7 @@ impl EsaClient {
         tags: Vec<String>,
         wip: bool,
     ) -> Result<EsaPost, ClientError> {
-        let url = self
-            .build_url(&format!("teams/{team}/posts"))?
-            .to_string();
+        let url = self.build_url(&format!("teams/{team}/posts"))?.to_string();
         let body = CreatePostRequest {
             post: CreatePostBody {
                 name: name.to_string(),
@@ -201,6 +195,7 @@ impl EsaClient {
         self.send(|http| http.post(&url).json(&body)).await
     }
 
+    #[allow(clippy::too_many_arguments)] // will be replaced by UpdatePostParams in PR #4
     pub async fn update_post(
         &self,
         team: &str,
@@ -228,8 +223,7 @@ impl EsaClient {
 
     fn build_url(&self, path: &str) -> Result<reqwest::Url, ClientError> {
         let raw = format!("{}/{path}", self.base_url);
-        reqwest::Url::parse(&raw)
-            .map_err(|e| ClientError::Api(format!("invalid URL '{raw}': {e}")))
+        reqwest::Url::parse(&raw).map_err(|e| ClientError::Api(format!("invalid URL '{raw}': {e}")))
     }
 
     async fn throttle(&self) {
@@ -306,9 +300,7 @@ impl EsaClient {
 fn retry_wait(status: u16, retry_after: Option<&str>, attempt: u32) -> Option<Duration> {
     match status {
         429 => {
-            let secs = retry_after
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(5);
+            let secs = retry_after.and_then(|v| v.parse::<u64>().ok()).unwrap_or(5);
             Some(Duration::from_secs(secs))
         }
         500 | 502 | 503 => Some(Duration::from_millis(500 * 2u64.pow(attempt))),
@@ -469,9 +461,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/teams/myteam/posts/1"))
-            .respond_with(
-                ResponseTemplate::new(429).insert_header("retry-after", "1"),
-            )
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
             .up_to_n_times(1)
             .mount(&server)
             .await;
@@ -491,8 +481,7 @@ mod tests {
 
     #[test]
     fn from_env_missing_token() {
-        let err =
-            EsaClient::from_env_with(|_| Err(std::env::VarError::NotPresent)).unwrap_err();
+        let err = EsaClient::from_env_with(|_| Err(std::env::VarError::NotPresent)).unwrap_err();
         assert!(matches!(err, ClientError::TokenNotSet));
     }
 
