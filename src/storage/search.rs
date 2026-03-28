@@ -427,7 +427,10 @@ mod tests {
     #[test]
     fn normalize_punctuation_strips_general_keeps_technical() {
         // General punctuation → space
-        assert_eq!(normalize_punctuation("hello; DROP TABLE"), "hello DROP TABLE");
+        assert_eq!(
+            normalize_punctuation("hello; DROP TABLE"),
+            "hello DROP TABLE"
+        );
         assert_eq!(normalize_punctuation("認証、フロー"), "認証 フロー");
         assert_eq!(normalize_punctuation("\"injected\""), "injected");
         assert_eq!(normalize_punctuation("  "), "");
@@ -452,10 +455,7 @@ mod tests {
             "\"認証の\" \"フロー\" OR \"認証フ\" \"フロー\""
         );
         // Single-element group + fixed term → distributed
-        assert_eq!(
-            clean_for_trigram("\"std\" (\"ioの\")"),
-            "\"ioの\" \"std\""
-        );
+        assert_eq!(clean_for_trigram("\"std\" (\"ioの\")"), "\"ioの\" \"std\"");
         // Multi-element group + fixed term → distributed
         assert_eq!(
             clean_for_trigram("(\"abc\" OR \"def\") \"ghi\""),
