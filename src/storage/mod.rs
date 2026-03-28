@@ -12,7 +12,7 @@ use tracing::warn;
 
 use rurico::embed::EMBEDDING_DIMS;
 
-const SCHEMA_VERSION: &str = "3";
+const SCHEMA_VERSION: &str = "4";
 
 const DDL: &str = "
     CREATE TABLE IF NOT EXISTS posts (
@@ -61,8 +61,37 @@ pub struct Db {
     conn: Connection,
 }
 
-fn ensure_sqlite_vec() -> Result<(), StorageError> {
+pub(crate) fn ensure_sqlite_vec() -> Result<(), StorageError> {
     rurico::storage::ensure_sqlite_vec().map_err(StorageError::Open)
+}
+
+/// Migrate FTS schema from v3 (1-column) to v4 (2-column with section_title).
+/// Runs DROP + recreate + rebuild within a single transaction.
+pub(crate) fn migrate_fts_v4(conn: &Connection) -> Result<(), StorageError> {
+    let tx = conn.unchecked_transaction()?;
+
+    tx.execute_batch(
+        "DROP TABLE IF EXISTS fts_chunks_vocab;\
+         DROP TABLE IF EXISTS fts_chunks;\
+         CREATE VIRTUAL TABLE fts_chunks USING fts5(\
+             section_title, content, tokenize='trigram'\
+         );\
+         CREATE VIRTUAL TABLE fts_chunks_vocab \
+             USING fts5vocab(fts_chunks, row);",
+    )?;
+
+    tx.execute_batch(
+        "INSERT INTO fts_chunks(rowid, section_title, content) \
+         SELECT id, section_title, content FROM chunks",
+    )?;
+
+    tx.execute(
+        "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('schema_version', ?1)",
+        [SCHEMA_VERSION],
+    )?;
+
+    tx.commit()?;
+    Ok(())
 }
 
 impl Db {
@@ -98,10 +127,9 @@ impl Db {
     fn init_schema(&self) -> Result<(), StorageError> {
         self.conn.execute_batch(DDL)?;
 
-        // FTS5 trigram for Japanese full-text search
         self.conn.execute_batch(
             "CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(\
-                 content, tokenize='trigram'\
+                 section_title, content, tokenize='trigram'\
              );\
              CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks_vocab \
                  USING fts5vocab(fts_chunks, row);",
@@ -125,10 +153,17 @@ impl Db {
         };
 
         if stored != SCHEMA_VERSION {
-            self.conn.execute(
-                "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('schema_version', ?1)",
-                [SCHEMA_VERSION],
-            )?;
+            let ver: u32 = stored
+                .parse()
+                .map_err(|_| StorageError::Open(format!("corrupt schema version: {stored:?}")))?;
+            match ver {
+                0..=3 => migrate_fts_v4(&self.conn)?,
+                _ => {
+                    return Err(StorageError::Open(format!(
+                        "database schema version {stored} is newer than supported version {SCHEMA_VERSION}"
+                    )));
+                }
+            }
         }
 
         Ok(())
@@ -294,8 +329,8 @@ pub fn rechunk_post(
         )?;
         let id = conn.last_insert_rowid();
         conn.execute(
-            "INSERT INTO fts_chunks(rowid, content) VALUES (?1, ?2)",
-            rusqlite::params![id, chunk.content],
+            "INSERT INTO fts_chunks(rowid, section_title, content) VALUES (?1, ?2, ?3)",
+            rusqlite::params![id, chunk.section_title, chunk.content],
         )?;
         count += 1;
     }
@@ -505,5 +540,249 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits, 1);
+    }
+
+    // T-005: rechunk 後 fts_chunks 件数 = chunks 件数 (FR-002)
+    #[test]
+    fn rechunk_fts_count_matches_chunks_count() {
+        let db = Db::open_memory().unwrap();
+        let body = "# セクション1\n本文A\n# セクション2\n本文B\n# セクション3\n本文C";
+        let post = test_post(1);
+        upsert_post(db.conn(), &post).unwrap();
+        let n = rechunk_post(db.conn(), 1, body).unwrap();
+        assert_eq!(n, 3);
+
+        let chunks_count: u32 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM chunks WHERE post_number = 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let fts_count: u32 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM fts_chunks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(
+            fts_count, chunks_count,
+            "[T-005] fts_chunks count ({fts_count}) must equal chunks count ({chunks_count})"
+        );
+    }
+
+    // T-006: fresh DB で fts_chunks に section_title + content カラムあり (FR-001)
+    #[test]
+    fn fresh_db_fts_has_section_title_and_content_columns() {
+        let db = Db::open_memory().unwrap();
+        let result = db.conn().execute(
+            "INSERT INTO fts_chunks(rowid, section_title, content) VALUES (999, '見出し', '本文')",
+            [],
+        );
+        assert!(
+            result.is_ok(),
+            "[T-006] fts_chunks must accept section_title column, got: {:?}",
+            result.err()
+        );
+        let title: String = db
+            .conn()
+            .query_row(
+                "SELECT section_title FROM fts_chunks WHERE rowid = 999",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(title, "見出し");
+    }
+
+    // T-007: migrate_fts_v4 失敗時 rollback 確認 (FR-005)
+    #[test]
+    fn migrate_fts_v4_rollback_on_failure() {
+        ensure_sqlite_vec().unwrap();
+        let conn = Connection::open_in_memory().unwrap();
+
+        // 旧スキーマ構築: chunks テーブル + 旧 1-column FTS + data
+        conn.execute_batch(
+            "CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+             CREATE TABLE chunks (
+                 id INTEGER PRIMARY KEY, post_number INTEGER NOT NULL,
+                 section_title TEXT, content TEXT NOT NULL,
+                 chunk_type TEXT NOT NULL DEFAULT 'section'
+             );
+             CREATE VIRTUAL TABLE fts_chunks USING fts5(content, tokenize='trigram');
+             CREATE VIRTUAL TABLE fts_chunks_vocab USING fts5vocab(fts_chunks, row);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO index_meta (key, value) VALUES ('schema_version', '3')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO chunks (id, post_number, section_title, content, chunk_type) \
+             VALUES (1, 1, '旧セクション', '旧データの本文テキスト', 'section')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO fts_chunks(rowid, content) VALUES (1, '旧データの本文テキスト')",
+            [],
+        )
+        .unwrap();
+
+        // 前提確認: 旧データが検索可能
+        let pre: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_chunks WHERE fts_chunks MATCH '旧データ'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(pre, 1, "precondition: old FTS data searchable");
+
+        // chunks テーブルを DROP して rebuild を失敗させる
+        conn.execute_batch("DROP TABLE chunks").unwrap();
+
+        let result = migrate_fts_v4(&conn);
+        assert!(
+            result.is_err(),
+            "[T-007] migrate_fts_v4 should fail when chunks table is missing"
+        );
+
+        // rollback 確認: version は "3" のまま
+        let version: String = conn
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "3", "[T-007] schema_version should remain '3'");
+
+        // rollback 確認: 旧 FTS data が生存（実検索 MATCH）
+        let post: u32 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM fts_chunks WHERE fts_chunks MATCH '旧データ'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(post, 1, "[T-007] old FTS data must survive after rollback");
+    }
+
+    // T-004: temp file DB + 旧スキーマ → Db::open で migration (FR-005)
+    #[test]
+    fn migration_from_old_schema_rebuilds_fts_with_section_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("migration_test.db");
+
+        // 旧スキーマ DB を手動構築
+        {
+            ensure_sqlite_vec().unwrap();
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
+                .unwrap();
+            conn.execute_batch(
+                "CREATE TABLE posts (
+                     number INTEGER PRIMARY KEY, name TEXT NOT NULL,
+                     full_name TEXT NOT NULL, body_md TEXT NOT NULL DEFAULT '',
+                     category TEXT, tags TEXT NOT NULL DEFAULT '[]',
+                     wip INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL DEFAULT 'stock',
+                     url TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                     created_by TEXT NOT NULL, updated_by TEXT NOT NULL,
+                     revision_number INTEGER NOT NULL DEFAULT 0
+                 );
+                 CREATE INDEX idx_posts_updated ON posts(updated_at);
+                 CREATE TABLE chunks (
+                     id INTEGER PRIMARY KEY, post_number INTEGER NOT NULL,
+                     section_title TEXT, content TEXT NOT NULL,
+                     chunk_type TEXT NOT NULL DEFAULT 'section'
+                 );
+                 CREATE INDEX idx_chunks_post ON chunks(post_number);
+                 CREATE TABLE sync_state (
+                     id INTEGER PRIMARY KEY CHECK (id = 1),
+                     latest_updated_at TEXT, total_count INTEGER NOT NULL DEFAULT 0,
+                     local_count INTEGER NOT NULL DEFAULT 0, last_page INTEGER,
+                     updated_at TEXT NOT NULL DEFAULT ''
+                 );
+                 CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+            )
+            .unwrap();
+            // 旧 1-column FTS
+            conn.execute_batch(
+                "CREATE VIRTUAL TABLE fts_chunks USING fts5(content, tokenize='trigram');
+                 CREATE VIRTUAL TABLE fts_chunks_vocab USING fts5vocab(fts_chunks, row);",
+            )
+            .unwrap();
+            conn.execute_batch(&format!(
+                "CREATE VIRTUAL TABLE vec_chunks USING vec0(\
+                     chunk_id INTEGER PRIMARY KEY, \
+                     embedding FLOAT[{}])",
+                rurico::embed::EMBEDDING_DIMS,
+            ))
+            .unwrap();
+            conn.execute(
+                "INSERT INTO index_meta (key, value) VALUES ('schema_version', '3')",
+                [],
+            )
+            .unwrap();
+            // テストデータ
+            conn.execute(
+                "INSERT INTO posts (number, name, full_name, body_md, url, created_at, \
+                 updated_at, created_by, updated_by) \
+                 VALUES (1, '認証ガイド', 'dev/認証ガイド', '# 認証ガイド\n認証フローの説明', \
+                 'https://example.esa.io/posts/1', '2025-01-01T00:00:00+09:00', \
+                 '2025-01-01T00:00:00+09:00', 'alice', 'alice')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO chunks (id, post_number, section_title, content, chunk_type) \
+                 VALUES (1, 1, '認証ガイド', '認証フローの説明', 'section')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO fts_chunks(rowid, content) VALUES (1, '認証フローの説明')",
+                [],
+            )
+            .unwrap();
+        }
+
+        // Db::open で migration 発火
+        let db = Db::open(&db_path).unwrap();
+
+        // schema_version = "4"
+        let version: String = db
+            .conn()
+            .query_row(
+                "SELECT value FROM index_meta WHERE key = 'schema_version'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "4", "[T-004] schema_version should be '4'");
+
+        // section_title の語で検索可能
+        let hits: u32 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM fts_chunks WHERE fts_chunks MATCH '認証ガイド'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            hits > 0,
+            "[T-004] section_title term should match after migration"
+        );
+
+        // fts_chunks_vocab が機能
+        let vocab: u32 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM fts_chunks_vocab", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(vocab > 0, "[T-004] fts_chunks_vocab should be populated");
     }
 }
