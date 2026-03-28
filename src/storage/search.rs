@@ -17,12 +17,16 @@ pub struct SearchResult {
 
 /// FTS5 trigram search with fts5vocab short-term expansion.
 pub fn fts_search(conn: &Connection, query: &str, limit: u32) -> Result<Vec<FtsHit>, StorageError> {
-    let sanitized = sanitize_fts(query);
-    let expanded = rurico::storage::fts_expand_short_terms(conn, &sanitized);
+    let normalized = normalize_punctuation(query);
+    let matched = match rurico::storage::prepare_match_query(conn, &normalized) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(%e, query, "query produced no searchable terms");
+            return Ok(Vec::new());
+        }
+    };
 
-    if expanded.trim().is_empty() {
-        return Ok(Vec::new());
-    }
+    let match_query = clean_for_trigram(matched.as_str());
 
     let mut stmt = conn.prepare(
         "SELECT c.id, c.post_number, c.section_title, c.content, f.rank \
@@ -34,7 +38,7 @@ pub fn fts_search(conn: &Connection, query: &str, limit: u32) -> Result<Vec<FtsH
     )?;
 
     let rows: Vec<FtsHit> = stmt
-        .query_map(rusqlite::params![expanded, limit], |row| {
+        .query_map(rusqlite::params![&match_query, limit], |row| {
             Ok(FtsHit {
                 chunk_id: row.get(0)?,
                 post_number: row.get(1)?,
@@ -195,11 +199,116 @@ pub struct VecHit {
     pub content: String,
 }
 
-fn sanitize_fts(query: &str) -> String {
-    query
+/// Strip general punctuation while preserving technical term characters.
+///
+/// Characters like `+`, `#`, `.`, `/`, `_`, `@` appear in technical terms
+/// (`C++`, `C#`, `.NET`, `/api/v1`) and must survive so that rurico's
+/// `prepare_match_query` can quote or expand them correctly.
+///
+/// `:` and `-` are intentionally stripped because rurico's
+/// `sanitize_fts_query` quotes terms containing them, and
+/// `fts_expand_short_terms` then re-quotes, producing double-quoted
+/// FTS5 queries that match nothing. Until rurico fixes this, terms like
+/// `std::io` and `rate-limit` are split into separate words (`std io`,
+/// `rate limit`) for broader-but-working recall.
+fn normalize_punctuation(query: &str) -> String {
+    let result: String = query
         .chars()
-        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
-        .collect()
+        .map(|c| {
+            if c.is_alphanumeric() || c.is_whitespace() || "+#./_@".contains(c) {
+                c
+            } else {
+                ' '
+            }
+        })
+        .collect();
+    result.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Adapt rurico's MatchFtsQuery output for FTS5 trigram tokenizer.
+///
+/// rurico targets standard FTS5 (Unicode61). The trigram tokenizer does
+/// not support parenthesized OR groups combined with other terms via
+/// implicit AND (e.g. `("a" OR "b") "c"` fails). This function:
+///
+/// 1. Strips control characters from vocab-expanded terms (trigram vocab
+///    can include newlines, e.g. "認証\n").
+/// 2. Drops sub-trigram terms (<3 chars) created by step 1.
+/// 3. Distributes OR groups across fixed terms to eliminate parentheses:
+///    `(A OR B) C` → `A C OR B C`.
+///    When the query is a single group with no other terms, the parens
+///    are simply removed (single-group queries work in trigram FTS5).
+fn cross_product(groups: &[Vec<String>]) -> Vec<Vec<String>> {
+    if groups.is_empty() {
+        return vec![vec![]];
+    }
+    let rest = cross_product(&groups[1..]);
+    let mut result = Vec::new();
+    for term in &groups[0] {
+        for combo in &rest {
+            let mut v = vec![term.clone()];
+            v.extend(combo.iter().cloned());
+            result.push(v);
+        }
+    }
+    result
+}
+
+fn clean_for_trigram(query: &str) -> String {
+    let cleaned: String = query.chars().filter(|c| !c.is_control()).collect();
+
+    // Parse into segments: quoted terms and OR groups
+    let mut fixed: Vec<String> = Vec::new();
+    let mut or_groups: Vec<Vec<String>> = Vec::new();
+    let mut chars = cleaned.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        if c == '(' {
+            let mut group = String::new();
+            for gc in chars.by_ref() {
+                if gc == ')' {
+                    break;
+                }
+                group.push(gc);
+            }
+            let terms: Vec<String> = group
+                .split(" OR ")
+                .filter(|t| t.trim().trim_matches('"').chars().count() >= 3)
+                .map(|t| t.trim().to_string())
+                .collect();
+            if !terms.is_empty() {
+                or_groups.push(terms);
+            }
+        } else if c == '"' {
+            let mut term = String::from('"');
+            for tc in chars.by_ref() {
+                term.push(tc);
+                if tc == '"' {
+                    break;
+                }
+            }
+            fixed.push(term);
+        }
+        // skip whitespace between segments
+    }
+
+    // No OR groups → return fixed terms joined
+    if or_groups.is_empty() {
+        return fixed.join(" ");
+    }
+
+    // Cross-product of all OR groups, then append fixed terms to each combo.
+    // E.g. (A1 OR A2) (B1 OR B2) C → A1 B1 C OR A1 B2 C OR A2 B1 C OR A2 B2 C
+    let combos = cross_product(&or_groups);
+    let alternatives: Vec<String> = combos
+        .iter()
+        .map(|combo| {
+            let mut parts = combo.clone();
+            parts.extend(fixed.iter().cloned());
+            parts.join(" ")
+        })
+        .collect();
+    alternatives.join(" OR ")
 }
 
 fn truncate_snippet(s: &str, max_chars: usize) -> String {
@@ -316,10 +425,125 @@ mod tests {
     }
 
     #[test]
-    fn sanitize_removes_special_chars_and_quotes() {
-        assert_eq!(sanitize_fts("hello; DROP TABLE"), "hello DROP TABLE");
-        assert_eq!(sanitize_fts("認証 AND フロー"), "認証 AND フロー");
-        assert_eq!(sanitize_fts("\"injected\""), "injected");
+    fn normalize_punctuation_strips_general_keeps_technical() {
+        // General punctuation → space
+        assert_eq!(
+            normalize_punctuation("hello; DROP TABLE"),
+            "hello DROP TABLE"
+        );
+        assert_eq!(normalize_punctuation("認証、フロー"), "認証 フロー");
+        assert_eq!(normalize_punctuation("\"injected\""), "injected");
+        assert_eq!(normalize_punctuation("  "), "");
+
+        // Technical characters preserved
+        assert_eq!(normalize_punctuation("C++"), "C++");
+        assert_eq!(normalize_punctuation("C#"), "C#");
+        assert_eq!(normalize_punctuation("/api/v1"), "/api/v1");
+        assert_eq!(normalize_punctuation(".NET"), ".NET");
+        assert_eq!(normalize_punctuation("user@example"), "user@example");
+
+        // : and - are stripped (rurico double-quoting bug workaround)
+        assert_eq!(normalize_punctuation("std::io"), "std io");
+        assert_eq!(normalize_punctuation("rate-limit"), "rate limit");
+    }
+
+    #[test]
+    fn clean_for_trigram_adapts_query() {
+        // Control chars removed + sub-trigram dropped + distributed
+        assert_eq!(
+            clean_for_trigram("(\"認証の\" OR \"認証\n\" OR \"認証フ\") \"フロー\""),
+            "\"認証の\" \"フロー\" OR \"認証フ\" \"フロー\""
+        );
+        // Single-element group + fixed term → distributed
+        assert_eq!(clean_for_trigram("\"std\" (\"ioの\")"), "\"ioの\" \"std\"");
+        // Multi-element group + fixed term → distributed
+        assert_eq!(
+            clean_for_trigram("(\"abc\" OR \"def\") \"ghi\""),
+            "\"abc\" \"ghi\" OR \"def\" \"ghi\""
+        );
+        // No parens → unchanged
+        assert_eq!(clean_for_trigram("\"hello\""), "\"hello\"");
+        // Single group, no fixed terms → just OR
+        assert_eq!(
+            clean_for_trigram("(\"abc\" OR \"def\")"),
+            "\"abc\" OR \"def\""
+        );
+        // Multiple OR groups → cross-product
+        assert_eq!(
+            clean_for_trigram("(\"a01\" OR \"a02\") (\"b01\" OR \"b02\")"),
+            "\"a01\" \"b01\" OR \"a01\" \"b02\" OR \"a02\" \"b01\" OR \"a02\" \"b02\""
+        );
+        // Multiple OR groups + fixed term
+        assert_eq!(
+            clean_for_trigram("(\"a01\" OR \"a02\") \"xyz\" (\"b01\" OR \"b02\")"),
+            "\"a01\" \"b01\" \"xyz\" OR \"a01\" \"b02\" \"xyz\" OR \"a02\" \"b01\" \"xyz\" OR \"a02\" \"b02\" \"xyz\""
+        );
+    }
+
+    #[test]
+    fn fts_search_with_punctuation_does_not_error() {
+        let db = Db::open_memory().unwrap();
+        setup_db_with_posts(&db);
+
+        let hits = fts_search(db.conn(), "認証、フロー", 10).unwrap();
+        let _ = hits;
+    }
+
+    #[test]
+    fn fts_search_technical_terms_e2e() {
+        let db = Db::open_memory().unwrap();
+        let posts = [
+            (
+                10,
+                "C++ guide",
+                "# C++入門\nC++のテンプレートとstd::ioの使い方",
+            ),
+            (
+                11,
+                "rate-limit設計",
+                "# rate-limit\nAPIのrate-limitを実装する手順",
+            ),
+        ];
+        for (num, name, body) in &posts {
+            storage::upsert_post(
+                db.conn(),
+                &storage::EsaPostRow {
+                    number: *num,
+                    name: name.to_string(),
+                    full_name: format!("dev/{name}"),
+                    body_md: body.to_string(),
+                    category: Some("dev".into()),
+                    tags: "[]".into(),
+                    wip: false,
+                    kind: "stock".into(),
+                    url: format!("https://example.esa.io/posts/{num}"),
+                    created_at: "2025-01-01T00:00:00+09:00".into(),
+                    updated_at: "2025-01-01T00:00:00+09:00".into(),
+                    created_by: "alice".into(),
+                    updated_by: "alice".into(),
+                    revision_number: 1,
+                },
+            )
+            .unwrap();
+            storage::rechunk_post(db.conn(), *num, body).unwrap();
+        }
+
+        // C++ should match post 10 (+ is preserved, no rurico quoting issue)
+        let hits = fts_search(db.conn(), "C++", 10).unwrap();
+        assert!(!hits.is_empty(), "C++ should match");
+        assert!(hits.iter().any(|h| h.post_number == 10));
+
+        // rate-limit → "rate limit" (- stripped). Both ≥3 chars, no vocab
+        // expansion needed, so no single-element parenthesization issue.
+        let hits = fts_search(db.conn(), "rate-limit", 10).unwrap();
+        assert!(!hits.is_empty(), "rate-limit (split) should match");
+        assert!(hits.iter().any(|h| h.post_number == 11));
+
+        // std::io → "std io" (: stripped). "io" (2 chars) expands via vocab.
+        // clean_for_trigram unwraps single-element parens for trigram compat.
+        let hits = fts_search(db.conn(), "std::io", 10).unwrap();
+        assert!(!hits.is_empty(), "std::io (split) should match");
+        assert!(hits.iter().any(|h| h.post_number == 10));
     }
 
     #[test]
