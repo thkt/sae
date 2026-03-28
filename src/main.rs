@@ -10,7 +10,7 @@ struct Cli {
     command: Command,
 }
 
-#[derive(Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Command {
     /// Fetch and index esa posts
     Harvest {
@@ -109,6 +109,32 @@ enum Command {
     },
 }
 
+const KNOWN_SUBCOMMANDS: &[&str] = &[
+    "harvest", "search", "get", "create", "update", "archive", "ship", "embed", "status",
+];
+
+fn parse_cli_args<I, T>(args: I) -> Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
+
+    // Shorthand: `sae "query"` → `sae search "query"`
+    // Conditions: exactly 2 args, second arg doesn't start with '-',
+    // and second arg is not a known subcommand name.
+    if args.len() == 2
+        && let Some(first_arg) = args[1].to_str()
+        && !first_arg.starts_with('-')
+        && !KNOWN_SUBCOMMANDS.contains(&first_arg)
+    {
+        let expanded = vec![args[0].clone(), "search".into(), args[1].clone()];
+        return Cli::try_parse_from(expanded);
+    }
+
+    Cli::try_parse_from(args)
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::fmt()
@@ -118,7 +144,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .init();
 
-    let cli = Cli::parse();
+    let cli = parse_cli_args(std::env::args_os()).unwrap_or_else(|e| e.exit());
     let config = Config::load()?;
 
     match cli.command {
@@ -146,8 +172,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     None
                 }
             });
-            let results =
-                sae::storage::hybrid_search(db.conn(), &query, query_embedding.as_deref(), limit)?;
+            let results = sae::storage::hybrid_search(
+                db.conn(),
+                &query,
+                query_embedding.as_deref(),
+                limit,
+                chrono::Utc::now(),
+            )?;
             if results.is_empty() {
                 println!("No results for '{query}'");
             } else {
@@ -364,6 +395,55 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // T-029: shorthand `sae "認証"` → search
+    #[test]
+    fn shorthand_single_query_becomes_search() {
+        let cli = parse_cli_args(["sae", "認証"]).unwrap();
+        match cli.command {
+            Command::Search { query, .. } => assert_eq!(query, "認証"),
+            other => panic!("expected Search, got {other:?}"),
+        }
+    }
+
+    // T-030: explicit `sae search "認証"` is not double-injected
+    #[test]
+    fn explicit_search_not_double_injected() {
+        let cli = parse_cli_args(["sae", "search", "認証"]).unwrap();
+        match cli.command {
+            Command::Search { query, .. } => assert_eq!(query, "認証"),
+            other => panic!("expected Search, got {other:?}"),
+        }
+    }
+
+    // T-031: `sae harvest team` stays as harvest
+    #[test]
+    fn known_subcommand_not_shorthand() {
+        let cli = parse_cli_args(["sae", "harvest", "myteam"]).unwrap();
+        match cli.command {
+            Command::Harvest { team, .. } => assert_eq!(team, "myteam"),
+            other => panic!("expected Harvest, got {other:?}"),
+        }
+    }
+
+    // T-033: `sae search` (missing required arg) → clap error via helper
+    #[test]
+    fn search_missing_arg_is_clap_error() {
+        let result = parse_cli_args(["sae", "search"]);
+        assert!(result.is_err(), "search without query should be clap error");
+    }
+
+    // T-034: `sae harvest` (missing required arg) → clap error via helper
+    #[test]
+    fn harvest_missing_arg_is_clap_error() {
+        let result = parse_cli_args(["sae", "harvest"]);
+        assert!(result.is_err(), "harvest without team should be clap error");
+    }
 }
 
 fn try_load_embedder() -> Option<Embedder> {
