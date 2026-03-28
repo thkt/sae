@@ -82,12 +82,18 @@ pub fn vec_search(
     Ok(rows)
 }
 
-/// Hybrid search: merge FTS5 + vector results via Reciprocal Rank Fusion.
+const RECENCY_HALF_LIFE: f64 = 30.0;
+const RECENCY_WEIGHT: f64 = 0.2;
+const SECS_PER_DAY: f64 = 86_400.0;
+
+/// Hybrid search: merge FTS5 + vector results via Reciprocal Rank Fusion,
+/// then apply recency decay boost based on `updated_at`.
 pub fn hybrid_search(
     conn: &Connection,
     query: &str,
     query_embedding: Option<&[f32]>,
     limit: u32,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Vec<SearchResult>, StorageError> {
     let candidate_limit = limit * 3;
 
@@ -109,22 +115,42 @@ pub fn hybrid_search(
     let vec_ranked: Vec<(u32, f64)> = vec_hits.iter().map(|h| (h.post_number, 0.0)).collect();
     let merged = rurico::storage::rrf_merge(&fts_ranked, &vec_ranked);
 
-    let post_numbers: Vec<u32> = merged
-        .iter()
-        .take(limit as usize)
-        .map(|(pn, _)| *pn)
-        .collect();
-    let post_meta = batch_fetch_post_meta(conn, &post_numbers)?;
+    // Fetch metadata for all candidates (not just limit) to apply decay before truncation
+    let candidate_numbers: Vec<u32> = merged.iter().map(|(pn, _)| *pn).collect();
+    let post_meta = batch_fetch_post_meta(conn, &candidate_numbers)?;
 
     let fts_map: HashMap<u32, &FtsHit> = fts_hits.iter().map(|h| (h.post_number, h)).collect();
     let vec_map: HashMap<u32, &VecHit> = vec_hits.iter().map(|h| (h.post_number, h)).collect();
 
+    // Apply recency decay to all candidates, then re-sort
+    let mut scored: Vec<(u32, f64)> = merged
+        .into_iter()
+        .map(|(post_number, rrf_score)| {
+            let decay = post_meta
+                .get(&post_number)
+                .and_then(|(_, _, updated_at)| {
+                    chrono::DateTime::parse_from_rfc3339(updated_at)
+                        .map_err(|e| warn!(%e, %updated_at, "unparseable updated_at, decay=0.0"))
+                        .ok()
+                })
+                .map(|updated| {
+                    let age_days = (now - updated.with_timezone(&chrono::Utc)).num_seconds() as f64
+                        / SECS_PER_DAY;
+                    rurico::storage::recency_decay(age_days, RECENCY_HALF_LIFE)
+                })
+                .unwrap_or(0.0);
+            let boosted = rrf_score * (1.0 + RECENCY_WEIGHT * decay);
+            (post_number, boosted)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+
     let mut results = Vec::new();
-    for (post_number, score) in merged.into_iter().take(limit as usize) {
-        let (name, url) = post_meta
+    for (post_number, score) in scored.into_iter().take(limit as usize) {
+        let (name, url, _) = post_meta
             .get(&post_number)
             .cloned()
-            .unwrap_or_else(|| (format!("#{post_number}"), String::new()));
+            .unwrap_or_else(|| (format!("#{post_number}"), String::new(), String::new()));
 
         let (section_title, snippet) = fts_map
             .get(&post_number)
@@ -152,13 +178,13 @@ pub fn hybrid_search(
 fn batch_fetch_post_meta(
     conn: &Connection,
     post_numbers: &[u32],
-) -> Result<HashMap<u32, (String, String)>, StorageError> {
+) -> Result<HashMap<u32, (String, String, String)>, StorageError> {
     if post_numbers.is_empty() {
         return Ok(HashMap::new());
     }
     let placeholders: Vec<String> = (1..=post_numbers.len()).map(|i| format!("?{i}")).collect();
     let sql = format!(
-        "SELECT number, name, url FROM posts WHERE number IN ({})",
+        "SELECT number, name, url, updated_at FROM posts WHERE number IN ({})",
         placeholders.join(", ")
     );
     let mut stmt = conn.prepare(&sql)?;
@@ -172,12 +198,13 @@ fn batch_fetch_post_meta(
                 row.get::<_, u32>(0)?,
                 row.get::<_, String>(1)?,
                 row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows
         .into_iter()
-        .map(|(n, name, url)| (n, (name, url)))
+        .map(|(n, name, url, updated_at)| (n, (name, url, updated_at)))
         .collect())
 }
 
@@ -260,7 +287,7 @@ fn clean_for_trigram(query: &str) -> String {
     // Parse into segments: quoted terms and OR groups
     let mut fixed: Vec<String> = Vec::new();
     let mut or_groups: Vec<Vec<String>> = Vec::new();
-    let mut chars = cleaned.chars().peekable();
+    let mut chars = cleaned.chars();
 
     while let Some(c) = chars.next() {
         if c == '(' {
@@ -408,7 +435,8 @@ mod tests {
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
 
-        let results = hybrid_search(db.conn(), "認証フロー", None, 10).unwrap();
+        let results =
+            hybrid_search(db.conn(), "認証の仕組み", None, 10, chrono::Utc::now()).unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].post_number, 1);
         assert!(!results[0].post_name.is_empty());
@@ -420,7 +448,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
 
-        let results = hybrid_search(db.conn(), "", None, 10).unwrap();
+        let results = hybrid_search(db.conn(), "", None, 10, chrono::Utc::now()).unwrap();
         assert!(results.is_empty());
     }
 
@@ -553,8 +581,9 @@ mod tests {
 
         let meta = batch_fetch_post_meta(db.conn(), &[1, 3]).unwrap();
         assert_eq!(meta.len(), 2);
-        assert!(meta.get(&1).unwrap().0.contains("認証"));
-        assert!(meta.get(&3).unwrap().0.contains("デプロイ"));
+        assert!(meta.get(&1).unwrap().0.contains("認証")); // name
+        assert!(meta.get(&3).unwrap().0.contains("デプロイ")); // name
+        assert!(!meta.get(&1).unwrap().2.is_empty()); // updated_at
     }
 
     #[test]
@@ -562,5 +591,98 @@ mod tests {
         let db = Db::open_memory().unwrap();
         let meta = batch_fetch_post_meta(db.conn(), &[]).unwrap();
         assert!(meta.is_empty());
+    }
+
+    // T-024: recent post scores higher than old post
+    #[test]
+    fn hybrid_search_recency_boost_recent_post_scores_higher() {
+        let db = Db::open_memory().unwrap();
+
+        // Post A: updated 1 day ago, Post B: updated 30 days ago.
+        // Both match the same query so raw RRF scores are equal.
+        let shared_body = "# 認証フロー\n認証の仕組みを説明します";
+        let posts = [
+            (1u32, "PostA", "2025-01-31T00:00:00+09:00"), // 1 day before "now"
+            (2u32, "PostB", "2025-01-02T00:00:00+09:00"), // 30 days before "now"
+        ];
+        for (num, name, updated) in &posts {
+            storage::upsert_post(
+                db.conn(),
+                &storage::EsaPostRow {
+                    number: *num,
+                    name: name.to_string(),
+                    full_name: format!("dev/{name}"),
+                    body_md: shared_body.to_string(),
+                    category: Some("dev".into()),
+                    tags: "[]".into(),
+                    wip: false,
+                    kind: "stock".into(),
+                    url: format!("https://example.esa.io/posts/{num}"),
+                    created_at: "2025-01-01T00:00:00+09:00".into(),
+                    updated_at: updated.to_string(),
+                    created_by: "alice".into(),
+                    updated_by: "alice".into(),
+                    revision_number: 1,
+                },
+            )
+            .unwrap();
+            storage::rechunk_post(db.conn(), *num, shared_body).unwrap();
+        }
+
+        let now = chrono::DateTime::parse_from_rfc3339("2025-02-01T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let results = hybrid_search(db.conn(), "認証の仕組み", None, 10, now).unwrap();
+        assert!(results.len() >= 2, "both posts should match");
+
+        let score_a = results.iter().find(|r| r.post_number == 1).unwrap().score;
+        let score_b = results.iter().find(|r| r.post_number == 2).unwrap().score;
+        assert!(
+            score_a > score_b,
+            "post A (1 day old) should score higher than post B (30 days old), \
+             got A={score_a} B={score_b}"
+        );
+    }
+
+    // T-025: unparseable updated_at does not panic, decay=0.0 applied
+    #[test]
+    fn hybrid_search_unparseable_updated_at_no_panic() {
+        let db = Db::open_memory().unwrap();
+
+        let body = "# 認証フロー\n認証の仕組みを説明します";
+        storage::upsert_post(
+            db.conn(),
+            &storage::EsaPostRow {
+                number: 1,
+                name: "BadDate".to_string(),
+                full_name: "dev/BadDate".to_string(),
+                body_md: body.to_string(),
+                category: Some("dev".into()),
+                tags: "[]".into(),
+                wip: false,
+                kind: "stock".into(),
+                url: "https://example.esa.io/posts/1".into(),
+                created_at: "2025-01-01T00:00:00+09:00".into(),
+                updated_at: "not-a-date".into(),
+                created_by: "alice".into(),
+                updated_by: "alice".into(),
+                revision_number: 1,
+            },
+        )
+        .unwrap();
+        storage::rechunk_post(db.conn(), 1, body).unwrap();
+
+        let now = chrono::DateTime::parse_from_rfc3339("2025-02-01T00:00:00+00:00")
+            .unwrap()
+            .with_timezone(&chrono::Utc);
+        let results = hybrid_search(db.conn(), "認証の仕組み", None, 10, now).unwrap();
+
+        // Must not panic. With decay=0.0 the boost factor is
+        // (1.0 + 0.2 * 0.0) = 1.0, so score equals raw RRF score.
+        assert!(!results.is_empty(), "post should still be returned");
+        assert!(
+            results[0].score > 0.0,
+            "score should be positive (raw RRF with 1.0x boost)"
+        );
     }
 }
