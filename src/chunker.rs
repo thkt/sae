@@ -74,8 +74,6 @@ fn split_oversized(chunk: Chunk) -> Vec<Chunk> {
     if chunk.content.len() <= MAX_CHUNK_BYTES {
         return vec![chunk];
     }
-    // Heading is already excluded from content at chunk creation (line 56).
-    // FTS indexing of section_title is tracked in #8.
     rurico::text::split_text(&chunk.content, MAX_CHUNK_BYTES)
         .into_iter()
         .map(|part| Chunk {

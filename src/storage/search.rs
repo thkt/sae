@@ -350,6 +350,25 @@ mod tests {
     use super::*;
     use crate::storage::{self, Db};
 
+    fn test_post(number: u32, name: &str, body_md: &str) -> storage::EsaPostRow {
+        storage::EsaPostRow {
+            number,
+            name: name.to_string(),
+            full_name: format!("dev/{name}"),
+            body_md: body_md.to_string(),
+            category: Some("dev".into()),
+            tags: "[]".into(),
+            wip: false,
+            kind: "stock".into(),
+            url: format!("https://example.esa.io/posts/{number}"),
+            created_at: "2025-01-01T00:00:00+09:00".into(),
+            updated_at: "2025-01-01T00:00:00+09:00".into(),
+            created_by: "alice".into(),
+            updated_by: "alice".into(),
+            revision_number: 1,
+        }
+    }
+
     fn setup_db_with_posts(db: &Db) {
         let posts = [
             (
@@ -684,5 +703,62 @@ mod tests {
             results[0].score > 0.0,
             "score should be positive (raw RRF with 1.0x boost)"
         );
+    }
+
+    // T-002: content のみの語で fts_search ヒット — regression (FR-003)
+    #[test]
+    fn fts_search_matches_content_only_term_regression() {
+        let db = Db::open_memory().unwrap();
+        let body = "# 認証ガイド\nフローの説明をします";
+        let post = test_post(1, "テスト", body);
+        storage::upsert_post(db.conn(), &post).unwrap();
+        storage::rechunk_post(db.conn(), 1, body).unwrap();
+
+        let hits = fts_search(db.conn(), "フローの説明", 10).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "[T-002] content-only term must still be found (regression)"
+        );
+        assert_eq!(hits[0].post_number, 1);
+    }
+
+    // T-003: heading なし preamble chunk で rechunk + fts_search エラーなし (FR-004)
+    #[test]
+    fn fts_search_preamble_chunk_no_heading_no_error() {
+        let db = Db::open_memory().unwrap();
+        let body = "見出しなしの本文テキストです";
+        let post = test_post(1, "Preamble", body);
+        storage::upsert_post(db.conn(), &post).unwrap();
+        let count = storage::rechunk_post(db.conn(), 1, body).unwrap();
+        assert_eq!(count, 1, "[T-003] preamble should produce 1 chunk");
+
+        let hits = fts_search(db.conn(), "見出しなし", 10).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "[T-003] preamble chunk should be searchable by content"
+        );
+        assert!(
+            hits[0].section_title.is_none(),
+            "[T-003] preamble chunk should have no section_title"
+        );
+    }
+
+    // T-001: section_title のみの語で fts_search ヒット (FR-003)
+    #[test]
+    fn fts_search_matches_section_title_only_term() {
+        let db = Db::open_memory().unwrap();
+        let body = "# 認証ガイド\nフローの説明をします";
+        let post = test_post(1, "テスト", body);
+        storage::upsert_post(db.conn(), &post).unwrap();
+        storage::rechunk_post(db.conn(), 1, body).unwrap();
+
+        // "認証ガイド" は section_title にのみ存在、content には含まれない
+        let hits = fts_search(db.conn(), "認証ガイド", 10).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "[T-001] section_title-only term should be found via FTS"
+        );
+        assert_eq!(hits[0].post_number, 1);
+        assert_eq!(hits[0].section_title.as_deref(), Some("認証ガイド"));
     }
 }
