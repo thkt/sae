@@ -66,6 +66,10 @@ pub fn has_embeddings(conn: &Connection) -> bool {
     conn.query_row("SELECT EXISTS(SELECT 1 FROM vec_chunks)", [], |row| {
         row.get(0)
     })
+    .map_err(|e| {
+        tracing::warn!(error = %e, "has_embeddings query failed, assuming no embeddings");
+        e
+    })
     .unwrap_or(false)
 }
 

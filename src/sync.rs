@@ -71,7 +71,7 @@ pub async fn harvest(
     // esa API caps pagination at 10,000 items per query.
     // When hit, we narrow by updated_at window and continue.
     let mut window_boundary: Option<String> = None;
-    let mut batch_oldest: Option<String> = None;
+    let mut batch_oldest_ts: Option<String> = None;
 
     'outer: loop {
         let query = build_window_query(base_query.as_deref(), window_boundary.as_deref());
@@ -79,14 +79,14 @@ pub async fn harvest(
         let resp = match client.list_posts(team, page, query.as_deref()).await {
             Ok(r) => r,
             Err(ClientError::Api(ref msg)) if is_pagination_limit(msg) => {
-                if let Some(ref oldest) = batch_oldest {
+                if let Some(ref oldest) = batch_oldest_ts {
                     if window_boundary.as_ref() == Some(oldest) {
                         eprintln!("  window didn't advance, stopping");
                         break;
                     }
                     eprintln!("  pagination limit — narrowing to updated:<={oldest}");
                     window_boundary = Some(oldest.clone());
-                    batch_oldest = None;
+                    batch_oldest_ts = None;
                     page = 1;
                     continue 'outer;
                 }
@@ -107,8 +107,8 @@ pub async fn harvest(
             if latest.as_ref().is_none_or(|l| row.updated_at > *l) {
                 latest = Some(row.updated_at.clone());
             }
-            if batch_oldest.as_ref().is_none_or(|o| row.updated_at < *o) {
-                batch_oldest = Some(row.updated_at.clone());
+            if batch_oldest_ts.as_ref().is_none_or(|o| row.updated_at < *o) {
+                batch_oldest_ts = Some(row.updated_at.clone());
             }
             storage::upsert_post(&tx, &row)?;
             storage::rechunk_post(&tx, row.number, &row.body_md)?;
@@ -573,5 +573,60 @@ mod tests {
         };
         let s = r.to_string();
         assert!(s.contains("gap detected: 10 missing"));
+    }
+
+    #[tokio::test]
+    async fn pagination_limit_narrows_window() {
+        let server = MockServer::start().await;
+
+        // First request hits 10,000-item pagination limit
+        Mock::given(method("GET"))
+            .and(path("/teams/t/posts"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(posts_response(
+                vec![
+                    api_post(1, "A", "2025-01-03T00:00:00+09:00"),
+                    api_post(2, "B", "2025-01-02T00:00:00+09:00"),
+                ],
+                Some(2),
+                10001,
+            )))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Second request (page 2) returns pagination limit error
+        Mock::given(method("GET"))
+            .and(path("/teams/t/posts"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "bad_request",
+                "message": "Pagination limit: exceeds 10,000 items"
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Narrowed window request succeeds
+        Mock::given(method("GET"))
+            .and(path("/teams/t/posts"))
+            .and(query_param("q", "updated:<=2025-01-02T00:00:00+09:00"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(posts_response(
+                vec![api_post(3, "C", "2025-01-01T00:00:00+09:00")],
+                None,
+                1,
+            )))
+            .mount(&server)
+            .await;
+
+        let client = EsaClient::with_base_url("tok".into(), server.uri());
+        let db = Db::open_memory().unwrap();
+
+        let r = harvest(&client, &db, "t", false).await.unwrap();
+        assert!(
+            r.posts_fetched >= 3,
+            "should fetch posts across window narrowing"
+        );
+        assert_eq!(storage::count_posts(db.conn()).unwrap(), 3);
     }
 }

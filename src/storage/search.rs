@@ -118,28 +118,7 @@ pub fn hybrid_search(
     let fts_map: HashMap<u32, &FtsHit> = fts_hits.iter().map(|h| (h.post_number, h)).collect();
     let vec_map: HashMap<u32, &VecHit> = vec_hits.iter().map(|h| (h.post_number, h)).collect();
 
-    let mut scored: Vec<(u32, f64)> = merged
-        .into_iter()
-        .map(|(post_number, rrf_score)| {
-            let decay = post_meta
-                .get(&post_number)
-                .and_then(|meta| {
-                    let updated_at = &meta.updated_at;
-                    chrono::DateTime::parse_from_rfc3339(updated_at)
-                        .map_err(|e| warn!(%e, %updated_at, "unparseable updated_at, decay=0.0"))
-                        .ok()
-                })
-                .map(|updated| {
-                    let age_days = (now - updated.with_timezone(&chrono::Utc)).num_seconds() as f64
-                        / SECS_PER_DAY;
-                    rurico::storage::recency_decay(age_days, RECENCY_HALF_LIFE)
-                })
-                .unwrap_or(0.0);
-            let boosted = rrf_score * (1.0 + RECENCY_WEIGHT * decay);
-            (post_number, boosted)
-        })
-        .collect();
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    let scored = apply_recency_boost(merged, &post_meta, now);
 
     let mut results = Vec::new();
     for (post_number, score) in scored.into_iter().take(limit as usize) {
@@ -173,6 +152,36 @@ pub fn hybrid_search(
     }
 
     Ok(results)
+}
+
+fn apply_recency_boost(
+    merged: Vec<(u32, f64)>,
+    post_meta: &HashMap<u32, PostMeta>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<(u32, f64)> {
+    let mut scored: Vec<(u32, f64)> = merged
+        .into_iter()
+        .map(|(post_number, rrf_score)| {
+            let decay = post_meta
+                .get(&post_number)
+                .and_then(|meta| {
+                    let updated_at = &meta.updated_at;
+                    chrono::DateTime::parse_from_rfc3339(updated_at)
+                        .map_err(|e| warn!(%e, %updated_at, "unparseable updated_at, decay=0.0"))
+                        .ok()
+                })
+                .map(|updated| {
+                    let age_days = (now - updated.with_timezone(&chrono::Utc)).num_seconds() as f64
+                        / SECS_PER_DAY;
+                    rurico::storage::recency_decay(age_days, RECENCY_HALF_LIFE)
+                })
+                .unwrap_or(0.0);
+            let boosted = rrf_score * (1.0 + RECENCY_WEIGHT * decay);
+            (post_number, boosted)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    scored
 }
 
 #[derive(Debug, Clone)]
@@ -241,20 +250,14 @@ pub struct VecHit {
     pub content: String,
 }
 
-/// Strip general punctuation while preserving technical term characters.
+/// Strip general punctuation while preserving technical term characters
+/// (`+`, `#`, `.`, `/`, `_`, `@`).
 ///
-/// Characters like `+`, `#`, `.`, `/`, `_`, `@` appear in technical terms
-/// (`C++`, `C#`, `.NET`, `/api/v1`) and must survive so that rurico's
-/// `prepare_match_query` can quote or expand them correctly.
-///
-/// `:` and `-` are intentionally stripped because rurico's
-/// `sanitize_fts_query` quotes terms containing them, and
-/// `fts_expand_short_terms` then re-quotes, producing double-quoted
-/// FTS5 queries that match nothing. Until rurico fixes this, terms like
-/// `std::io` and `rate-limit` are split into separate words (`std io`,
-/// `rate limit`) for broader-but-working recall.
+/// `:` and `-` are stripped to work around rurico double-quoting in
+/// `sanitize_fts_query` + `fts_expand_short_terms` (produces FTS5
+/// queries that match nothing).
 fn normalize_punctuation(query: &str) -> String {
-    let result: String = query
+    query
         .chars()
         .map(|c| {
             if c.is_alphanumeric() || c.is_whitespace() || "+#./_@".contains(c) {
@@ -263,23 +266,12 @@ fn normalize_punctuation(query: &str) -> String {
                 ' '
             }
         })
-        .collect();
-    result.split_whitespace().collect::<Vec<_>>().join(" ")
+        .collect::<String>()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-/// Adapt rurico's MatchFtsQuery output for FTS5 trigram tokenizer.
-///
-/// rurico targets standard FTS5 (Unicode61). The trigram tokenizer does
-/// not support parenthesized OR groups combined with other terms via
-/// implicit AND (e.g. `("a" OR "b") "c"` fails). This function:
-///
-/// 1. Strips control characters from vocab-expanded terms (trigram vocab
-///    can include newlines, e.g. "認証\n").
-/// 2. Drops sub-trigram terms (<3 chars) created by step 1.
-/// 3. Distributes OR groups across fixed terms to eliminate parentheses:
-///    `(A OR B) C` → `A C OR B C`.
-///    When the query is a single group with no other terms, the parens
-///    are simply removed (single-group queries work in trigram FTS5).
 fn cross_product(groups: &[Vec<String>]) -> Vec<Vec<String>> {
     if groups.is_empty() {
         return vec![vec![]];
@@ -296,10 +288,7 @@ fn cross_product(groups: &[Vec<String>]) -> Vec<Vec<String>> {
     result
 }
 
-fn clean_for_trigram(query: &str) -> String {
-    let cleaned: String = query.chars().filter(|c| !c.is_control()).collect();
-
-    // Parse into segments: quoted terms and OR groups
+fn parse_fts_segments(cleaned: &str) -> (Vec<String>, Vec<Vec<String>>) {
     let mut fixed: Vec<String> = Vec::new();
     let mut or_groups: Vec<Vec<String>> = Vec::new();
     let mut chars = cleaned.chars();
@@ -332,6 +321,19 @@ fn clean_for_trigram(query: &str) -> String {
             fixed.push(term);
         }
     }
+
+    (fixed, or_groups)
+}
+
+/// Adapt rurico's MatchFtsQuery output for FTS5 trigram tokenizer.
+///
+/// Trigram FTS5 does not support `("a" OR "b") "c"` (parenthesized
+/// OR + implicit AND). This distributes OR groups into flat alternatives:
+/// `(A OR B) C` → `A C OR B C`. Also strips control chars and drops
+/// sub-trigram terms (<3 chars).
+fn clean_for_trigram(query: &str) -> String {
+    let cleaned: String = query.chars().filter(|c| !c.is_control()).collect();
+    let (fixed, or_groups) = parse_fts_segments(&cleaned);
 
     if or_groups.is_empty() {
         return fixed.join(" ");
@@ -743,7 +745,8 @@ mod tests {
         storage::add_embeddings(db.conn(), &embeddings).unwrap();
 
         let query_emb = vec![0.1; EMBEDDING_DIMS as usize];
-        let results = hybrid_search(db.conn(), "認証", Some(&query_emb), 10, chrono::Utc::now()).unwrap();
+        let results =
+            hybrid_search(db.conn(), "認証", Some(&query_emb), 10, chrono::Utc::now()).unwrap();
         assert!(!results.is_empty());
         assert!(!results[0].post_name.is_empty());
         assert!(!results[0].post_url.is_empty());

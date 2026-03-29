@@ -208,7 +208,6 @@ impl EsaClient {
         self.send(|http| http.post(&url).json(&body)).await
     }
 
-    #[allow(clippy::too_many_arguments)]
     pub async fn update_post(
         &self,
         team: &str,
@@ -422,13 +421,16 @@ mod tests {
 
         let post = test_client(&server)
             .await
-            .create_post("myteam", &CreatePostParams {
-                name: "Test",
-                body_md: Some("# Body"),
-                category: None,
-                tags: vec![],
-                wip: true,
-            })
+            .create_post(
+                "myteam",
+                &CreatePostParams {
+                    name: "Test",
+                    body_md: Some("# Body"),
+                    category: None,
+                    tags: vec![],
+                    wip: true,
+                },
+            )
             .await
             .unwrap();
         assert_eq!(post.name, "Getting Started");
@@ -445,7 +447,14 @@ mod tests {
 
         let post = test_client(&server)
             .await
-            .update_post("myteam", 1, &UpdatePostParams { name: Some("New Name"), ..Default::default() })
+            .update_post(
+                "myteam",
+                1,
+                &UpdatePostParams {
+                    name: Some("New Name"),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(post.name, "Getting Started");
@@ -541,6 +550,31 @@ mod tests {
         assert!(retry_wait(404, None, 0).is_none());
     }
 
+    #[test]
+    fn retry_wait_429_non_numeric_header_defaults() {
+        assert_eq!(
+            retry_wait(429, Some("Thu, 01 Jan 2026 00:00:00 GMT"), 0),
+            Some(Duration::from_secs(5))
+        );
+    }
+
+    #[tokio::test]
+    async fn malformed_json_on_success_returns_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/teams/myteam/posts/1"))
+            .respond_with(ResponseTemplate::new(200).set_body_string("not json"))
+            .mount(&server)
+            .await;
+
+        let err = test_client(&server)
+            .await
+            .get_post("myteam", 1)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ClientError::Network(_)));
+    }
+
     fn test_esa_post(body_md: Option<String>) -> EsaPost {
         EsaPost {
             number: 42,
@@ -631,13 +665,16 @@ mod tests {
 
         test_client(&server)
             .await
-            .create_post("myteam", &CreatePostParams {
-                name: "My Title",
-                body_md: Some("# Content"),
-                category: Some("docs"),
-                tags: vec!["rust".into(), "api".into()],
-                wip: true,
-            })
+            .create_post(
+                "myteam",
+                &CreatePostParams {
+                    name: "My Title",
+                    body_md: Some("# Content"),
+                    category: Some("docs"),
+                    tags: vec!["rust".into(), "api".into()],
+                    wip: true,
+                },
+            )
             .await
             .unwrap();
     }
@@ -660,13 +697,16 @@ mod tests {
 
         test_client(&server)
             .await
-            .create_post("myteam", &CreatePostParams {
-                name: "Minimal",
-                body_md: None,
-                category: None,
-                tags: vec![],
-                wip: false,
-            })
+            .create_post(
+                "myteam",
+                &CreatePostParams {
+                    name: "Minimal",
+                    body_md: None,
+                    category: None,
+                    tags: vec![],
+                    wip: false,
+                },
+            )
             .await
             .unwrap();
     }
@@ -676,9 +716,7 @@ mod tests {
         let server = MockServer::start().await;
         Mock::given(method("GET"))
             .and(path("/teams/myteam/posts/1"))
-            .respond_with(
-                ResponseTemplate::new(429).insert_header("retry-after", "0"),
-            )
+            .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "0"))
             .mount(&server)
             .await;
 

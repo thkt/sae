@@ -318,6 +318,11 @@ pub fn rechunk_post(
     use crate::chunker;
 
     conn.execute(
+        "DELETE FROM vec_chunks WHERE chunk_id IN \
+         (SELECT id FROM chunks WHERE post_number = ?1)",
+        [post_number],
+    )?;
+    conn.execute(
         "DELETE FROM fts_chunks WHERE rowid IN \
          (SELECT id FROM chunks WHERE post_number = ?1)",
         [post_number],
@@ -325,23 +330,23 @@ pub fn rechunk_post(
     conn.execute("DELETE FROM chunks WHERE post_number = ?1", [post_number])?;
 
     let chunks = chunker::chunk_markdown(body_md);
+    let mut insert_chunk = conn.prepare_cached(
+        "INSERT INTO chunks (post_number, section_title, content, chunk_type) \
+         VALUES (?1, ?2, ?3, ?4)",
+    )?;
+    let mut insert_fts = conn.prepare_cached(
+        "INSERT INTO fts_chunks(rowid, section_title, content) VALUES (?1, ?2, ?3)",
+    )?;
     let mut count = 0u32;
     for chunk in &chunks {
-        conn.execute(
-            "INSERT INTO chunks (post_number, section_title, content, chunk_type) \
-             VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                post_number,
-                chunk.section_title,
-                chunk.content,
-                chunk.chunk_type.as_str(),
-            ],
-        )?;
+        insert_chunk.execute(rusqlite::params![
+            post_number,
+            chunk.section_title,
+            chunk.content,
+            chunk.chunk_type.as_str(),
+        ])?;
         let id = conn.last_insert_rowid();
-        conn.execute(
-            "INSERT INTO fts_chunks(rowid, section_title, content) VALUES (?1, ?2, ?3)",
-            rusqlite::params![id, chunk.section_title, chunk.content],
-        )?;
+        insert_fts.execute(rusqlite::params![id, chunk.section_title, chunk.content])?;
         count += 1;
     }
     Ok(count)
@@ -533,6 +538,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(hits, 0);
+    }
+
+    #[test]
+    fn rechunk_cleans_orphaned_vec_chunks() {
+        let db = Db::open_memory().unwrap();
+        let post = test_post_row(1);
+        upsert_post(db.conn(), &post).unwrap();
+        rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
+
+        let chunks = embed::get_unembedded_chunks(db.conn(), 100).unwrap();
+        let emb: Vec<(i64, Vec<f32>)> = chunks
+            .iter()
+            .map(|(id, _)| (*id, vec![0.1; rurico::embed::EMBEDDING_DIMS as usize]))
+            .collect();
+        embed::add_embeddings(db.conn(), &emb).unwrap();
+        assert!(embed::has_embeddings(db.conn()));
+
+        rechunk_post(db.conn(), 1, "# New\nContent").unwrap();
+
+        let orphans: u32 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(orphans, 0, "rechunk should clean orphaned vec_chunks");
     }
 
     #[test]
