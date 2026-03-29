@@ -195,7 +195,7 @@ impl EsaClient {
         self.send(|http| http.post(&url).json(&body)).await
     }
 
-    #[allow(clippy::too_many_arguments)] // will be replaced by UpdatePostParams in PR #4
+    #[allow(clippy::too_many_arguments)]
     pub async fn update_post(
         &self,
         team: &str,
@@ -311,7 +311,7 @@ fn retry_wait(status: u16, retry_after: Option<&str>, attempt: u32) -> Option<Du
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_json, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn test_post_json() -> serde_json::Value {
@@ -524,5 +524,131 @@ mod tests {
     fn retry_wait_non_retryable() {
         assert!(retry_wait(400, None, 0).is_none());
         assert!(retry_wait(404, None, 0).is_none());
+    }
+
+    fn test_esa_post(body_md: Option<String>) -> EsaPost {
+        EsaPost {
+            number: 42,
+            name: "Test Post".to_string(),
+            full_name: "dev/Test Post".to_string(),
+            body_md,
+            category: Some("dev".to_string()),
+            tags: vec!["rust".to_string()],
+            wip: false,
+            kind: "stock".to_string(),
+            url: "https://example.esa.io/posts/42".to_string(),
+            created_at: "2025-01-01T00:00:00+09:00".to_string(),
+            updated_at: "2025-01-02T00:00:00+09:00".to_string(),
+            created_by: EsaUser {
+                screen_name: "alice".to_string(),
+            },
+            updated_by: EsaUser {
+                screen_name: "bob".to_string(),
+            },
+            revision_number: 3,
+        }
+    }
+
+    // T-036: get --json → body_md field is null
+    #[test]
+    fn esa_post_json_body_md_null_when_none() {
+        let post = test_esa_post(None);
+        let json_str = serde_json::to_string(&post).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert!(
+            v["body_md"].is_null(),
+            "[T-036] body_md should be null when None"
+        );
+        assert_eq!(v["number"], 42);
+        assert_eq!(v["name"], "Test Post");
+    }
+
+    // T-043: get --json --with-body → body_md is string value
+    #[test]
+    fn esa_post_json_body_md_present_when_some() {
+        let post = test_esa_post(Some("# Hello\nWorld".to_string()));
+        let json_str = serde_json::to_string(&post).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(
+            v["body_md"], "# Hello\nWorld",
+            "[T-043] body_md should be the string value"
+        );
+    }
+
+    // T-048: create --json → EsaPost JSON (name, number, url)
+    // T-050: update --json → EsaPost JSON
+    // T-051: archive --json → EsaPost JSON
+    // T-052: ship --json → EsaPost JSON
+    // All share the same serialization contract: EsaPost → JSON with name, number, url.
+    #[test]
+    fn esa_post_json_has_name_number_url() {
+        // [T-048, T-050, T-051, T-052] All mutation commands output EsaPost JSON
+        let post = test_esa_post(Some("body".to_string()));
+        let json_str = serde_json::to_string(&post).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(v["number"], 42, "[T-048] number field");
+        assert_eq!(v["name"], "Test Post", "[T-048] name field");
+        assert_eq!(
+            v["url"], "https://example.esa.io/posts/42",
+            "[T-048] url field"
+        );
+        assert_eq!(v["wip"], false, "[T-048] wip field");
+        assert_eq!(v["tags"][0], "rust", "[T-048] tags field");
+    }
+
+    // TC-007: create_post sends correct request body
+    #[tokio::test]
+    async fn create_post_sends_correct_payload() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/myteam/posts"))
+            .and(body_json(serde_json::json!({
+                "post": {
+                    "name": "My Title",
+                    "body_md": "# Content",
+                    "category": "docs",
+                    "tags": ["rust", "api"],
+                    "wip": true,
+                }
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(test_post_json()))
+            .mount(&server)
+            .await;
+
+        test_client(&server)
+            .await
+            .create_post(
+                "myteam",
+                "My Title",
+                Some("# Content"),
+                Some("docs"),
+                vec!["rust".into(), "api".into()],
+                true,
+            )
+            .await
+            .unwrap();
+    }
+
+    // TC-007: create_post omits None fields via skip_serializing_if
+    #[tokio::test]
+    async fn create_post_omits_none_fields() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/myteam/posts"))
+            .and(body_json(serde_json::json!({
+                "post": {
+                    "name": "Minimal",
+                    "wip": false,
+                }
+            })))
+            .respond_with(ResponseTemplate::new(201).set_body_json(test_post_json()))
+            .mount(&server)
+            .await;
+
+        test_client(&server)
+            .await
+            .create_post("myteam", "Minimal", None, None, vec![], false)
+            .await
+            .unwrap();
     }
 }

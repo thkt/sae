@@ -66,7 +66,6 @@ pub(crate) fn ensure_sqlite_vec() -> Result<(), StorageError> {
 }
 
 /// Migrate FTS schema from v3 (1-column) to v4 (2-column with section_title).
-/// Runs DROP + recreate + rebuild within a single transaction.
 pub(crate) fn migrate_fts_v4(conn: &Connection) -> Result<(), StorageError> {
     let tx = conn.unchecked_transaction()?;
 
@@ -338,27 +337,28 @@ pub fn rechunk_post(
 }
 
 #[cfg(test)]
+pub(crate) fn test_post_row(number: u32) -> EsaPostRow {
+    EsaPostRow {
+        number,
+        name: format!("Post {number}"),
+        full_name: format!("dev/Post {number}"),
+        body_md: format!("# Post {number}"),
+        category: Some("dev".into()),
+        tags: "[]".into(),
+        wip: false,
+        kind: "stock".into(),
+        url: format!("https://example.esa.io/posts/{number}"),
+        created_at: "2025-01-01T00:00:00+09:00".into(),
+        updated_at: "2025-01-02T00:00:00+09:00".into(),
+        created_by: "alice".into(),
+        updated_by: "bob".into(),
+        revision_number: 1,
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
-
-    fn test_post(number: u32) -> EsaPostRow {
-        EsaPostRow {
-            number,
-            name: format!("Post {number}"),
-            full_name: format!("dev/Post {number}"),
-            body_md: format!("# Post {number}"),
-            category: Some("dev".into()),
-            tags: r#"["test"]"#.into(),
-            wip: false,
-            kind: "stock".into(),
-            url: format!("https://example.esa.io/posts/{number}"),
-            created_at: "2025-01-01T00:00:00+09:00".into(),
-            updated_at: "2025-01-02T00:00:00+09:00".into(),
-            created_by: "alice".into(),
-            updated_by: "bob".into(),
-            revision_number: 1,
-        }
-    }
 
     #[test]
     fn open_and_init_schema() {
@@ -377,7 +377,7 @@ mod tests {
     #[test]
     fn upsert_and_count() {
         let db = Db::open_memory().unwrap();
-        upsert_post(db.conn(), &test_post(1)).unwrap();
+        upsert_post(db.conn(), &test_post_row(1)).unwrap();
         assert_eq!(count_posts(db.conn()).unwrap(), 1);
     }
 
@@ -385,7 +385,7 @@ mod tests {
     fn upsert_multiple() {
         let db = Db::open_memory().unwrap();
         for i in 1..=5 {
-            upsert_post(db.conn(), &test_post(i)).unwrap();
+            upsert_post(db.conn(), &test_post_row(i)).unwrap();
         }
         assert_eq!(count_posts(db.conn()).unwrap(), 5);
     }
@@ -393,7 +393,7 @@ mod tests {
     #[test]
     fn upsert_replaces_on_conflict() {
         let db = Db::open_memory().unwrap();
-        let mut post = test_post(1);
+        let mut post = test_post_row(1);
         upsert_post(db.conn(), &post).unwrap();
 
         post.name = "Updated".into();
@@ -465,7 +465,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let db = Db::open(&path).unwrap();
-        upsert_post(db.conn(), &test_post(1)).unwrap();
+        upsert_post(db.conn(), &test_post_row(1)).unwrap();
         assert_eq!(count_posts(db.conn()).unwrap(), 1);
     }
 
@@ -474,7 +474,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         let tx = db.conn().unchecked_transaction().unwrap();
         for i in 1..=10 {
-            upsert_post(&tx, &test_post(i)).unwrap();
+            upsert_post(&tx, &test_post_row(i)).unwrap();
         }
         tx.commit().unwrap();
         assert_eq!(count_posts(db.conn()).unwrap(), 10);
@@ -483,7 +483,7 @@ mod tests {
     #[test]
     fn rechunk_creates_chunks_and_fts() {
         let db = Db::open_memory().unwrap();
-        let mut post = test_post(1);
+        let mut post = test_post_row(1);
         post.body_md = "# Intro\nHello\n# Details\nWorld".into();
         upsert_post(db.conn(), &post).unwrap();
 
@@ -505,7 +505,7 @@ mod tests {
     #[test]
     fn rechunk_replaces_old_chunks() {
         let db = Db::open_memory().unwrap();
-        let post = test_post(1);
+        let post = test_post_row(1);
         upsert_post(db.conn(), &post).unwrap();
         rechunk_post(db.conn(), 1, "# Old\nContent").unwrap();
         assert_eq!(count_chunks(db.conn()).unwrap(), 1);
@@ -527,7 +527,7 @@ mod tests {
     #[test]
     fn fts_trigram_japanese() {
         let db = Db::open_memory().unwrap();
-        let post = test_post(1);
+        let post = test_post_row(1);
         upsert_post(db.conn(), &post).unwrap();
         rechunk_post(db.conn(), 1, "# 認証ガイド\n認証フローの説明").unwrap();
 
@@ -547,7 +547,7 @@ mod tests {
     fn rechunk_fts_count_matches_chunks_count() {
         let db = Db::open_memory().unwrap();
         let body = "# セクション1\n本文A\n# セクション2\n本文B\n# セクション3\n本文C";
-        let post = test_post(1);
+        let post = test_post_row(1);
         upsert_post(db.conn(), &post).unwrap();
         let n = rechunk_post(db.conn(), 1, body).unwrap();
         assert_eq!(n, 3);

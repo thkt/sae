@@ -5,7 +5,7 @@ use tracing::warn;
 
 use super::StorageError;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
     pub post_number: u32,
     pub post_name: String,
@@ -122,13 +122,13 @@ pub fn hybrid_search(
     let fts_map: HashMap<u32, &FtsHit> = fts_hits.iter().map(|h| (h.post_number, h)).collect();
     let vec_map: HashMap<u32, &VecHit> = vec_hits.iter().map(|h| (h.post_number, h)).collect();
 
-    // Apply recency decay to all candidates, then re-sort
     let mut scored: Vec<(u32, f64)> = merged
         .into_iter()
         .map(|(post_number, rrf_score)| {
             let decay = post_meta
                 .get(&post_number)
-                .and_then(|(_, _, updated_at)| {
+                .and_then(|meta| {
+                    let updated_at = &meta.updated_at;
                     chrono::DateTime::parse_from_rfc3339(updated_at)
                         .map_err(|e| warn!(%e, %updated_at, "unparseable updated_at, decay=0.0"))
                         .ok()
@@ -147,10 +147,14 @@ pub fn hybrid_search(
 
     let mut results = Vec::new();
     for (post_number, score) in scored.into_iter().take(limit as usize) {
-        let (name, url, _) = post_meta
+        let meta = post_meta
             .get(&post_number)
             .cloned()
-            .unwrap_or_else(|| (format!("#{post_number}"), String::new(), String::new()));
+            .unwrap_or_else(|| PostMeta {
+                name: format!("#{post_number}"),
+                url: String::new(),
+                updated_at: String::new(),
+            });
 
         let (section_title, snippet) = fts_map
             .get(&post_number)
@@ -164,8 +168,8 @@ pub fn hybrid_search(
 
         results.push(SearchResult {
             post_number,
-            post_name: name,
-            post_url: url,
+            post_name: meta.name,
+            post_url: meta.url,
             section_title,
             snippet: truncate_snippet(&snippet, 200),
             score,
@@ -175,10 +179,17 @@ pub fn hybrid_search(
     Ok(results)
 }
 
+#[derive(Debug, Clone)]
+struct PostMeta {
+    name: String,
+    url: String,
+    updated_at: String,
+}
+
 fn batch_fetch_post_meta(
     conn: &Connection,
     post_numbers: &[u32],
-) -> Result<HashMap<u32, (String, String, String)>, StorageError> {
+) -> Result<HashMap<u32, PostMeta>, StorageError> {
     if post_numbers.is_empty() {
         return Ok(HashMap::new());
     }
@@ -204,7 +215,16 @@ fn batch_fetch_post_meta(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows
         .into_iter()
-        .map(|(n, name, url, updated_at)| (n, (name, url, updated_at)))
+        .map(|(n, name, url, updated_at)| {
+            (
+                n,
+                PostMeta {
+                    name,
+                    url,
+                    updated_at,
+                },
+            )
+        })
         .collect())
 }
 
@@ -316,16 +336,13 @@ fn clean_for_trigram(query: &str) -> String {
             }
             fixed.push(term);
         }
-        // skip whitespace between segments
     }
 
-    // No OR groups → return fixed terms joined
     if or_groups.is_empty() {
         return fixed.join(" ");
     }
 
-    // Cross-product of all OR groups, then append fixed terms to each combo.
-    // E.g. (A1 OR A2) (B1 OR B2) C → A1 B1 C OR A1 B2 C OR A2 B1 C OR A2 B2 C
+    // (A1 OR A2) (B1 OR B2) C → A1 B1 C OR A1 B2 C OR A2 B1 C OR A2 B2 C
     let combos = cross_product(&or_groups);
     let alternatives: Vec<String> = combos
         .iter()
@@ -351,22 +368,11 @@ mod tests {
     use crate::storage::{self, Db};
 
     fn test_post(number: u32, name: &str, body_md: &str) -> storage::EsaPostRow {
-        storage::EsaPostRow {
-            number,
-            name: name.to_string(),
-            full_name: format!("dev/{name}"),
-            body_md: body_md.to_string(),
-            category: Some("dev".into()),
-            tags: "[]".into(),
-            wip: false,
-            kind: "stock".into(),
-            url: format!("https://example.esa.io/posts/{number}"),
-            created_at: "2025-01-01T00:00:00+09:00".into(),
-            updated_at: "2025-01-01T00:00:00+09:00".into(),
-            created_by: "alice".into(),
-            updated_by: "alice".into(),
-            revision_number: 1,
-        }
+        let mut row = storage::test_post_row(number);
+        row.name = name.to_string();
+        row.full_name = format!("dev/{name}");
+        row.body_md = body_md.to_string();
+        row
     }
 
     fn setup_db_with_posts(db: &Db) {
@@ -384,26 +390,8 @@ mod tests {
             (3, "デプロイ", "# 手順\nデプロイの手順ガイド"),
         ];
         for (num, name, body) in &posts {
-            storage::upsert_post(
-                db.conn(),
-                &storage::EsaPostRow {
-                    number: *num,
-                    name: name.to_string(),
-                    full_name: format!("dev/{name}"),
-                    body_md: body.to_string(),
-                    category: Some("dev".into()),
-                    tags: "[]".into(),
-                    wip: false,
-                    kind: "stock".into(),
-                    url: format!("https://example.esa.io/posts/{num}"),
-                    created_at: "2025-01-01T00:00:00+09:00".into(),
-                    updated_at: "2025-01-01T00:00:00+09:00".into(),
-                    created_by: "alice".into(),
-                    updated_by: "alice".into(),
-                    revision_number: 1,
-                },
-            )
-            .unwrap();
+            let post = test_post(*num, name, body);
+            storage::upsert_post(db.conn(), &post).unwrap();
             storage::rechunk_post(db.conn(), *num, body).unwrap();
         }
     }
@@ -532,8 +520,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
 
-        let hits = fts_search(db.conn(), "認証、フロー", 10).unwrap();
-        let _ = hits;
+        fts_search(db.conn(), "認証、フロー", 10).unwrap();
     }
 
     #[test]
@@ -552,26 +539,8 @@ mod tests {
             ),
         ];
         for (num, name, body) in &posts {
-            storage::upsert_post(
-                db.conn(),
-                &storage::EsaPostRow {
-                    number: *num,
-                    name: name.to_string(),
-                    full_name: format!("dev/{name}"),
-                    body_md: body.to_string(),
-                    category: Some("dev".into()),
-                    tags: "[]".into(),
-                    wip: false,
-                    kind: "stock".into(),
-                    url: format!("https://example.esa.io/posts/{num}"),
-                    created_at: "2025-01-01T00:00:00+09:00".into(),
-                    updated_at: "2025-01-01T00:00:00+09:00".into(),
-                    created_by: "alice".into(),
-                    updated_by: "alice".into(),
-                    revision_number: 1,
-                },
-            )
-            .unwrap();
+            let post = test_post(*num, name, body);
+            storage::upsert_post(db.conn(), &post).unwrap();
             storage::rechunk_post(db.conn(), *num, body).unwrap();
         }
 
@@ -600,9 +569,9 @@ mod tests {
 
         let meta = batch_fetch_post_meta(db.conn(), &[1, 3]).unwrap();
         assert_eq!(meta.len(), 2);
-        assert!(meta.get(&1).unwrap().0.contains("認証")); // name
-        assert!(meta.get(&3).unwrap().0.contains("デプロイ")); // name
-        assert!(!meta.get(&1).unwrap().2.is_empty()); // updated_at
+        assert!(meta.get(&1).unwrap().name.contains("認証"));
+        assert!(meta.get(&3).unwrap().name.contains("デプロイ"));
+        assert!(!meta.get(&1).unwrap().updated_at.is_empty());
     }
 
     #[test]
@@ -625,26 +594,9 @@ mod tests {
             (2u32, "PostB", "2025-01-02T00:00:00+09:00"), // 30 days before "now"
         ];
         for (num, name, updated) in &posts {
-            storage::upsert_post(
-                db.conn(),
-                &storage::EsaPostRow {
-                    number: *num,
-                    name: name.to_string(),
-                    full_name: format!("dev/{name}"),
-                    body_md: shared_body.to_string(),
-                    category: Some("dev".into()),
-                    tags: "[]".into(),
-                    wip: false,
-                    kind: "stock".into(),
-                    url: format!("https://example.esa.io/posts/{num}"),
-                    created_at: "2025-01-01T00:00:00+09:00".into(),
-                    updated_at: updated.to_string(),
-                    created_by: "alice".into(),
-                    updated_by: "alice".into(),
-                    revision_number: 1,
-                },
-            )
-            .unwrap();
+            let mut post = test_post(*num, name, shared_body);
+            post.updated_at = updated.to_string();
+            storage::upsert_post(db.conn(), &post).unwrap();
             storage::rechunk_post(db.conn(), *num, shared_body).unwrap();
         }
 
@@ -669,26 +621,9 @@ mod tests {
         let db = Db::open_memory().unwrap();
 
         let body = "# 認証フロー\n認証の仕組みを説明します";
-        storage::upsert_post(
-            db.conn(),
-            &storage::EsaPostRow {
-                number: 1,
-                name: "BadDate".to_string(),
-                full_name: "dev/BadDate".to_string(),
-                body_md: body.to_string(),
-                category: Some("dev".into()),
-                tags: "[]".into(),
-                wip: false,
-                kind: "stock".into(),
-                url: "https://example.esa.io/posts/1".into(),
-                created_at: "2025-01-01T00:00:00+09:00".into(),
-                updated_at: "not-a-date".into(),
-                created_by: "alice".into(),
-                updated_by: "alice".into(),
-                revision_number: 1,
-            },
-        )
-        .unwrap();
+        let mut post = test_post(1, "BadDate", body);
+        post.updated_at = "not-a-date".into();
+        storage::upsert_post(db.conn(), &post).unwrap();
         storage::rechunk_post(db.conn(), 1, body).unwrap();
 
         let now = chrono::DateTime::parse_from_rfc3339("2025-02-01T00:00:00+00:00")
@@ -760,5 +695,46 @@ mod tests {
         );
         assert_eq!(hits[0].post_number, 1);
         assert_eq!(hits[0].section_title.as_deref(), Some("認証ガイド"));
+    }
+
+    // T-035: search --json → JSON array with post_number, post_name, score
+    #[test]
+    fn search_result_serializes_to_json_with_expected_fields() {
+        let result = SearchResult {
+            post_number: 42,
+            post_name: "Test Post".to_string(),
+            post_url: "https://example.esa.io/posts/42".to_string(),
+            section_title: Some("Section".to_string()),
+            snippet: "snippet text".to_string(),
+            score: 0.85,
+        };
+        let json_str =
+            serde_json::to_string(&result).expect("[T-035] SearchResult should serialize");
+        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(v["post_number"], 42);
+        assert_eq!(v["post_name"], "Test Post");
+        assert_eq!(v["score"], 0.85);
+        assert_eq!(v["post_url"], "https://example.esa.io/posts/42");
+        assert_eq!(v["section_title"], "Section");
+        assert_eq!(v["snippet"], "snippet text");
+    }
+
+    // TC-006: truncate_snippet
+    #[test]
+    fn truncate_snippet_short_unchanged() {
+        assert_eq!(truncate_snippet("abc", 5), "abc");
+    }
+
+    #[test]
+    fn truncate_snippet_over_limit_truncated() {
+        assert_eq!(truncate_snippet("abcdef", 3), "abc...");
+    }
+
+    #[test]
+    fn truncate_snippet_multibyte_boundary() {
+        // 3 chars of Japanese = 9 bytes; truncation must be on char boundary
+        let s = "あいうえお";
+        let result = truncate_snippet(s, 3);
+        assert_eq!(result, "あいう...");
     }
 }

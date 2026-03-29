@@ -6,9 +6,7 @@ pub fn add_embeddings(
     conn: &Connection,
     embeddings: &[(i64, Vec<f32>)],
 ) -> Result<u32, StorageError> {
-    let tx = conn
-        .unchecked_transaction()
-        .map_err(super::StorageError::Db)?;
+    let tx = conn.unchecked_transaction()?;
     let mut count = 0u32;
     for (chunk_id, embedding) in embeddings {
         let exists: bool = tx.query_row(
@@ -26,7 +24,7 @@ pub fn add_embeddings(
         )?;
         count += 1;
     }
-    tx.commit().map_err(super::StorageError::Db)?;
+    tx.commit()?;
     Ok(count)
 }
 
@@ -67,26 +65,9 @@ mod tests {
     fn add_and_query_embeddings() {
         let db = Db::open_memory().unwrap();
 
-        crate::storage::upsert_post(
-            db.conn(),
-            &crate::storage::EsaPostRow {
-                number: 1,
-                name: "Test".into(),
-                full_name: "dev/Test".into(),
-                body_md: "# Hello\nWorld".into(),
-                category: None,
-                tags: "[]".into(),
-                wip: false,
-                kind: "stock".into(),
-                url: "https://example.esa.io/posts/1".into(),
-                created_at: "2025-01-01T00:00:00+09:00".into(),
-                updated_at: "2025-01-01T00:00:00+09:00".into(),
-                created_by: "alice".into(),
-                updated_by: "alice".into(),
-                revision_number: 1,
-            },
-        )
-        .unwrap();
+        let mut row = crate::storage::test_post_row(1);
+        row.body_md = "# Hello\nWorld".into();
+        crate::storage::upsert_post(db.conn(), &row).unwrap();
         crate::storage::rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
 
         let unembedded = get_unembedded_chunks(db.conn(), 100).unwrap();
@@ -103,26 +84,9 @@ mod tests {
     #[test]
     fn skip_already_embedded() {
         let db = Db::open_memory().unwrap();
-        crate::storage::upsert_post(
-            db.conn(),
-            &crate::storage::EsaPostRow {
-                number: 1,
-                name: "T".into(),
-                full_name: "T".into(),
-                body_md: "# A\nB".into(),
-                category: None,
-                tags: "[]".into(),
-                wip: false,
-                kind: "stock".into(),
-                url: "u".into(),
-                created_at: "t".into(),
-                updated_at: "t".into(),
-                created_by: "a".into(),
-                updated_by: "a".into(),
-                revision_number: 1,
-            },
-        )
-        .unwrap();
+        let mut row = crate::storage::test_post_row(1);
+        row.body_md = "# A\nB".into();
+        crate::storage::upsert_post(db.conn(), &row).unwrap();
         crate::storage::rechunk_post(db.conn(), 1, "# A\nB").unwrap();
 
         let chunks = get_unembedded_chunks(db.conn(), 100).unwrap();

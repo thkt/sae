@@ -3,7 +3,7 @@ use tracing::info;
 use crate::client::{ClientError, EsaClient, EsaPost};
 use crate::storage::{self, Db, EsaPostRow, StorageError};
 
-#[derive(Debug)]
+#[derive(Debug, serde::Serialize)]
 pub struct HarvestResult {
     pub posts_fetched: u32,
     pub posts_stored: u32,
@@ -453,5 +453,70 @@ mod tests {
         let (page, q) = resolve_start(true, &state);
         assert_eq!(page, 1);
         assert!(q.is_none());
+    }
+
+    // T-044: HarvestResult serialize → posts_fetched, posts_stored, total_count fields
+    #[test]
+    fn harvest_result_serializes_to_json_with_expected_fields() {
+        let result = HarvestResult {
+            posts_fetched: 10,
+            posts_stored: 8,
+            total_count: 100,
+            local_count: 50,
+            gap_detected: true,
+        };
+        let json_str =
+            serde_json::to_string(&result).expect("[T-044] HarvestResult should serialize");
+        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
+        assert_eq!(v["posts_fetched"], 10);
+        assert_eq!(v["posts_stored"], 8);
+        assert_eq!(v["total_count"], 100);
+        assert_eq!(v["local_count"], 50);
+        assert_eq!(v["gap_detected"], true);
+    }
+
+    // TC-002: is_pagination_limit
+    #[test]
+    fn is_pagination_limit_detects_comma_format() {
+        assert!(is_pagination_limit("exceeds 10,000 items"));
+    }
+
+    #[test]
+    fn is_pagination_limit_detects_plain_format() {
+        assert!(is_pagination_limit("exceeds 10000 items"));
+    }
+
+    #[test]
+    fn is_pagination_limit_rejects_other_numbers() {
+        assert!(!is_pagination_limit("1000 items"));
+        assert!(!is_pagination_limit(""));
+    }
+
+    // TC-005: post_to_row with body_md: None → empty string
+    #[test]
+    fn post_to_row_none_body_becomes_empty() {
+        let post = EsaPost {
+            number: 1,
+            name: "Test".into(),
+            full_name: "dev/Test".into(),
+            body_md: None,
+            category: Some("dev".into()),
+            tags: vec!["rust".into()],
+            wip: false,
+            kind: "stock".into(),
+            url: "https://example.esa.io/posts/1".into(),
+            created_at: "2025-01-01T00:00:00+09:00".into(),
+            updated_at: "2025-01-02T00:00:00+09:00".into(),
+            created_by: crate::client::EsaUser {
+                screen_name: "alice".into(),
+            },
+            updated_by: crate::client::EsaUser {
+                screen_name: "bob".into(),
+            },
+            revision_number: 1,
+        };
+        let row = post_to_row(&post);
+        assert_eq!(row.body_md, "");
+        assert_eq!(row.tags, r#"["rust"]"#);
     }
 }

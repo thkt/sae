@@ -1,3 +1,5 @@
+mod output;
+
 use clap::{Parser, Subcommand};
 use rurico::embed::{Embed, Embedder};
 use sae::client::EsaClient;
@@ -6,6 +8,9 @@ use sae::config::Config;
 #[derive(Parser)]
 #[command(name = "sae", about = "esa semantic search CLI")]
 struct Cli {
+    /// Output as JSON
+    #[arg(long, global = true)]
+    json: bool,
     #[command(subcommand)]
     command: Command,
 }
@@ -13,6 +18,10 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Fetch and index esa posts
+    #[command(after_help = "\
+Examples:
+  sae harvest myteam
+  sae harvest myteam --full")]
     Harvest {
         /// Team name
         team: String,
@@ -21,6 +30,10 @@ enum Command {
         full: bool,
     },
     /// Semantic search over indexed posts
+    #[command(after_help = "\
+Examples:
+  sae search \"認証\" --team myteam --limit 5
+  sae \"認証\"")]
     Search {
         /// Search query
         query: String,
@@ -32,21 +45,38 @@ enum Command {
         limit: u32,
     },
     /// Get a post by number
+    #[command(after_help = "\
+Examples:
+  sae get 42 --team myteam
+  sae --json get 42
+  sae --json get 42 --with-body")]
     Get {
         /// Post number
         number: u32,
         /// Team name
         #[arg(long)]
         team: Option<String>,
+        /// Include body_md in JSON output (ignored without --json)
+        #[arg(long)]
+        with_body: bool,
     },
     /// Create a new post
+    #[command(after_help = "\
+Examples:
+  sae create --name \"Title\" --body \"Content\" --team myteam
+  sae create --name \"Title\" --body-file draft.md
+  cat body.md | sae create --name \"Title\" --body-file -
+  sae create --name \"Title\" --dry-run")]
     Create {
         /// Post title
         #[arg(long)]
         name: String,
         /// Post body (Markdown)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "body_file")]
         body: Option<String>,
+        /// Read body from file (use "-" for stdin)
+        #[arg(long, conflicts_with = "body")]
+        body_file: Option<String>,
         /// Category path
         #[arg(long)]
         category: Option<String>,
@@ -59,8 +89,16 @@ enum Command {
         /// Team name
         #[arg(long)]
         team: Option<String>,
+        /// Preview without creating (no mutation API calls)
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Update a post
+    #[command(after_help = "\
+Examples:
+  sae update 42 --name \"New Title\" --team myteam
+  sae update 42 --body-file updated.md
+  sae update 42 --name \"New Title\" --dry-run")]
     Update {
         /// Post number
         number: u32,
@@ -68,8 +106,11 @@ enum Command {
         #[arg(long)]
         name: Option<String>,
         /// New body (Markdown)
-        #[arg(long)]
+        #[arg(long, conflicts_with = "body_file")]
         body: Option<String>,
+        /// Read body from file (use "-" for stdin)
+        #[arg(long, conflicts_with = "body")]
+        body_file: Option<String>,
         /// New category path
         #[arg(long)]
         category: Option<String>,
@@ -79,29 +120,54 @@ enum Command {
         /// Team name
         #[arg(long)]
         team: Option<String>,
+        /// Preview without updating (no mutation API calls)
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Archive a post
+    #[command(after_help = "\
+Examples:
+  sae archive 42 --team myteam
+  sae archive 42 --dry-run")]
     Archive {
         /// Post number
         number: u32,
         /// Team name
         #[arg(long)]
         team: Option<String>,
+        /// Preview without archiving (reads current post, no mutation)
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Ship a WIP post (set wip=false)
+    #[command(after_help = "\
+Examples:
+  sae ship 42 --team myteam
+  sae ship 42 --dry-run")]
     Ship {
         /// Post number
         number: u32,
         /// Team name
         #[arg(long)]
         team: Option<String>,
+        /// Preview without shipping (no mutation API calls)
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Download model and embed all chunks
+    #[command(after_help = "\
+Examples:
+  sae embed myteam")]
     Embed {
         /// Team name
         team: String,
     },
     /// Show sync status
+    #[command(after_help = "\
+Examples:
+  sae status
+  sae status --team myteam
+  sae --json status")]
     Status {
         /// Team name (omit to show all teams)
         #[arg(long)]
@@ -113,6 +179,8 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "harvest", "search", "get", "create", "update", "archive", "ship", "embed", "status",
 ];
 
+const GLOBAL_FLAGS: &[&str] = &["--json"];
+
 fn parse_cli_args<I, T>(args: I) -> Result<Cli, clap::Error>
 where
     I: IntoIterator<Item = T>,
@@ -120,15 +188,25 @@ where
 {
     let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
 
-    // Shorthand: `sae "query"` → `sae search "query"`
-    // Conditions: exactly 2 args, second arg doesn't start with '-',
-    // and second arg is not a known subcommand name.
-    if args.len() == 2
-        && let Some(first_arg) = args[1].to_str()
+    // Shorthand: `sae "query"` or `sae --json "query"` → `sae [flags] search "query"`
+    // Strip global flags, check if remaining is [binary, query], then re-inject.
+    let (flags, rest): (Vec<_>, Vec<_>) = args
+        .iter()
+        .enumerate()
+        .partition(|(i, a)| *i > 0 && a.to_str().is_some_and(|s| GLOBAL_FLAGS.contains(&s)));
+    let rest: Vec<&std::ffi::OsString> = rest.into_iter().map(|(_, a)| a).collect();
+
+    if rest.len() == 2
+        && let Some(first_arg) = rest[1].to_str()
         && !first_arg.starts_with('-')
         && !KNOWN_SUBCOMMANDS.contains(&first_arg)
     {
-        let expanded = vec![args[0].clone(), "search".into(), args[1].clone()];
+        let mut expanded: Vec<std::ffi::OsString> = vec![rest[0].clone()];
+        for (_, f) in &flags {
+            expanded.push((*f).clone());
+        }
+        expanded.push("search".into());
+        expanded.push(rest[1].clone());
         return Cli::try_parse_from(expanded);
     }
 
@@ -146,6 +224,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let cli = parse_cli_args(std::env::args_os()).unwrap_or_else(|e| e.exit());
     let config = Config::load()?;
+    let json = cli.json;
 
     match cli.command {
         Command::Harvest { team, full } => {
@@ -154,15 +233,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let db_path = config.team_db_path(team)?;
             let db = sae::storage::Db::open(&db_path)?;
             let result = sae::sync::harvest(&client, &db, team, full).await?;
-            println!("{result}");
+            output::harvest(&result, json)?;
         }
         Command::Search { query, team, limit } => {
             let team = config.resolve_team(team.as_deref())?;
             let db_path = config.team_db_path(team)?;
-            if !db_path.exists() {
-                eprintln!("No data for team '{team}'. Run `sae harvest {team}` first.");
-                std::process::exit(1);
-            }
+            require_db(&db_path, team);
             let db = sae::storage::Db::open(&db_path)?;
             let embedder = try_load_embedder();
             let query_embedding = embedder.as_ref().and_then(|e| match e.embed_query(&query) {
@@ -179,104 +255,97 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 limit,
                 chrono::Utc::now(),
             )?;
-            if results.is_empty() {
-                println!("No results for '{query}'");
-            } else {
-                for r in &results {
-                    let section = r
-                        .section_title
-                        .as_deref()
-                        .map(|s| format!(" > {s}"))
-                        .unwrap_or_default();
-                    println!(
-                        "[{:.4}] {}{} (#{})  {}",
-                        r.score, r.post_name, section, r.post_number, r.post_url
-                    );
-                    if !r.snippet.is_empty() {
-                        println!("  {}", r.snippet.replace('\n', " "));
-                    }
-                }
-            }
+            output::search(&results, &query, json)?;
         }
-        Command::Get { number, team } => {
+        Command::Get {
+            number,
+            team,
+            with_body,
+        } => {
             let team = config.resolve_team(team.as_deref())?;
             let client = EsaClient::from_env()?;
             let post = client.get_post(team, number).await?;
-            println!("---");
-            println!("title: \"{}\"", post.full_name.replace('"', "\\\""));
-            if let Some(ref cat) = post.category
-                && !cat.is_empty()
-            {
-                println!("category: \"{}\"", cat.replace('"', "\\\""));
-            }
-            if !post.tags.is_empty() {
-                let tags: Vec<String> = post
-                    .tags
-                    .iter()
-                    .map(|t| format!("\"{}\"", t.replace('"', "\\\"")))
-                    .collect();
-                println!("tags: [{}]", tags.join(", "));
-            }
-            println!("author: \"@{}\"", post.created_by.screen_name);
-            if post.updated_by.screen_name != post.created_by.screen_name {
-                println!("updated_by: \"@{}\"", post.updated_by.screen_name);
-            }
-            println!("updated_at: \"{}\"", post.updated_at);
-            if post.wip {
-                println!("wip: true");
-            }
-            println!("number: {}", post.number);
-            println!("url: {}", post.url);
-            println!("---");
-            println!();
-            println!("{}", post.body_md.as_deref().unwrap_or("(empty)"));
+            output::get(&post, json, with_body)?;
         }
         Command::Create {
             name,
             body,
+            body_file,
             category,
             tag,
             wip,
             team,
+            dry_run,
         } => {
-            let team = config.resolve_team(team.as_deref())?;
-            let client = EsaClient::from_env()?;
-            let post = client
-                .create_post(team, &name, body.as_deref(), category.as_deref(), tag, wip)
-                .await?;
-            println!("Created: {} (#{}) {}", post.name, post.number, post.url);
+            let resolved_body = resolve_body(body.as_deref(), body_file.as_deref())?;
+            if dry_run {
+                let payload = serde_json::json!({
+                    "name": name,
+                    "body_md": resolved_body,
+                    "category": category,
+                    "tags": tag,
+                    "wip": wip,
+                });
+                println!("{}", serde_json::to_string(&payload)?);
+            } else {
+                let team = config.resolve_team(team.as_deref())?;
+                let client = EsaClient::from_env()?;
+                let post = client
+                    .create_post(
+                        team,
+                        &name,
+                        resolved_body.as_deref(),
+                        category.as_deref(),
+                        tag,
+                        wip,
+                    )
+                    .await?;
+                output::post("Created", &post, json)?;
+            }
         }
         Command::Update {
             number,
             name,
             body,
+            body_file,
             category,
             tag,
             team,
+            dry_run,
         } => {
-            let team = config.resolve_team(team.as_deref())?;
-            let client = EsaClient::from_env()?;
-            let tags = if tag.is_empty() { None } else { Some(tag) };
-            let post = client
-                .update_post(
-                    team,
-                    number,
-                    name.as_deref(),
-                    body.as_deref(),
-                    category.as_deref(),
-                    tags,
-                    None,
-                )
-                .await?;
-            println!("Updated: {} (#{}) {}", post.name, post.number, post.url);
+            let resolved_body = resolve_body(body.as_deref(), body_file.as_deref())?;
+            if dry_run {
+                let tags = if tag.is_empty() { None } else { Some(&tag) };
+                let payload = serde_json::json!({
+                    "number": number,
+                    "name": name,
+                    "body_md": resolved_body,
+                    "category": category,
+                    "tags": tags,
+                });
+                println!("{}", serde_json::to_string(&payload)?);
+            } else {
+                let team = config.resolve_team(team.as_deref())?;
+                let client = EsaClient::from_env()?;
+                let tags = if tag.is_empty() { None } else { Some(tag) };
+                let post = client
+                    .update_post(
+                        team,
+                        number,
+                        name.as_deref(),
+                        resolved_body.as_deref(),
+                        category.as_deref(),
+                        tags,
+                        None,
+                    )
+                    .await?;
+                output::post("Updated", &post, json)?;
+            }
         }
         Command::Embed { team } => {
             let team = config.resolve_team(Some(&team))?;
             let db_path = config.team_db_path(team)?;
-            if !db_path.exists() {
-                eprintln!("No data for team '{team}'. Run `sae harvest {team}` first.");
-                std::process::exit(1);
-            }
+            require_db(&db_path, team);
             let db = sae::storage::Db::open(&db_path)?;
 
             eprintln!("Checking model...");
@@ -313,49 +382,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 done += batch_len;
                 eprintln!("  {done} chunks processed");
             }
-            if done == 0 {
-                println!("All chunks already embedded");
-            } else {
-                println!("Embedded {total_added} chunks");
-            }
+            let result = sae::storage::EmbedResult {
+                chunks_embedded: total_added,
+            };
+            output::embed(&result, done, json)?;
         }
-        Command::Archive { number, team } => {
+        Command::Archive {
+            number,
+            team,
+            dry_run,
+        } => {
             let team = config.resolve_team(team.as_deref())?;
             let client = EsaClient::from_env()?;
             let post = client.get_post(team, number).await?;
             let current_category = post.category.as_deref().unwrap_or("");
             if current_category.starts_with("Archived/") || current_category == "Archived" {
-                println!(
-                    "Already archived: {} (#{}) {}",
-                    post.name, post.number, post.url
-                );
+                if dry_run {
+                    let payload = serde_json::json!({
+                        "number": number,
+                        "already_archived": true,
+                        "category": current_category,
+                    });
+                    println!("{}", serde_json::to_string(&payload)?);
+                } else {
+                    output::post("Already archived", &post, json)?;
+                }
             } else {
                 let archived_category = if current_category.is_empty() {
                     "Archived".to_string()
                 } else {
                     format!("Archived/{current_category}")
                 };
-                let post = client
-                    .update_post(
-                        team,
-                        number,
-                        None,
-                        None,
-                        Some(&archived_category),
-                        None,
-                        None,
-                    )
-                    .await?;
-                println!("Archived: {} (#{}) {}", post.name, post.number, post.url);
+                if dry_run {
+                    let payload = serde_json::json!({
+                        "number": number,
+                        "from_category": current_category,
+                        "to_category": archived_category,
+                    });
+                    println!("{}", serde_json::to_string(&payload)?);
+                } else {
+                    let post = client
+                        .update_post(
+                            team,
+                            number,
+                            None,
+                            None,
+                            Some(&archived_category),
+                            None,
+                            None,
+                        )
+                        .await?;
+                    output::post("Archived", &post, json)?;
+                }
             }
         }
-        Command::Ship { number, team } => {
-            let team = config.resolve_team(team.as_deref())?;
-            let client = EsaClient::from_env()?;
-            let post = client
-                .update_post(team, number, None, None, None, None, Some(false))
-                .await?;
-            println!("Shipped: {} (#{}) {}", post.name, post.number, post.url);
+        Command::Ship {
+            number,
+            team,
+            dry_run,
+        } => {
+            if dry_run {
+                let payload = serde_json::json!({
+                    "number": number,
+                    "wip": false,
+                });
+                println!("{}", serde_json::to_string(&payload)?);
+            } else {
+                let team = config.resolve_team(team.as_deref())?;
+                let client = EsaClient::from_env()?;
+                let post = client
+                    .update_post(team, number, None, None, None, None, Some(false))
+                    .await?;
+                output::post("Shipped", &post, json)?;
+            }
         }
         Command::Status { team } => {
             let teams: Vec<&str> = if let Some(ref t) = team {
@@ -363,38 +462,100 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             } else {
                 config.teams.iter().map(String::as_str).collect()
             };
-            for t in &teams {
-                println!("--- {t} ---");
-                match config.team_db_path(t) {
-                    Ok(path) if path.exists() => {
-                        let db = sae::storage::Db::open(&path)?;
-                        let count = sae::storage::count_posts(db.conn())?;
-                        let state = sae::storage::get_sync_state(db.conn())?;
-                        println!("  Posts: {count}");
-                        if let Some(s) = state {
-                            println!(
-                                "  Last sync: {} (total: {}, local: {})",
-                                s.updated_at, s.total_count, s.local_count
-                            );
-                            if let Some(pg) = s.last_page {
-                                println!("  Checkpoint: page {pg} (interrupted)");
-                            }
-                        } else {
-                            println!("  Not yet synced");
-                        }
-                    }
-                    Ok(path) => {
-                        println!("  Not yet synced (no DB at {})", path.display());
-                    }
-                    Err(e) => {
-                        println!("  Error: {e}");
-                    }
-                }
-            }
+            let statuses = collect_team_statuses(&config, &teams)?;
+            output::status(&statuses, json)?;
         }
     }
 
     Ok(())
+}
+
+fn collect_team_statuses(
+    config: &Config,
+    teams: &[&str],
+) -> Result<Vec<sae::storage::TeamStatus>, Box<dyn std::error::Error>> {
+    let mut statuses = Vec::new();
+    for t in teams {
+        let ts = match config.team_db_path(t) {
+            Ok(path) if path.exists() => match query_team_status(t, &path) {
+                Ok(ts) => ts,
+                Err(e) => sae::storage::TeamStatus {
+                    team: t.to_string(),
+                    status: sae::storage::SyncStatus::Error,
+                    posts: 0,
+                    sync_state: None,
+                    error: Some(e.to_string()),
+                    db_path: None,
+                },
+            },
+            Ok(path) => sae::storage::TeamStatus {
+                team: t.to_string(),
+                status: sae::storage::SyncStatus::NotSynced,
+                posts: 0,
+                sync_state: None,
+                error: None,
+                db_path: Some(path.display().to_string()),
+            },
+            Err(e) => sae::storage::TeamStatus {
+                team: t.to_string(),
+                status: sae::storage::SyncStatus::Error,
+                posts: 0,
+                sync_state: None,
+                error: Some(e.to_string()),
+                db_path: None,
+            },
+        };
+        statuses.push(ts);
+    }
+    Ok(statuses)
+}
+
+fn require_db(db_path: &std::path::Path, team: &str) {
+    if !db_path.exists() {
+        eprintln!("No data for team '{team}'. Run `sae harvest {team}` first.");
+        std::process::exit(1);
+    }
+}
+
+fn query_team_status(
+    team: &str,
+    path: &std::path::Path,
+) -> Result<sae::storage::TeamStatus, Box<dyn std::error::Error>> {
+    let db = sae::storage::Db::open(path)?;
+    let count = sae::storage::count_posts(db.conn())?;
+    let state = sae::storage::get_sync_state(db.conn())?;
+    Ok(sae::storage::TeamStatus {
+        team: team.to_string(),
+        status: if state.is_some() {
+            sae::storage::SyncStatus::Synced
+        } else {
+            sae::storage::SyncStatus::NotSynced
+        },
+        posts: count,
+        sync_state: state,
+        error: None,
+        db_path: None,
+    })
+}
+
+fn resolve_body(
+    body: Option<&str>,
+    body_file: Option<&str>,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    match (body, body_file) {
+        (Some(b), None) => Ok(Some(b.to_string())),
+        (None, Some("-")) => {
+            let mut buf = String::new();
+            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+            Ok(Some(buf))
+        }
+        (None, Some(path)) => {
+            let content = std::fs::read_to_string(path)?;
+            Ok(Some(content))
+        }
+        (None, None) => Ok(None),
+        (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
+    }
 }
 
 #[cfg(test)]
@@ -443,6 +604,167 @@ mod tests {
     fn harvest_missing_arg_is_clap_error() {
         let result = parse_cli_args(["sae", "harvest"]);
         assert!(result.is_err(), "harvest without team should be clap error");
+    }
+
+    // T-037: parse_cli_args(["sae", "--json", "query"]) → Command::Search + json=true
+    #[test]
+    fn shorthand_with_json_flag_becomes_search_with_json() {
+        let cli = parse_cli_args(["sae", "--json", "query"]).unwrap();
+        assert!(cli.json, "[T-037] global json flag should be true");
+        match cli.command {
+            Command::Search { query, .. } => assert_eq!(query, "query"),
+            other => panic!("[T-037] expected Search, got {other:?}"),
+        }
+    }
+
+    // T-049: parse_cli_args(["sae", "query"]) → Command::Search (json=false) - regression
+    #[test]
+    fn shorthand_without_flags_has_json_false() {
+        let cli = parse_cli_args(["sae", "query"]).unwrap();
+        assert!(!cli.json, "[T-049] json should default to false");
+        match cli.command {
+            Command::Search { query, .. } => assert_eq!(query, "query"),
+            other => panic!("[T-049] expected Search, got {other:?}"),
+        }
+    }
+
+    // --- Phase 2: --dry-run, --body-file (FR-004, FR-005, FR-006, FR-007) ---
+
+    // T-038: create args + --dry-run → parse succeeds with dry_run=true
+    #[test]
+    fn create_with_dry_run_parses_dry_run_flag() {
+        let cli = parse_cli_args(["sae", "create", "--name", "Test Post", "--dry-run"]).unwrap();
+        match cli.command {
+            Command::Create { name, dry_run, .. } => {
+                assert_eq!(name, "Test Post", "[T-038] name should match");
+                assert!(dry_run, "[T-038] dry_run should be true");
+            }
+            other => panic!("[T-038] expected Create, got {other:?}"),
+        }
+    }
+
+    // T-039: --body-file <tempfile> with create → file content becomes body
+    #[test]
+    fn body_file_reads_from_file() {
+        let dir = std::env::temp_dir().join("sae_test_t039");
+        let _ = std::fs::create_dir_all(&dir);
+        let file_path = dir.join("body.md");
+        std::fs::write(&file_path, "# Hello\nBody from file").unwrap();
+
+        let result = resolve_body(None, Some(file_path.to_str().unwrap())).unwrap();
+        assert_eq!(
+            result.as_deref(),
+            Some("# Hello\nBody from file"),
+            "[T-039] body should contain file contents"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // T-040: --body-file - with create → stdin content becomes body
+    // Note: stdin mocking is non-trivial; test that resolve_body("-") triggers
+    // the stdin path. The function should accept a Read trait for testability.
+    // For now, test the parse side: --body-file "-" parses correctly.
+    #[test]
+    fn body_file_dash_parses_as_stdin() {
+        let cli =
+            parse_cli_args(["sae", "create", "--name", "Stdin Post", "--body-file", "-"]).unwrap();
+        match cli.command {
+            Command::Create { body_file, .. } => {
+                assert_eq!(
+                    body_file.as_deref(),
+                    Some("-"),
+                    "[T-040] body_file should be \"-\" for stdin"
+                );
+            }
+            other => panic!("[T-040] expected Create, got {other:?}"),
+        }
+    }
+
+    // T-041: --body and --body-file both specified → clap error
+    #[test]
+    fn body_and_body_file_conflict_is_clap_error() {
+        let result = parse_cli_args([
+            "sae",
+            "create",
+            "--name",
+            "Conflict Post",
+            "--body",
+            "inline body",
+            "--body-file",
+            "some_file.md",
+        ]);
+        assert!(
+            result.is_err(),
+            "[T-041] --body and --body-file together should be a clap error"
+        );
+    }
+
+    // T-046: archive args + --dry-run → parse succeeds with dry_run=true
+    #[test]
+    fn archive_with_dry_run_parses_dry_run_flag() {
+        let cli = parse_cli_args(["sae", "archive", "42", "--dry-run"]).unwrap();
+        match cli.command {
+            Command::Archive {
+                number, dry_run, ..
+            } => {
+                assert_eq!(number, 42, "[T-046] post number should be 42");
+                assert!(dry_run, "[T-046] dry_run should be true");
+            }
+            other => panic!("[T-046] expected Archive, got {other:?}"),
+        }
+    }
+
+    // T-042: help output contains Examples section
+    #[test]
+    fn help_output_contains_examples() {
+        use clap::CommandFactory;
+        let cmd = Cli::command();
+        for sub in cmd.get_subcommands() {
+            let after_help = sub
+                .get_after_help()
+                .map(|h| h.to_string())
+                .unwrap_or_default();
+            assert!(
+                after_help.contains("Examples"),
+                "[T-042] subcommand '{}' should have Examples in after_help",
+                sub.get_name()
+            );
+        }
+    }
+
+    // TC-008: resolve_body(Some, None) → inline body
+    #[test]
+    fn resolve_body_inline_text() {
+        let result = resolve_body(Some("inline text"), None).unwrap();
+        assert_eq!(result.as_deref(), Some("inline text"));
+    }
+
+    // TC-008: resolve_body(None, None) → no body
+    #[test]
+    fn resolve_body_none_returns_none() {
+        let result = resolve_body(None, None).unwrap();
+        assert_eq!(result, None);
+    }
+
+    // TC-009: resolve_body with nonexistent file → error
+    #[test]
+    fn resolve_body_nonexistent_file_is_error() {
+        let result = resolve_body(None, Some("/nonexistent/path.md"));
+        assert!(
+            result.is_err(),
+            "[TC-009] nonexistent file should return error"
+        );
+    }
+
+    // TC-011: flag-like argument not treated as shorthand query
+    #[test]
+    fn flag_like_arg_not_shorthand() {
+        let result = parse_cli_args(["sae", "--unknown"]);
+        assert!(
+            result.is_err(),
+            "[TC-011] --unknown should be clap error, not search shorthand"
+        );
     }
 }
 
