@@ -212,12 +212,11 @@ where
         .collect();
 
     // Shorthand: `sae "query"` or `sae --json "query"` → `sae [flags] search "query"`
-    let (flags, rest): (Vec<_>, Vec<_>) = args
-        .iter()
-        .enumerate()
-        .partition(|(i, a)| {
-            *i > 0 && a.to_str().is_some_and(|s| global_flags.iter().any(|f| f == s))
-        });
+    let (flags, rest): (Vec<_>, Vec<_>) = args.iter().enumerate().partition(|(i, a)| {
+        *i > 0
+            && a.to_str()
+                .is_some_and(|s| global_flags.iter().any(|f| f == s))
+    });
     let rest: Vec<&std::ffi::OsString> = rest.into_iter().map(|(_, a)| a).collect();
 
     if rest.len() == 2
