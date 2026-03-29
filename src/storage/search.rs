@@ -147,11 +147,14 @@ pub fn hybrid_search(
 
     let mut results = Vec::new();
     for (post_number, score) in scored.into_iter().take(limit as usize) {
-        let meta = post_meta.get(&post_number).cloned().unwrap_or_else(|| PostMeta {
-            name: format!("#{post_number}"),
-            url: String::new(),
-            updated_at: String::new(),
-        });
+        let meta = post_meta
+            .get(&post_number)
+            .cloned()
+            .unwrap_or_else(|| PostMeta {
+                name: format!("#{post_number}"),
+                url: String::new(),
+                updated_at: String::new(),
+            });
 
         let (section_title, snippet) = fts_map
             .get(&post_number)
@@ -212,7 +215,16 @@ fn batch_fetch_post_meta(
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows
         .into_iter()
-        .map(|(n, name, url, updated_at)| (n, PostMeta { name, url, updated_at }))
+        .map(|(n, name, url, updated_at)| {
+            (
+                n,
+                PostMeta {
+                    name,
+                    url,
+                    updated_at,
+                },
+            )
+        })
         .collect())
 }
 
@@ -696,7 +708,8 @@ mod tests {
             snippet: "snippet text".to_string(),
             score: 0.85,
         };
-        let json_str = serde_json::to_string(&result).expect("[T-035] SearchResult should serialize");
+        let json_str =
+            serde_json::to_string(&result).expect("[T-035] SearchResult should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["post_number"], 42);
         assert_eq!(v["post_name"], "Test Post");
