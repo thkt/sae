@@ -154,10 +154,11 @@ Examples:
         #[arg(long)]
         dry_run: bool,
     },
-    /// Download model and embed all chunks
+    /// Embed all chunks (model must be downloaded first)
     #[command(after_help = "\
 Examples:
-  sae embed myteam")]
+  sae embed myteam
+  SAE_AUTO_DOWNLOAD_MODEL=1 sae embed myteam")]
     Embed {
         /// Team name
         team: String,
@@ -173,10 +174,28 @@ Examples:
         #[arg(long)]
         team: Option<String>,
     },
+    /// Manage embedding model
+    #[command(
+        subcommand_required = true,
+        arg_required_else_help = true,
+        after_help = "\
+Examples:
+  sae model download"
+    )]
+    Model {
+        #[command(subcommand)]
+        command: ModelCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum ModelCommand {
+    /// Download embedding model from Hugging Face Hub
+    Download,
 }
 
 const KNOWN_SUBCOMMANDS: &[&str] = &[
-    "harvest", "search", "get", "create", "update", "archive", "ship", "embed", "status",
+    "harvest", "search", "get", "create", "update", "archive", "ship", "embed", "status", "model",
 ];
 
 const GLOBAL_FLAGS: &[&str] = &["--json"];
@@ -348,9 +367,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             require_db(&db_path, team);
             let db = sae::storage::Db::open(&db_path)?;
 
-            eprintln!("Checking model...");
-            let paths = rurico::embed::download_model()
-                .map_err(|e| format!("Failed to download model: {e}"))?;
+            let paths = require_embed_model()?;
+            eprintln!("Loading model...");
             let embedder =
                 Embedder::new(&paths).map_err(|e| format!("Failed to load model: {e}"))?;
             eprintln!("Model ready");
@@ -465,6 +483,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let statuses = collect_team_statuses(&config, &teams)?;
             output::status(&statuses, json)?;
         }
+        Command::Model { command } => match command {
+            ModelCommand::Download => {
+                eprintln!("Downloading model...");
+                let paths = rurico::embed::download_model()
+                    .map_err(|e| format!("Failed to download model: {e}"))?;
+                // Verify model files are loadable (catches corrupt downloads)
+                let _embedder =
+                    Embedder::new(&paths).map_err(|e| format!("Failed to verify model: {e}"))?;
+                output::model_download(json)?;
+            }
+        },
     }
 
     Ok(())
@@ -766,16 +795,98 @@ mod tests {
             "[TC-011] --unknown should be clap error, not search shorthand"
         );
     }
+
+    // --- model subcommand (FR-001, FR-006, FR-007) ---
+
+    // T-001: `sae model download` parses to Command::Model { ModelCommand::Download }
+    #[test]
+    fn model_download_parses_correctly() {
+        let cli = parse_cli_args(["sae", "model", "download"]).unwrap();
+        match cli.command {
+            Command::Model { command } => match command {
+                ModelCommand::Download => {} // pass
+            },
+            other => panic!("[T-001] expected Model {{ Download }}, got {other:?}"),
+        }
+    }
+
+    // T-002: `sae model` without subcommand → clap error (arg_required_else_help)
+    #[test]
+    fn model_without_subcommand_is_clap_error() {
+        let result = parse_cli_args(["sae", "model"]);
+        assert!(
+            result.is_err(),
+            "[T-002] model without subcommand should be clap error"
+        );
+    }
+
+    // T-003: `sae model` is in KNOWN_SUBCOMMANDS, not rewritten to search shorthand
+    #[test]
+    fn model_is_known_subcommand_not_shorthand() {
+        assert!(
+            KNOWN_SUBCOMMANDS.contains(&"model"),
+            "[T-003] KNOWN_SUBCOMMANDS must contain \"model\""
+        );
+        // Also verify parse does not rewrite to search
+        let result = parse_cli_args(["sae", "model"]);
+        // Should be a clap error (missing subcommand), NOT a search for "model"
+        assert!(
+            result.is_err(),
+            "[T-003] sae model should not become search shorthand"
+        );
+    }
+
+    // T-004: `sae model download --json` → json=true + ModelCommand::Download
+    #[test]
+    fn model_download_with_json_flag() {
+        let cli = parse_cli_args(["sae", "--json", "model", "download"]).unwrap();
+        assert!(cli.json, "[T-004] global json flag should be true");
+        match cli.command {
+            Command::Model { command } => match command {
+                ModelCommand::Download => {} // pass
+            },
+            other => panic!("[T-004] expected Model {{ Download }}, got {other:?}"),
+        }
+    }
+
+    // T-005: `sae embed myteam` still parses as Command::Embed (regression)
+    #[test]
+    fn embed_still_parses_after_model_addition() {
+        let cli = parse_cli_args(["sae", "embed", "myteam"]).unwrap();
+        match cli.command {
+            Command::Embed { team } => {
+                assert_eq!(team, "myteam", "[T-005] team should be myteam");
+            }
+            other => panic!("[T-005] expected Embed, got {other:?}"),
+        }
+    }
+}
+
+fn require_embed_model() -> Result<rurico::embed::ModelPaths, Box<dyn std::error::Error>> {
+    let auto_download = std::env::var("SAE_AUTO_DOWNLOAD_MODEL").as_deref() == Ok("1");
+    if auto_download {
+        eprintln!("Downloading model (SAE_AUTO_DOWNLOAD_MODEL=1)...");
+        return rurico::embed::download_model()
+            .map_err(|e| format!("Failed to download model: {e}").into());
+    }
+    match rurico::embed::model_paths_if_cached() {
+        Ok(Some(p)) => Ok(p),
+        Ok(None) => Err("Model not found. Run 'sae model download' first.".into()),
+        Err(e) => Err(format!("Failed to check model cache: {e}").into()),
+    }
 }
 
 fn try_load_embedder() -> Option<Embedder> {
-    let paths = match rurico::embed::download_model() {
-        Ok(p) => p,
+    let paths = match rurico::embed::model_paths_if_cached() {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            eprintln!(
+                "Hint: run 'sae model download && sae embed <team>' to enable semantic search"
+            );
+            return None;
+        }
         Err(e) => {
             tracing::warn!(error = %e, "embedding model not available");
-            eprintln!(
-                "Note: embedding model not available. Run `sae embed <team>` to enable semantic search."
-            );
             return None;
         }
     };

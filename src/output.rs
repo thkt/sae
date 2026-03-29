@@ -103,6 +103,18 @@ pub fn embed(
     Ok(())
 }
 
+pub fn model_download(json: bool) -> Result<(), Box<dyn std::error::Error>> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({"status": "ok"}))?
+        );
+    } else {
+        println!("Model downloaded and verified");
+    }
+    Ok(())
+}
+
 pub fn status(statuses: &[TeamStatus], json: bool) -> Result<(), Box<dyn std::error::Error>> {
     if json {
         println!("{}", serde_json::to_string(statuses)?);
