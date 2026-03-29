@@ -1,6 +1,6 @@
 mod output;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use rurico::embed::{Embed, Embedder};
 use sae::client::EsaClient;
 use sae::config::Config;
@@ -9,6 +9,8 @@ use sae::config::Config;
 #[command(name = "sae", about = "esa semantic search CLI")]
 struct Cli {
     /// Output as JSON
+    // NOTE: parse_cli_args の shorthand 判定は long flag のみ対応。
+    // short global flag を追加する場合は get_short() 対応が必要。
     #[arg(long, global = true)]
     json: bool,
     #[command(subcommand)]
@@ -194,12 +196,6 @@ enum ModelCommand {
     Download,
 }
 
-const KNOWN_SUBCOMMANDS: &[&str] = &[
-    "harvest", "search", "get", "create", "update", "archive", "ship", "embed", "status", "model",
-];
-
-const GLOBAL_FLAGS: &[&str] = &["--json"];
-
 fn parse_cli_args<I, T>(args: I) -> Result<Cli, clap::Error>
 where
     I: IntoIterator<Item = T>,
@@ -207,18 +203,26 @@ where
 {
     let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
 
+    let cmd = Cli::command();
+    let known: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
+    let global_flags: Vec<String> = cmd
+        .get_arguments()
+        .filter(|a| a.is_global_set())
+        .filter_map(|a| a.get_long().map(|l| format!("--{l}")))
+        .collect();
+
     // Shorthand: `sae "query"` or `sae --json "query"` → `sae [flags] search "query"`
-    // Strip global flags, check if remaining is [binary, query], then re-inject.
-    let (flags, rest): (Vec<_>, Vec<_>) = args
-        .iter()
-        .enumerate()
-        .partition(|(i, a)| *i > 0 && a.to_str().is_some_and(|s| GLOBAL_FLAGS.contains(&s)));
+    let (flags, rest): (Vec<_>, Vec<_>) = args.iter().enumerate().partition(|(i, a)| {
+        *i > 0
+            && a.to_str()
+                .is_some_and(|s| global_flags.iter().any(|f| f == s))
+    });
     let rest: Vec<&std::ffi::OsString> = rest.into_iter().map(|(_, a)| a).collect();
 
     if rest.len() == 2
         && let Some(first_arg) = rest[1].to_str()
         && !first_arg.starts_with('-')
-        && !KNOWN_SUBCOMMANDS.contains(&first_arg)
+        && !known.contains(&first_arg)
     {
         let mut expanded: Vec<std::ffi::OsString> = vec![rest[0].clone()];
         for (_, f) in &flags {
@@ -810,29 +814,13 @@ mod tests {
         }
     }
 
-    // T-002: `sae model` without subcommand → clap error (arg_required_else_help)
+    // T-002/T-003: `sae model` → clap error (not rewritten to search shorthand)
     #[test]
     fn model_without_subcommand_is_clap_error() {
         let result = parse_cli_args(["sae", "model"]);
         assert!(
             result.is_err(),
-            "[T-002] model without subcommand should be clap error"
-        );
-    }
-
-    // T-003: `sae model` is in KNOWN_SUBCOMMANDS, not rewritten to search shorthand
-    #[test]
-    fn model_is_known_subcommand_not_shorthand() {
-        assert!(
-            KNOWN_SUBCOMMANDS.contains(&"model"),
-            "[T-003] KNOWN_SUBCOMMANDS must contain \"model\""
-        );
-        // Also verify parse does not rewrite to search
-        let result = parse_cli_args(["sae", "model"]);
-        // Should be a clap error (missing subcommand), NOT a search for "model"
-        assert!(
-            result.is_err(),
-            "[T-003] sae model should not become search shorthand"
+            "[T-002] model without subcommand should be clap error, not search shorthand"
         );
     }
 
