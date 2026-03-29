@@ -5,7 +5,7 @@ pub struct EsaPostRow {
     pub full_name: String,
     pub body_md: String,
     pub category: Option<String>,
-    pub tags: String,
+    pub tags: Vec<String>,
     pub wip: bool,
     pub kind: String,
     pub url: String,
@@ -14,6 +14,12 @@ pub struct EsaPostRow {
     pub created_by: String,
     pub updated_by: String,
     pub revision_number: u32,
+}
+
+impl EsaPostRow {
+    pub fn tags_json(&self) -> String {
+        serde_json::to_string(&self.tags).unwrap_or_else(|_| "[]".into())
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
