@@ -175,9 +175,13 @@ Examples:
         team: Option<String>,
     },
     /// Manage embedding model
-    #[command(subcommand_required = true, arg_required_else_help = true, after_help = "\
+    #[command(
+        subcommand_required = true,
+        arg_required_else_help = true,
+        after_help = "\
 Examples:
-  sae model download")]
+  sae model download"
+    )]
     Model {
         #[command(subcommand)]
         command: ModelCommand,
@@ -485,8 +489,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let paths = rurico::embed::download_model()
                     .map_err(|e| format!("Failed to download model: {e}"))?;
                 // Verify model files are loadable (catches corrupt downloads)
-                let _embedder = Embedder::new(&paths)
-                    .map_err(|e| format!("Failed to verify model: {e}"))?;
+                let _embedder =
+                    Embedder::new(&paths).map_err(|e| format!("Failed to verify model: {e}"))?;
                 output::model_download(json)?;
             }
         },

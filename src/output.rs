@@ -105,7 +105,10 @@ pub fn embed(
 
 pub fn model_download(json: bool) -> Result<(), Box<dyn std::error::Error>> {
     if json {
-        println!("{}", serde_json::to_string(&serde_json::json!({"status": "ok"}))?);
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({"status": "ok"}))?
+        );
     } else {
         println!("Model downloaded and verified");
     }
