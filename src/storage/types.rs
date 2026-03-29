@@ -83,13 +83,15 @@ mod tests {
             error: None,
             db_path: None,
         };
-        let json_str =
-            serde_json::to_string(&status).expect("[T-045] TeamStatus should serialize");
+        let json_str = serde_json::to_string(&status).expect("[T-045] TeamStatus should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["team"], "myteam");
         assert_eq!(v["status"], "synced");
         assert_eq!(v["posts"], 42);
-        assert!(v["sync_state"].is_object(), "[T-045] sync_state should be an object");
+        assert!(
+            v["sync_state"].is_object(),
+            "[T-045] sync_state should be an object"
+        );
     }
 
     // T-045: TeamStatus array serialization
@@ -113,8 +115,8 @@ mod tests {
                 db_path: None,
             },
         ];
-        let json_str = serde_json::to_string(&statuses)
-            .expect("[T-045] TeamStatus array should serialize");
+        let json_str =
+            serde_json::to_string(&statuses).expect("[T-045] TeamStatus array should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert!(v.is_array(), "[T-045] should be a JSON array");
         assert_eq!(v.as_array().unwrap().len(), 2);
@@ -149,8 +151,7 @@ mod tests {
             last_page: Some(3),
             updated_at: "2025-01-01 00:00:00".to_string(),
         };
-        let json_str =
-            serde_json::to_string(&state).expect("[T-045] SyncState should serialize");
+        let json_str = serde_json::to_string(&state).expect("[T-045] SyncState should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["total_count"], 100);
         assert_eq!(v["local_count"], 50);
@@ -160,7 +161,9 @@ mod tests {
     // T-053: embed --json → EmbedResult JSON (chunks_embedded field)
     #[test]
     fn embed_result_serializes_to_json_with_chunks_embedded() {
-        let result = EmbedResult { chunks_embedded: 150 };
+        let result = EmbedResult {
+            chunks_embedded: 150,
+        };
         let json_str =
             serde_json::to_string(&result).expect("[T-053] EmbedResult should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();

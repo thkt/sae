@@ -39,11 +39,7 @@ pub fn search(
     Ok(())
 }
 
-pub fn get(
-    post: &EsaPost,
-    json: bool,
-    with_body: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+pub fn get(post: &EsaPost, json: bool, with_body: bool) -> Result<(), Box<dyn std::error::Error>> {
     if json {
         let mut post = post.clone();
         if !with_body {

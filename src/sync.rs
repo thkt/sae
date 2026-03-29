@@ -507,8 +507,12 @@ mod tests {
             url: "https://example.esa.io/posts/1".into(),
             created_at: "2025-01-01T00:00:00+09:00".into(),
             updated_at: "2025-01-02T00:00:00+09:00".into(),
-            created_by: crate::client::EsaUser { screen_name: "alice".into() },
-            updated_by: crate::client::EsaUser { screen_name: "bob".into() },
+            created_by: crate::client::EsaUser {
+                screen_name: "alice".into(),
+            },
+            updated_by: crate::client::EsaUser {
+                screen_name: "bob".into(),
+            },
             revision_number: 1,
         };
         let row = post_to_row(&post);

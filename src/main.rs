@@ -487,7 +487,7 @@ fn collect_team_statuses(
                     error: Some(e.to_string()),
                     db_path: None,
                 },
-            }
+            },
             Ok(path) => sae::storage::TeamStatus {
                 team: t.to_string(),
                 status: sae::storage::SyncStatus::NotSynced,
@@ -633,14 +633,9 @@ mod tests {
     // T-038: create args + --dry-run → parse succeeds with dry_run=true
     #[test]
     fn create_with_dry_run_parses_dry_run_flag() {
-        let cli = parse_cli_args([
-            "sae", "create", "--name", "Test Post", "--dry-run",
-        ])
-        .unwrap();
+        let cli = parse_cli_args(["sae", "create", "--name", "Test Post", "--dry-run"]).unwrap();
         match cli.command {
-            Command::Create {
-                name, dry_run, ..
-            } => {
+            Command::Create { name, dry_run, .. } => {
                 assert_eq!(name, "Test Post", "[T-038] name should match");
                 assert!(dry_run, "[T-038] dry_run should be true");
             }
@@ -672,10 +667,8 @@ mod tests {
     // For now, test the parse side: --body-file "-" parses correctly.
     #[test]
     fn body_file_dash_parses_as_stdin() {
-        let cli = parse_cli_args([
-            "sae", "create", "--name", "Stdin Post", "--body-file", "-",
-        ])
-        .unwrap();
+        let cli =
+            parse_cli_args(["sae", "create", "--name", "Stdin Post", "--body-file", "-"]).unwrap();
         match cli.command {
             Command::Create { body_file, .. } => {
                 assert_eq!(
@@ -728,7 +721,10 @@ mod tests {
         use clap::CommandFactory;
         let cmd = Cli::command();
         for sub in cmd.get_subcommands() {
-            let after_help = sub.get_after_help().map(|h| h.to_string()).unwrap_or_default();
+            let after_help = sub
+                .get_after_help()
+                .map(|h| h.to_string())
+                .unwrap_or_default();
             assert!(
                 after_help.contains("Examples"),
                 "[T-042] subcommand '{}' should have Examples in after_help",
@@ -755,14 +751,20 @@ mod tests {
     #[test]
     fn resolve_body_nonexistent_file_is_error() {
         let result = resolve_body(None, Some("/nonexistent/path.md"));
-        assert!(result.is_err(), "[TC-009] nonexistent file should return error");
+        assert!(
+            result.is_err(),
+            "[TC-009] nonexistent file should return error"
+        );
     }
 
     // TC-011: flag-like argument not treated as shorthand query
     #[test]
     fn flag_like_arg_not_shorthand() {
         let result = parse_cli_args(["sae", "--unknown"]);
-        assert!(result.is_err(), "[TC-011] --unknown should be clap error, not search shorthand");
+        assert!(
+            result.is_err(),
+            "[TC-011] --unknown should be clap error, not search shorthand"
+        );
     }
 }
 

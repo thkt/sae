@@ -555,7 +555,10 @@ mod tests {
         let post = test_esa_post(None);
         let json_str = serde_json::to_string(&post).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert!(v["body_md"].is_null(), "[T-036] body_md should be null when None");
+        assert!(
+            v["body_md"].is_null(),
+            "[T-036] body_md should be null when None"
+        );
         assert_eq!(v["number"], 42);
         assert_eq!(v["name"], "Test Post");
     }
