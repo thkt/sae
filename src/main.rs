@@ -503,7 +503,7 @@ fn run_embed(config: &Config, team: &str, json: bool) -> Result<(), AppError> {
     let embedder = Embedder::new(&paths).map_err(|e| format!("Failed to load model: {e}"))?;
     eprintln!("Model ready");
 
-    const BATCH_SIZE: u32 = 500;
+    const BATCH_SIZE: u32 = 256;
     let mut total_added = 0u32;
     let mut done = 0u32;
     loop {

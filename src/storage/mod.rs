@@ -310,6 +310,20 @@ pub fn count_chunks(conn: &Connection) -> Result<u32, StorageError> {
     Ok(count)
 }
 
+/// Make post metadata searchable via FTS by prepending it to the chunk body.
+pub(crate) fn enrich_body(row: &EsaPostRow) -> String {
+    let mut meta = format!("{}\n{}", row.name, row.created_by);
+    if let Some(cat) = &row.category {
+        meta.push(' ');
+        meta.push_str(cat);
+    }
+    if !row.tags.is_empty() {
+        meta.push(' ');
+        meta.push_str(&row.tags.join(" "));
+    }
+    format!("{meta}\n\n{}", row.body_md)
+}
+
 pub fn rechunk_post(
     conn: &Connection,
     post_number: u32,
@@ -608,6 +622,51 @@ mod tests {
             fts_count, chunks_count,
             "[T-005] fts_chunks count ({fts_count}) must equal chunks count ({chunks_count})"
         );
+    }
+
+    #[test]
+    fn enrich_body_includes_all_metadata() {
+        let mut row = test_post_row(1);
+        row.name = "Daily 振り返り".into();
+        row.body_md = "# やったこと\n実装した".into();
+        row.category = Some("チーム/日報/thkt".into());
+        row.tags = vec!["日報".into(), "振り返り".into()];
+        row.created_by = "thkt".into();
+        let enriched = enrich_body(&row);
+        assert_eq!(
+            enriched,
+            "Daily 振り返り\nthkt チーム/日報/thkt 日報 振り返り\n\n# やったこと\n実装した"
+        );
+    }
+
+    #[test]
+    fn enrich_body_no_category_no_tags() {
+        let mut row = test_post_row(1);
+        row.name = "Untitled".into();
+        row.body_md = "text".into();
+        row.category = None;
+        let enriched = enrich_body(&row);
+        assert_eq!(enriched, "Untitled\nalice\n\ntext");
+    }
+
+    #[test]
+    fn enrich_body_category_only() {
+        let mut row = test_post_row(1);
+        row.name = "Post".into();
+        row.body_md = "body".into();
+        let enriched = enrich_body(&row);
+        assert_eq!(enriched, "Post\nalice dev\n\nbody");
+    }
+
+    #[test]
+    fn enrich_body_tags_only() {
+        let mut row = test_post_row(1);
+        row.name = "Post".into();
+        row.body_md = "body".into();
+        row.category = None;
+        row.tags = vec!["rust".into(), "cli".into()];
+        let enriched = enrich_body(&row);
+        assert_eq!(enriched, "Post\nalice rust cli\n\nbody");
     }
 
     // T-006: fresh DB で fts_chunks に section_title + content カラムあり (FR-001)

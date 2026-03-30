@@ -111,7 +111,8 @@ pub async fn harvest(
                 batch_oldest_ts = Some(row.updated_at.clone());
             }
             storage::upsert_post(&tx, &row)?;
-            storage::rechunk_post(&tx, row.number, &row.body_md)?;
+            let enriched_body = storage::enrich_body(&row);
+            storage::rechunk_post(&tx, row.number, &enriched_body)?;
             total_stored += 1;
         }
         total_fetched += resp.posts.len() as u32;
