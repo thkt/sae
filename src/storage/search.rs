@@ -717,7 +717,10 @@ mod tests {
 
         // Combined query (matching esa web search behavior)
         let hits = fts_search(db.conn(), "Daily 振り返り thkt", 10).unwrap();
-        assert!(!hits.is_empty(), "combined name + author query should match");
+        assert!(
+            !hits.is_empty(),
+            "combined name + author query should match"
+        );
     }
 
     // T-035: search --json → JSON array with post_number, post_name, score
