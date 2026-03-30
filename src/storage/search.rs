@@ -689,6 +689,37 @@ mod tests {
         assert_eq!(hits[0].section_title.as_deref(), Some("認証ガイド"));
     }
 
+    #[test]
+    fn fts_search_matches_enriched_metadata() {
+        let db = Db::open_memory().unwrap();
+        let mut row = storage::test_post_row(1);
+        row.name = "Daily振り返り".into();
+        row.body_md = "# 作業内容\n実装した".into();
+        row.category = Some("チーム/日報".into());
+        row.tags = vec!["日報".into(), "振り返り".into()];
+        row.created_by = "thkt".into();
+        storage::upsert_post(db.conn(), &row).unwrap();
+
+        let enriched = storage::enrich_body(&row);
+        storage::rechunk_post(db.conn(), 1, &enriched).unwrap();
+
+        // Post name
+        let hits = fts_search(db.conn(), "Daily振り返り", 10).unwrap();
+        assert!(!hits.is_empty(), "post name should be searchable");
+
+        // Author
+        let hits = fts_search(db.conn(), "thkt", 10).unwrap();
+        assert!(!hits.is_empty(), "author should be searchable");
+
+        // Category
+        let hits = fts_search(db.conn(), "日報", 10).unwrap();
+        assert!(!hits.is_empty(), "category/tag should be searchable");
+
+        // Combined query (matching esa web search behavior)
+        let hits = fts_search(db.conn(), "Daily 振り返り thkt", 10).unwrap();
+        assert!(!hits.is_empty(), "combined name + author query should match");
+    }
+
     // T-035: search --json → JSON array with post_number, post_name, score
     #[test]
     fn search_result_serializes_to_json_with_expected_fields() {
