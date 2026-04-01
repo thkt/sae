@@ -1,5 +1,7 @@
 mod output;
 
+use std::io::Read;
+
 use clap::{CommandFactory, Parser, Subcommand};
 use rurico::embed::{Embed, Embedder};
 use sae::client::{CreatePostParams, EsaClient, UpdatePostParams};
@@ -503,7 +505,7 @@ fn run_embed(config: &Config, team: &str, json: bool) -> Result<(), AppError> {
     let embedder = Embedder::new(&paths).map_err(|e| format!("Failed to load model: {e}"))?;
     eprintln!("Model ready");
 
-    const BATCH_SIZE: u32 = 256;
+    const BATCH_SIZE: u32 = 64;
     let mut total_added = 0u32;
     let mut done = 0u32;
     loop {
@@ -686,11 +688,20 @@ fn resolve_body(
     body: Option<&str>,
     body_file: Option<&str>,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let mut stdin = std::io::stdin();
+    resolve_body_with_reader(body, body_file, &mut stdin)
+}
+
+fn resolve_body_with_reader(
+    body: Option<&str>,
+    body_file: Option<&str>,
+    stdin: &mut impl Read,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     match (body, body_file) {
         (Some(b), None) => Ok(Some(b.to_string())),
         (None, Some("-")) => {
             let mut buf = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+            stdin.read_to_string(&mut buf)?;
             Ok(Some(buf))
         }
         (None, Some(path)) => {
@@ -742,6 +753,18 @@ fn try_load_embedder() -> Option<Embedder> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use tempfile::tempdir;
+
+    fn subcommand_after_help(name: &str) -> String {
+        let mut command = Cli::command();
+        command
+            .find_subcommand_mut(name)
+            .unwrap()
+            .get_after_help()
+            .map(|help| help.to_string())
+            .unwrap_or_default()
+    }
 
     // T-029: shorthand `sae "認証"` → search
     #[test]
@@ -827,9 +850,8 @@ mod tests {
     // T-039: --body-file <tempfile> with create → file content becomes body
     #[test]
     fn body_file_reads_from_file() {
-        let dir = std::env::temp_dir().join("sae_test_t039");
-        let _ = std::fs::create_dir_all(&dir);
-        let file_path = dir.join("body.md");
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("body.md");
         std::fs::write(&file_path, "# Hello\nBody from file").unwrap();
 
         let result = resolve_body(None, Some(file_path.to_str().unwrap())).unwrap();
@@ -838,14 +860,20 @@ mod tests {
             Some("# Hello\nBody from file"),
             "[T-039] body should contain file contents"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // T-040: --body-file - with create → stdin content becomes body
-    // Note: stdin mocking is non-trivial; test that resolve_body("-") triggers
-    // the stdin path. The function should accept a Read trait for testability.
-    // For now, test the parse side: --body-file "-" parses correctly.
+    #[test]
+    fn body_file_dash_reads_from_stdin() {
+        let mut stdin = Cursor::new("# Hello\nBody from stdin\n");
+        let result = resolve_body_with_reader(None, Some("-"), &mut stdin).unwrap();
+        assert_eq!(
+            result.as_deref(),
+            Some("# Hello\nBody from stdin\n"),
+            "[T-040] body should contain stdin contents as-is"
+        );
+    }
+
     #[test]
     fn body_file_dash_parses_as_stdin() {
         let cli =
@@ -899,19 +927,24 @@ mod tests {
     // T-042: help output contains Examples section
     #[test]
     fn help_output_contains_examples() {
-        use clap::CommandFactory;
         let cmd = Cli::command();
         for sub in cmd.get_subcommands() {
-            let after_help = sub
-                .get_after_help()
-                .map(|h| h.to_string())
-                .unwrap_or_default();
+            let after_help = subcommand_after_help(sub.get_name());
             assert!(
                 after_help.contains("Examples"),
                 "[T-042] subcommand '{}' should have Examples in after_help",
                 sub.get_name()
             );
         }
+    }
+
+    #[test]
+    fn create_help_includes_stdin_example() {
+        let after_help = subcommand_after_help("create");
+        assert!(
+            after_help.contains("cat body.md | sae create --name \"Title\" --body-file -"),
+            "[T-042] create help should include stdin example"
+        );
     }
 
     // TC-008: resolve_body(Some, None) → inline body
