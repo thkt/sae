@@ -891,7 +891,6 @@ mod tests {
         }
     }
 
-    // --- Phase 2: --dry-run, --body-file (FR-004, FR-005, FR-006, FR-007) ---
 
     // T-038: create args + --dry-run → parse succeeds with dry_run=true
     #[test]
@@ -1056,74 +1055,46 @@ mod tests {
         assert_eq!(result.as_deref(), Some(""), "[TC-010b] empty stdin yields empty body string");
     }
 
+    fn resolve_search(value: Option<&str>, stdin: &str, is_terminal: bool) -> Result<String, AppError> {
+        resolve_value_with_reader(
+            value.map(str::to_string),
+            Cursor::new(stdin),
+            is_terminal,
+            "search query",
+            "QUERY",
+        )
+    }
+
     #[test]
     fn resolve_value_reads_piped_stdin_when_missing() {
-        let query =
-            resolve_value_with_reader(None, Cursor::new("認証\n"), false, "search query", "QUERY").unwrap();
-        assert_eq!(query, "認証");
+        assert_eq!(resolve_search(None, "認証\n", false).unwrap(), "認証");
     }
 
     #[test]
     fn resolve_value_reads_stdin_when_dash_is_passed() {
-        let query = resolve_value_with_reader(
-            Some("-".to_string()),
-            Cursor::new("認証\n"),
-            true,
-            "search query",
-            "QUERY",
-        )
-        .unwrap();
-        assert_eq!(query, "認証");
+        assert_eq!(resolve_search(Some("-"), "認証\n", true).unwrap(), "認証");
     }
 
     #[test]
     fn resolve_value_returns_value_when_present() {
-        let query = resolve_value_with_reader(
-            Some("認証".to_string()),
-            Cursor::new("ignored"),
-            true,
-            "search query",
-            "QUERY",
-        )
-        .unwrap();
-        assert_eq!(query, "認証");
+        assert_eq!(resolve_search(Some("認証"), "ignored", true).unwrap(), "認証");
     }
 
     #[test]
     fn resolve_value_rejects_dash_with_empty_stdin() {
-        let err = resolve_value_with_reader(
-            Some("-".to_string()),
-            Cursor::new(""),
-            true,
-            "search query",
-            "QUERY",
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("No search query provided"),
-            "unexpected error: {err}"
-        );
+        let err = resolve_search(Some("-"), "", true).unwrap_err();
+        assert!(err.to_string().contains("No search query provided"), "unexpected error: {err}");
     }
 
     #[test]
     fn resolve_value_rejects_whitespace_only_piped_stdin() {
-        let err = resolve_value_with_reader(
-            None,
-            Cursor::new("  \n  \t  "),
-            false,
-            "search query",
-            "QUERY",
-        )
-        .unwrap_err();
-        assert!(
-            err.to_string().contains("No search query provided"),
-            "unexpected error: {err}"
-        );
+        let err = resolve_search(None, "  \n  \t  ", false).unwrap_err();
+        assert!(err.to_string().contains("No search query provided"), "unexpected error: {err}");
     }
 
     #[test]
     fn resolve_value_rejects_missing_on_terminal() {
-        let err = resolve_value_with_reader(None, Cursor::new(""), true, "search query", "QUERY").unwrap_err();
+        let err = resolve_search(None, "", true).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("Missing search query"), "unexpected error: {err}");
         assert!(msg.contains("Pass QUERY"), "error should include placeholder: {err}");
@@ -1139,7 +1110,6 @@ mod tests {
         );
     }
 
-    // --- model subcommand (FR-001, FR-006, FR-007) ---
 
     // T-001: `sae model download` parses to Command::Model { ModelCommand::Download }
     #[test]
@@ -1188,7 +1158,6 @@ mod tests {
         }
     }
 
-    // --- archive_category ---
 
     #[test]
     fn archive_no_category() {
