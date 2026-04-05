@@ -1,5 +1,7 @@
 mod output;
 
+use std::io::{IsTerminal, Read};
+
 use clap::{CommandFactory, Parser, Subcommand};
 use rurico::embed::{Embed, Embedder};
 use sae::client::{CreatePostParams, EsaClient, UpdatePostParams};
@@ -35,10 +37,11 @@ Examples:
     #[command(after_help = "\
 Examples:
   sae search \"認証\" --team myteam --limit 5
-  sae \"認証\"")]
+  echo \"認証\" | sae search
+  sae search -")]
     Search {
-        /// Search query
-        query: String,
+        /// Search query. Reads piped stdin when omitted, or any stdin with `-`.
+        query: Option<String>,
         /// Team name
         #[arg(long)]
         team: Option<String>,
@@ -283,6 +286,7 @@ async fn main() -> Result<(), AppError> {
     match cli.command {
         Command::Harvest { team, full } => run_harvest(&config, &team, full, json).await,
         Command::Search { query, team, limit } => {
+            let query = resolve_search_query(query)?;
             run_search(&config, &query, team.as_deref(), limit, json)
         }
         Command::Get {
@@ -503,7 +507,7 @@ fn run_embed(config: &Config, team: &str, json: bool) -> Result<(), AppError> {
     let embedder = Embedder::new(&paths).map_err(|e| format!("Failed to load model: {e}"))?;
     eprintln!("Model ready");
 
-    const BATCH_SIZE: u32 = 256;
+    const BATCH_SIZE: u32 = 64;
     let mut total_added = 0u32;
     let mut done = 0u32;
     loop {
@@ -606,7 +610,13 @@ fn run_status(config: &Config, team: Option<&str>, json: bool) -> Result<(), App
         config
             .teams
             .iter()
-            .filter(|t| sae::config::validate_team_name(t).is_ok())
+            .filter(|t| match sae::config::validate_team_name(t) {
+                Ok(_) => true,
+                Err(_) => {
+                    eprintln!("warning: skipping invalid team name: {t}");
+                    false
+                }
+            })
             .map(String::as_str)
             .collect()
     };
@@ -686,11 +696,20 @@ fn resolve_body(
     body: Option<&str>,
     body_file: Option<&str>,
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let mut stdin = std::io::stdin();
+    resolve_body_with_reader(body, body_file, &mut stdin)
+}
+
+fn resolve_body_with_reader(
+    body: Option<&str>,
+    body_file: Option<&str>,
+    stdin: &mut impl Read,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
     match (body, body_file) {
         (Some(b), None) => Ok(Some(b.to_string())),
         (None, Some("-")) => {
             let mut buf = String::new();
-            std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)?;
+            stdin.read_to_string(&mut buf)?;
             Ok(Some(buf))
         }
         (None, Some(path)) => {
@@ -700,6 +719,54 @@ fn resolve_body(
         (None, None) => Ok(None),
         (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
     }
+}
+
+fn resolve_search_query(query: Option<String>) -> Result<String, AppError> {
+    let stdin = std::io::stdin();
+    resolve_value_with_reader(
+        query,
+        stdin.lock(),
+        stdin.is_terminal(),
+        "search query",
+        "QUERY",
+    )
+}
+
+fn resolve_value_with_reader(
+    value: Option<String>,
+    mut stdin: impl Read,
+    stdin_is_terminal: bool,
+    label: &str,
+    placeholder: &str,
+) -> Result<String, AppError> {
+    match value {
+        Some(value) if value != "-" => Ok(value),
+        Some(_) => read_stdin_value(&mut stdin, label, placeholder),
+        None if stdin_is_terminal => Err(format!(
+            "Missing {label}. Pass {placeholder}, pipe it via stdin, or use `-` to read stdin interactively"
+        )
+        .into()),
+        None => read_stdin_value(&mut stdin, label, placeholder),
+    }
+}
+
+fn read_stdin_value(
+    mut stdin: impl Read,
+    label: &str,
+    placeholder: &str,
+) -> Result<String, AppError> {
+    let mut buf = String::new();
+    stdin.read_to_string(&mut buf)?;
+
+    let value = buf.trim();
+    if value.is_empty() {
+        return Err(format!(
+            "No {label} provided. Pass {placeholder}, pipe it via stdin, or use `-` to read stdin interactively"
+        )
+        .into());
+    }
+
+    Ok(value.to_string())
 }
 
 fn require_embed_model() -> Result<rurico::embed::ModelPaths, Box<dyn std::error::Error>> {
@@ -742,13 +809,25 @@ fn try_load_embedder() -> Option<Embedder> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::Cursor;
+    use tempfile::tempdir;
+
+    fn subcommand_after_help(name: &str) -> String {
+        let mut command = Cli::command();
+        command
+            .find_subcommand_mut(name)
+            .unwrap()
+            .get_after_help()
+            .map(|help| help.to_string())
+            .unwrap_or_default()
+    }
 
     // T-029: shorthand `sae "認証"` → search
     #[test]
     fn shorthand_single_query_becomes_search() {
         let cli = parse_cli_args(["sae", "認証"]).unwrap();
         match cli.command {
-            Command::Search { query, .. } => assert_eq!(query, "認証"),
+            Command::Search { query, .. } => assert_eq!(query.as_deref(), Some("認証")),
             other => panic!("expected Search, got {other:?}"),
         }
     }
@@ -758,7 +837,7 @@ mod tests {
     fn explicit_search_not_double_injected() {
         let cli = parse_cli_args(["sae", "search", "認証"]).unwrap();
         match cli.command {
-            Command::Search { query, .. } => assert_eq!(query, "認証"),
+            Command::Search { query, .. } => assert_eq!(query.as_deref(), Some("認証")),
             other => panic!("expected Search, got {other:?}"),
         }
     }
@@ -773,11 +852,14 @@ mod tests {
         }
     }
 
-    // T-033: `sae search` (missing required arg) → clap error via helper
+    // T-033: `sae search` (missing arg) parses to stdin fallback path
     #[test]
-    fn search_missing_arg_is_clap_error() {
-        let result = parse_cli_args(["sae", "search"]);
-        assert!(result.is_err(), "search without query should be clap error");
+    fn search_missing_arg_parses_for_stdin_fallback() {
+        let cli = parse_cli_args(["sae", "search"]).unwrap();
+        match cli.command {
+            Command::Search { query, .. } => assert_eq!(query, None),
+            other => panic!("expected Search, got {other:?}"),
+        }
     }
 
     // T-034: `sae harvest` (missing required arg) → clap error via helper
@@ -793,7 +875,7 @@ mod tests {
         let cli = parse_cli_args(["sae", "--json", "query"]).unwrap();
         assert!(cli.json, "[T-037] global json flag should be true");
         match cli.command {
-            Command::Search { query, .. } => assert_eq!(query, "query"),
+            Command::Search { query, .. } => assert_eq!(query.as_deref(), Some("query")),
             other => panic!("[T-037] expected Search, got {other:?}"),
         }
     }
@@ -804,12 +886,10 @@ mod tests {
         let cli = parse_cli_args(["sae", "query"]).unwrap();
         assert!(!cli.json, "[T-049] json should default to false");
         match cli.command {
-            Command::Search { query, .. } => assert_eq!(query, "query"),
+            Command::Search { query, .. } => assert_eq!(query.as_deref(), Some("query")),
             other => panic!("[T-049] expected Search, got {other:?}"),
         }
     }
-
-    // --- Phase 2: --dry-run, --body-file (FR-004, FR-005, FR-006, FR-007) ---
 
     // T-038: create args + --dry-run → parse succeeds with dry_run=true
     #[test]
@@ -827,9 +907,8 @@ mod tests {
     // T-039: --body-file <tempfile> with create → file content becomes body
     #[test]
     fn body_file_reads_from_file() {
-        let dir = std::env::temp_dir().join("sae_test_t039");
-        let _ = std::fs::create_dir_all(&dir);
-        let file_path = dir.join("body.md");
+        let dir = tempdir().unwrap();
+        let file_path = dir.path().join("body.md");
         std::fs::write(&file_path, "# Hello\nBody from file").unwrap();
 
         let result = resolve_body(None, Some(file_path.to_str().unwrap())).unwrap();
@@ -838,14 +917,20 @@ mod tests {
             Some("# Hello\nBody from file"),
             "[T-039] body should contain file contents"
         );
-
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // T-040: --body-file - with create → stdin content becomes body
-    // Note: stdin mocking is non-trivial; test that resolve_body("-") triggers
-    // the stdin path. The function should accept a Read trait for testability.
-    // For now, test the parse side: --body-file "-" parses correctly.
+    #[test]
+    fn body_file_dash_reads_from_stdin() {
+        let mut stdin = Cursor::new("# Hello\nBody from stdin\n");
+        let result = resolve_body_with_reader(None, Some("-"), &mut stdin).unwrap();
+        assert_eq!(
+            result.as_deref(),
+            Some("# Hello\nBody from stdin\n"),
+            "[T-040] body should contain stdin contents as-is"
+        );
+    }
+
     #[test]
     fn body_file_dash_parses_as_stdin() {
         let cli =
@@ -899,17 +984,33 @@ mod tests {
     // T-042: help output contains Examples section
     #[test]
     fn help_output_contains_examples() {
-        use clap::CommandFactory;
         let cmd = Cli::command();
         for sub in cmd.get_subcommands() {
-            let after_help = sub
-                .get_after_help()
-                .map(|h| h.to_string())
-                .unwrap_or_default();
+            let after_help = subcommand_after_help(sub.get_name());
             assert!(
                 after_help.contains("Examples"),
                 "[T-042] subcommand '{}' should have Examples in after_help",
                 sub.get_name()
+            );
+        }
+    }
+
+    #[test]
+    fn create_help_includes_stdin_example() {
+        let after_help = subcommand_after_help("create");
+        assert!(
+            after_help.contains("cat body.md | sae create --name \"Title\" --body-file -"),
+            "[T-042] create help should include stdin example"
+        );
+    }
+
+    #[test]
+    fn search_help_includes_stdin_examples() {
+        let after_help = subcommand_after_help("search");
+        for snippet in ["echo \"認証\" | sae search", "sae search -"] {
+            assert!(
+                after_help.contains(snippet),
+                "[T-042] search help should include stdin example '{snippet}'"
             );
         }
     }
@@ -938,6 +1039,92 @@ mod tests {
         );
     }
 
+    // TC-010: resolve_body_with_reader(`-`) reads from stdin
+    #[test]
+    fn resolve_body_with_reader_reads_stdin_when_dash() {
+        let result = resolve_body_with_reader(None, Some("-"), &mut Cursor::new("本文\n")).unwrap();
+        assert_eq!(
+            result.as_deref(),
+            Some("本文\n"),
+            "[TC-010] body from stdin should preserve trailing newline"
+        );
+    }
+
+    // TC-010b: resolve_body_with_reader(`-`) with empty stdin → Some("")
+    #[test]
+    fn resolve_body_with_reader_empty_stdin_returns_empty_body() {
+        let result = resolve_body_with_reader(None, Some("-"), &mut Cursor::new("")).unwrap();
+        assert_eq!(
+            result.as_deref(),
+            Some(""),
+            "[TC-010b] empty stdin yields empty body string"
+        );
+    }
+
+    fn resolve_search(
+        value: Option<&str>,
+        stdin: &str,
+        is_terminal: bool,
+    ) -> Result<String, AppError> {
+        resolve_value_with_reader(
+            value.map(str::to_string),
+            Cursor::new(stdin),
+            is_terminal,
+            "search query",
+            "QUERY",
+        )
+    }
+
+    #[test]
+    fn resolve_value_reads_piped_stdin_when_missing() {
+        assert_eq!(resolve_search(None, "認証\n", false).unwrap(), "認証");
+    }
+
+    #[test]
+    fn resolve_value_reads_stdin_when_dash_is_passed() {
+        assert_eq!(resolve_search(Some("-"), "認証\n", true).unwrap(), "認証");
+    }
+
+    #[test]
+    fn resolve_value_returns_value_when_present() {
+        assert_eq!(
+            resolve_search(Some("認証"), "ignored", true).unwrap(),
+            "認証"
+        );
+    }
+
+    #[test]
+    fn resolve_value_rejects_dash_with_empty_stdin() {
+        let err = resolve_search(Some("-"), "", true).unwrap_err();
+        assert!(
+            err.to_string().contains("No search query provided"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_value_rejects_whitespace_only_piped_stdin() {
+        let err = resolve_search(None, "  \n  \t  ", false).unwrap_err();
+        assert!(
+            err.to_string().contains("No search query provided"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_value_rejects_missing_on_terminal() {
+        let err = resolve_search(None, "", true).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Missing search query"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            msg.contains("Pass QUERY"),
+            "error should include placeholder: {err}"
+        );
+    }
+
     // TC-011: flag-like argument not treated as shorthand query
     #[test]
     fn flag_like_arg_not_shorthand() {
@@ -947,8 +1134,6 @@ mod tests {
             "[TC-011] --unknown should be clap error, not search shorthand"
         );
     }
-
-    // --- model subcommand (FR-001, FR-006, FR-007) ---
 
     // T-001: `sae model download` parses to Command::Model { ModelCommand::Download }
     #[test]
@@ -996,8 +1181,6 @@ mod tests {
             other => panic!("[T-005] expected Embed, got {other:?}"),
         }
     }
-
-    // --- archive_category ---
 
     #[test]
     fn archive_no_category() {
