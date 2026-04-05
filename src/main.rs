@@ -891,7 +891,6 @@ mod tests {
         }
     }
 
-
     // T-038: create args + --dry-run → parse succeeds with dry_run=true
     #[test]
     fn create_with_dry_run_parses_dry_run_flag() {
@@ -1043,19 +1042,30 @@ mod tests {
     // TC-010: resolve_body_with_reader(`-`) reads from stdin
     #[test]
     fn resolve_body_with_reader_reads_stdin_when_dash() {
-        let result =
-            resolve_body_with_reader(None, Some("-"), &mut Cursor::new("本文\n")).unwrap();
-        assert_eq!(result.as_deref(), Some("本文\n"), "[TC-010] body from stdin should preserve trailing newline");
+        let result = resolve_body_with_reader(None, Some("-"), &mut Cursor::new("本文\n")).unwrap();
+        assert_eq!(
+            result.as_deref(),
+            Some("本文\n"),
+            "[TC-010] body from stdin should preserve trailing newline"
+        );
     }
 
     // TC-010b: resolve_body_with_reader(`-`) with empty stdin → Some("")
     #[test]
     fn resolve_body_with_reader_empty_stdin_returns_empty_body() {
         let result = resolve_body_with_reader(None, Some("-"), &mut Cursor::new("")).unwrap();
-        assert_eq!(result.as_deref(), Some(""), "[TC-010b] empty stdin yields empty body string");
+        assert_eq!(
+            result.as_deref(),
+            Some(""),
+            "[TC-010b] empty stdin yields empty body string"
+        );
     }
 
-    fn resolve_search(value: Option<&str>, stdin: &str, is_terminal: bool) -> Result<String, AppError> {
+    fn resolve_search(
+        value: Option<&str>,
+        stdin: &str,
+        is_terminal: bool,
+    ) -> Result<String, AppError> {
         resolve_value_with_reader(
             value.map(str::to_string),
             Cursor::new(stdin),
@@ -1077,27 +1087,42 @@ mod tests {
 
     #[test]
     fn resolve_value_returns_value_when_present() {
-        assert_eq!(resolve_search(Some("認証"), "ignored", true).unwrap(), "認証");
+        assert_eq!(
+            resolve_search(Some("認証"), "ignored", true).unwrap(),
+            "認証"
+        );
     }
 
     #[test]
     fn resolve_value_rejects_dash_with_empty_stdin() {
         let err = resolve_search(Some("-"), "", true).unwrap_err();
-        assert!(err.to_string().contains("No search query provided"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("No search query provided"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
     fn resolve_value_rejects_whitespace_only_piped_stdin() {
         let err = resolve_search(None, "  \n  \t  ", false).unwrap_err();
-        assert!(err.to_string().contains("No search query provided"), "unexpected error: {err}");
+        assert!(
+            err.to_string().contains("No search query provided"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]
     fn resolve_value_rejects_missing_on_terminal() {
         let err = resolve_search(None, "", true).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("Missing search query"), "unexpected error: {err}");
-        assert!(msg.contains("Pass QUERY"), "error should include placeholder: {err}");
+        assert!(
+            msg.contains("Missing search query"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            msg.contains("Pass QUERY"),
+            "error should include placeholder: {err}"
+        );
     }
 
     // TC-011: flag-like argument not treated as shorthand query
@@ -1109,7 +1134,6 @@ mod tests {
             "[TC-011] --unknown should be clap error, not search shorthand"
         );
     }
-
 
     // T-001: `sae model download` parses to Command::Model { ModelCommand::Download }
     #[test]
@@ -1157,7 +1181,6 @@ mod tests {
             other => panic!("[T-005] expected Embed, got {other:?}"),
         }
     }
-
 
     #[test]
     fn archive_no_category() {
