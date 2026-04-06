@@ -48,7 +48,15 @@ pub async fn harvest(
     let state = storage::get_sync_state(db.conn())?;
 
     if full {
-        storage::save_sync_state(db.conn(), None, 0, 0, None)?;
+        storage::save_sync_state(
+            db.conn(),
+            &storage::SyncStateUpdate {
+                latest_updated_at: None,
+                total_count: 0,
+                local_count: 0,
+                last_page: None,
+            },
+        )?;
     }
 
     let (start_page, base_query) = resolve_start(full, &state);
@@ -119,10 +127,12 @@ pub async fn harvest(
 
         storage::save_sync_state(
             &tx,
-            latest.as_deref(),
-            api_total,
-            prior_count + total_stored,
-            resp.next_page,
+            &storage::SyncStateUpdate {
+                latest_updated_at: latest.as_deref(),
+                total_count: api_total,
+                local_count: prior_count + total_stored,
+                last_page: resp.next_page,
+            },
         )?;
         tx.commit().map_err(StorageError::Db)?;
 
@@ -143,7 +153,15 @@ pub async fn harvest(
     let local_count = storage::count_posts(db.conn())?;
     let gap_detected = local_count < api_total;
 
-    storage::save_sync_state(db.conn(), latest.as_deref(), api_total, local_count, None)?;
+    storage::save_sync_state(
+        db.conn(),
+        &storage::SyncStateUpdate {
+            latest_updated_at: latest.as_deref(),
+            total_count: api_total,
+            local_count,
+            last_page: None,
+        },
+    )?;
 
     if gap_detected {
         eprintln!(

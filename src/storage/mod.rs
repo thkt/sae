@@ -1,7 +1,7 @@
 pub mod embed;
 pub mod search;
 pub mod types;
-pub use embed::{add_embeddings, get_unembedded_chunks, has_embeddings};
+pub use embed::{add_chunked_embeddings, get_unembedded_chunks, has_embeddings};
 pub use search::{SearchResult, hybrid_search};
 pub use types::*;
 
@@ -12,13 +12,22 @@ use tracing::warn;
 
 use rurico::embed::EMBEDDING_DIMS;
 
-const SCHEMA_VERSION: &str = "4";
+const SCHEMA_VERSION: &str = "5";
 
 pub(crate) fn in_placeholders(len: usize) -> String {
     (1..=len)
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+pub(crate) fn as_sql_params<T: rusqlite::types::ToSql>(
+    values: &[T],
+) -> Vec<&dyn rusqlite::types::ToSql> {
+    values
+        .iter()
+        .map(|v| v as &dyn rusqlite::types::ToSql)
+        .collect()
 }
 
 const DDL: &str = "
@@ -62,6 +71,13 @@ const DDL: &str = "
         key TEXT PRIMARY KEY,
         value TEXT NOT NULL
     );
+
+    CREATE TABLE IF NOT EXISTS embedded_chunk_ids (
+        chunk_id INTEGER NOT NULL,
+        sub_idx INTEGER NOT NULL,
+        vec_rowid INTEGER NOT NULL,
+        PRIMARY KEY (chunk_id, sub_idx)
+    );
 ";
 
 pub struct Db {
@@ -72,7 +88,7 @@ pub(crate) fn ensure_sqlite_vec() -> Result<(), StorageError> {
     rurico::storage::ensure_sqlite_vec().map_err(StorageError::Open)
 }
 
-/// Migrate FTS schema from v3 (1-column) to v4 (2-column with section_title).
+/// Migrate FTS schema from v0–v3 (1-column) to v4 (2-column with section_title).
 pub(crate) fn migrate_fts_v4(conn: &Connection) -> Result<(), StorageError> {
     let tx = conn.unchecked_transaction()?;
 
@@ -92,11 +108,41 @@ pub(crate) fn migrate_fts_v4(conn: &Connection) -> Result<(), StorageError> {
     )?;
 
     tx.execute(
-        "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('schema_version', ?1)",
-        [SCHEMA_VERSION],
+        "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('schema_version', '4')",
+        [],
     )?;
 
     tx.commit()?;
+    Ok(())
+}
+
+pub(crate) fn migrate_v5(conn: &Connection) -> Result<(), StorageError> {
+    let tx = conn.unchecked_transaction()?;
+
+    tx.execute_batch(&format!(
+        "DROP TABLE IF EXISTS vec_chunks;\
+         CREATE VIRTUAL TABLE vec_chunks USING vec0(\
+             embedding FLOAT[{EMBEDDING_DIMS}], \
+             +chunk_id INTEGER, \
+             +sub_idx INTEGER\
+         );\
+         CREATE TABLE IF NOT EXISTS embedded_chunk_ids (\
+             chunk_id INTEGER NOT NULL, \
+             sub_idx INTEGER NOT NULL, \
+             vec_rowid INTEGER NOT NULL, \
+             PRIMARY KEY (chunk_id, sub_idx)\
+         );"
+    ))?;
+
+    tx.execute(
+        "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('schema_version', '5')",
+        [],
+    )?;
+
+    tx.commit()?;
+    eprintln!(
+        "Migration complete: schema upgraded to v5 (embeddings cleared, please re-run `sae embed`)"
+    );
     Ok(())
 }
 
@@ -147,8 +193,9 @@ impl Db {
 
         self.conn.execute_batch(&format!(
             "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(\
-                 chunk_id INTEGER PRIMARY KEY, \
-                 embedding FLOAT[{EMBEDDING_DIMS}]\
+                 embedding FLOAT[{EMBEDDING_DIMS}], \
+                 +chunk_id INTEGER, \
+                 +sub_idx INTEGER\
              )"
         ))?;
 
@@ -167,7 +214,11 @@ impl Db {
                 .parse()
                 .map_err(|_| StorageError::Open(format!("corrupt schema version: {stored:?}")))?;
             match ver {
-                0..=3 => migrate_fts_v4(&self.conn)?,
+                0..=3 => {
+                    migrate_fts_v4(&self.conn)?;
+                    migrate_v5(&self.conn)?;
+                }
+                4 => migrate_v5(&self.conn)?,
                 _ => {
                     return Err(StorageError::Open(format!(
                         "database schema version {stored} is newer than supported version {SCHEMA_VERSION}"
@@ -258,31 +309,18 @@ pub fn get_sync_state(conn: &Connection) -> Result<Option<SyncState>, StorageErr
 
 pub fn save_sync_state(
     conn: &Connection,
-    latest_updated_at: Option<&str>,
-    total_count: u32,
-    local_count: u32,
-    last_page: Option<u32>,
+    update: &SyncStateUpdate<'_>,
 ) -> Result<(), StorageError> {
     let epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .expect("system clock before epoch")
         .as_secs() as i64;
-    save_sync_state_at(
-        conn,
-        latest_updated_at,
-        total_count,
-        local_count,
-        last_page,
-        epoch,
-    )
+    save_sync_state_at(conn, update, epoch)
 }
 
 pub(crate) fn save_sync_state_at(
     conn: &Connection,
-    latest_updated_at: Option<&str>,
-    total_count: u32,
-    local_count: u32,
-    last_page: Option<u32>,
+    update: &SyncStateUpdate<'_>,
     epoch_secs: i64,
 ) -> Result<(), StorageError> {
     conn.execute(
@@ -290,10 +328,10 @@ pub(crate) fn save_sync_state_at(
          (id, latest_updated_at, total_count, local_count, last_page, updated_at) \
          VALUES (1, ?1, ?2, ?3, ?4, datetime(?5, 'unixepoch'))",
         rusqlite::params![
-            latest_updated_at,
-            total_count,
-            local_count,
-            last_page,
+            update.latest_updated_at,
+            update.total_count,
+            update.local_count,
+            update.last_page,
             epoch_secs
         ],
     )?;
@@ -331,39 +369,69 @@ pub fn rechunk_post(
 ) -> Result<u32, StorageError> {
     use crate::chunker;
 
-    conn.execute(
-        "DELETE FROM vec_chunks WHERE chunk_id IN \
-         (SELECT id FROM chunks WHERE post_number = ?1)",
-        [post_number],
-    )?;
-    conn.execute(
-        "DELETE FROM fts_chunks WHERE rowid IN \
-         (SELECT id FROM chunks WHERE post_number = ?1)",
-        [post_number],
-    )?;
-    conn.execute("DELETE FROM chunks WHERE post_number = ?1", [post_number])?;
+    let chunk_ids: Vec<i64> = {
+        let mut stmt = conn.prepare_cached("SELECT id FROM chunks WHERE post_number = ?1")?;
+        let rows = stmt.query_map([post_number], |row| row.get(0))?;
+        rows.collect::<Result<_, _>>()?
+    };
 
-    let chunks = chunker::chunk_markdown(body_md);
-    let mut insert_chunk = conn.prepare_cached(
-        "INSERT INTO chunks (post_number, section_title, content, chunk_type) \
-         VALUES (?1, ?2, ?3, ?4)",
-    )?;
-    let mut insert_fts = conn.prepare_cached(
-        "INSERT INTO fts_chunks(rowid, section_title, content) VALUES (?1, ?2, ?3)",
-    )?;
-    let mut count = 0u32;
-    for chunk in &chunks {
-        insert_chunk.execute(rusqlite::params![
-            post_number,
-            chunk.section_title,
-            chunk.content,
-            chunk.chunk_type.as_str(),
-        ])?;
-        let id = conn.last_insert_rowid();
-        insert_fts.execute(rusqlite::params![id, chunk.section_title, chunk.content])?;
-        count += 1;
+    // SAVEPOINT works both standalone and within an outer transaction (sync).
+    conn.execute_batch("SAVEPOINT rechunk")?;
+    let result: Result<u32, StorageError> = (|| {
+        if !chunk_ids.is_empty() {
+            let ph = in_placeholders(chunk_ids.len());
+            let params = as_sql_params(&chunk_ids);
+            conn.execute(
+                &format!(
+                    "DELETE FROM vec_chunks WHERE rowid IN \
+                     (SELECT vec_rowid FROM embedded_chunk_ids WHERE chunk_id IN ({ph}))"
+                ),
+                params.as_slice(),
+            )?;
+            conn.execute(
+                &format!("DELETE FROM embedded_chunk_ids WHERE chunk_id IN ({ph})"),
+                params.as_slice(),
+            )?;
+            conn.execute(
+                &format!("DELETE FROM fts_chunks WHERE rowid IN ({ph})"),
+                params.as_slice(),
+            )?;
+        }
+        conn.execute("DELETE FROM chunks WHERE post_number = ?1", [post_number])?;
+
+        let chunks = chunker::chunk_markdown(body_md);
+        let mut insert_chunk = conn.prepare_cached(
+            "INSERT INTO chunks (post_number, section_title, content, chunk_type) \
+             VALUES (?1, ?2, ?3, ?4)",
+        )?;
+        let mut insert_fts = conn.prepare_cached(
+            "INSERT INTO fts_chunks(rowid, section_title, content) VALUES (?1, ?2, ?3)",
+        )?;
+        let mut count = 0u32;
+        for chunk in &chunks {
+            insert_chunk.execute(rusqlite::params![
+                post_number,
+                chunk.section_title,
+                chunk.content,
+                chunk.chunk_type.as_str(),
+            ])?;
+            let id = conn.last_insert_rowid();
+            insert_fts.execute(rusqlite::params![id, chunk.section_title, chunk.content])?;
+            count += 1;
+        }
+        Ok(count)
+    })();
+    match result {
+        Ok(count) => {
+            conn.execute_batch("RELEASE rechunk")?;
+            Ok(count)
+        }
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK TO rechunk");
+            let _ = conn.execute_batch("RELEASE rechunk");
+            Err(e)
+        }
     }
-    Ok(count)
 }
 
 #[cfg(test)]
@@ -452,10 +520,12 @@ mod tests {
         // Deterministic timestamp for test assertions
         save_sync_state_at(
             db.conn(),
-            Some("2025-01-01T00:00:00+09:00"),
-            100,
-            50,
-            Some(3),
+            &SyncStateUpdate {
+                latest_updated_at: Some("2025-01-01T00:00:00+09:00"),
+                total_count: 100,
+                local_count: 50,
+                last_page: Some(3),
+            },
             1735689600, // 2025-01-01 00:00:00 UTC
         )
         .unwrap();
@@ -474,13 +544,31 @@ mod tests {
     #[test]
     fn sync_state_clears_checkpoint() {
         let db = Db::open_memory().unwrap();
-        save_sync_state(db.conn(), None, 0, 0, Some(5)).unwrap();
+        save_sync_state(
+            db.conn(),
+            &SyncStateUpdate {
+                latest_updated_at: None,
+                total_count: 0,
+                local_count: 0,
+                last_page: Some(5),
+            },
+        )
+        .unwrap();
         assert_eq!(
             get_sync_state(db.conn()).unwrap().unwrap().last_page,
             Some(5)
         );
 
-        save_sync_state(db.conn(), None, 10, 10, None).unwrap();
+        save_sync_state(
+            db.conn(),
+            &SyncStateUpdate {
+                latest_updated_at: None,
+                total_count: 10,
+                local_count: 10,
+                last_page: None,
+            },
+        )
+        .unwrap();
         assert!(
             get_sync_state(db.conn())
                 .unwrap()
@@ -562,20 +650,29 @@ mod tests {
         rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
 
         let chunks = embed::get_unembedded_chunks(db.conn(), 100).unwrap();
-        let emb: Vec<(i64, Vec<f32>)> = chunks
+        let emb: Vec<(i64, rurico::embed::ChunkedEmbedding)> = chunks
             .iter()
-            .map(|(id, _)| (*id, vec![0.1; rurico::embed::EMBEDDING_DIMS as usize]))
+            .map(|(id, _)| {
+                (
+                    *id,
+                    rurico::embed::ChunkedEmbedding {
+                        chunks: vec![vec![0.1; rurico::embed::EMBEDDING_DIMS as usize]],
+                    },
+                )
+            })
             .collect();
-        embed::add_embeddings(db.conn(), &emb).unwrap();
+        embed::add_chunked_embeddings(db.conn(), &emb).unwrap();
         assert!(embed::has_embeddings(db.conn()));
 
         rechunk_post(db.conn(), 1, "# New\nContent").unwrap();
 
         let orphans: u32 = db
             .conn()
-            .query_row("SELECT COUNT(*) FROM vec_chunks", [], |row| row.get(0))
+            .query_row("SELECT COUNT(*) FROM embedded_chunk_ids", [], |row| {
+                row.get(0)
+            })
             .unwrap();
-        assert_eq!(orphans, 0, "rechunk should clean orphaned vec_chunks");
+        assert_eq!(orphans, 0, "rechunk should clean orphaned embeddings");
     }
 
     #[test]
@@ -859,7 +956,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(version, "4", "[T-004] schema_version should be '4'");
+        assert_eq!(
+            version, "5",
+            "[T-004] schema_version should be '5' after full migration"
+        );
 
         // section_title の語で検索可能
         let hits: u32 = db
@@ -883,5 +983,107 @@ mod tests {
             })
             .unwrap();
         assert!(vocab > 0, "[T-004] fts_chunks_vocab should be populated");
+    }
+
+    // TC-005: WAL recovery — is_recoverable_open_error recognizes DatabaseCorrupt
+    #[test]
+    fn is_recoverable_for_database_corrupt() {
+        use rusqlite::ffi::ErrorCode;
+        let err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: ErrorCode::DatabaseCorrupt,
+                extended_code: 11,
+            },
+            None,
+        );
+        assert!(is_recoverable_open_error(&err));
+    }
+
+    // TC-005: WAL recovery — is_recoverable_open_error recognizes CannotOpen
+    #[test]
+    fn is_recoverable_for_cannot_open() {
+        use rusqlite::ffi::ErrorCode;
+        let err = rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code: ErrorCode::CannotOpen,
+                extended_code: 14,
+            },
+            None,
+        );
+        assert!(is_recoverable_open_error(&err));
+    }
+
+    // TC-005: WAL recovery — non-SqliteFailure error is not recoverable
+    #[test]
+    fn is_not_recoverable_for_non_sqlite_failure() {
+        let err = rusqlite::Error::QueryReturnedNoRows;
+        assert!(!is_recoverable_open_error(&err));
+    }
+
+    // TC-005: WAL recovery — open_with_wal_recovery succeeds on a valid DB file
+    #[test]
+    fn open_with_wal_recovery_opens_valid_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("wal_test.db");
+        {
+            let conn = Connection::open(&db_path).unwrap();
+            conn.execute_batch("PRAGMA journal_mode=WAL;").unwrap();
+        }
+        let conn = open_with_wal_recovery(&db_path).unwrap();
+        assert!(conn.is_autocommit());
+    }
+
+    // TC-002: init_schema rejects a non-numeric (corrupt) schema version string
+    #[test]
+    fn init_schema_rejects_corrupt_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("corrupt.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(DDL).unwrap();
+            conn.execute(
+                "INSERT INTO index_meta (key, value) VALUES ('schema_version', 'not-a-number')",
+                [],
+            )
+            .unwrap();
+        }
+        match Db::open(&path) {
+            Ok(_) => panic!("[TC-002] expected Db::open to fail"),
+            Err(StorageError::Open(msg)) => assert!(
+                msg.contains("corrupt schema version"),
+                "[TC-002] unexpected error message: {msg}"
+            ),
+            Err(e) => panic!("[TC-002] expected StorageError::Open, got {e:?}"),
+        }
+    }
+
+    // TC-008: init_schema rejects a schema version number higher than SCHEMA_VERSION
+    #[test]
+    fn init_schema_rejects_future_version() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("future.db");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(DDL).unwrap();
+            conn.execute(
+                "INSERT INTO index_meta (key, value) VALUES ('schema_version', '99')",
+                [],
+            )
+            .unwrap();
+        }
+        match Db::open(&path) {
+            Ok(_) => panic!("[TC-008] expected Db::open to fail"),
+            Err(StorageError::Open(msg)) => {
+                assert!(
+                    msg.contains("newer than supported"),
+                    "[TC-008] unexpected error message: {msg}"
+                );
+                assert!(
+                    msg.contains("99"),
+                    "[TC-008] message should include the invalid version: {msg}"
+                );
+            }
+            Err(e) => panic!("[TC-008] expected StorageError::Open, got {e:?}"),
+        }
     }
 }

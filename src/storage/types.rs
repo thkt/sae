@@ -18,7 +18,7 @@ pub struct EsaPostRow {
 
 impl EsaPostRow {
     pub fn tags_json(&self) -> String {
-        serde_json::to_string(&self.tags).unwrap_or_else(|_| "[]".into())
+        serde_json::to_string(&self.tags).expect("Vec<String> serialization is infallible")
     }
 }
 
@@ -29,6 +29,14 @@ pub struct SyncState {
     pub local_count: u32,
     pub last_page: Option<u32>,
     pub updated_at: String,
+}
+
+#[derive(Debug)]
+pub struct SyncStateUpdate<'a> {
+    pub latest_updated_at: Option<&'a str>,
+    pub total_count: u32,
+    pub local_count: u32,
+    pub last_page: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize)]
@@ -49,6 +57,41 @@ pub struct TeamStatus {
     /// DB path for human-readable output (not included in JSON)
     #[serde(skip)]
     pub db_path: Option<String>,
+}
+
+impl TeamStatus {
+    pub fn synced(team: impl Into<String>, posts: u32, sync_state: Option<SyncState>) -> Self {
+        Self {
+            team: team.into(),
+            status: SyncStatus::Synced,
+            posts,
+            sync_state,
+            error: None,
+            db_path: None,
+        }
+    }
+
+    pub fn not_synced(team: impl Into<String>, db_path: Option<String>) -> Self {
+        Self {
+            team: team.into(),
+            status: SyncStatus::NotSynced,
+            posts: 0,
+            sync_state: None,
+            error: None,
+            db_path,
+        }
+    }
+
+    pub fn error(team: impl Into<String>, message: impl ToString) -> Self {
+        Self {
+            team: team.into(),
+            status: SyncStatus::Error,
+            posts: 0,
+            sync_state: None,
+            error: Some(message.to_string()),
+            db_path: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Serialize)]

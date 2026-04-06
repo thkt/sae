@@ -27,7 +27,7 @@ pub fn fts_search(conn: &Connection, query: &str, limit: u32) -> Result<Vec<FtsH
 
     let match_query = clean_for_trigram(matched.as_str());
 
-    let mut stmt = conn.prepare(
+    let mut stmt = conn.prepare_cached(
         "SELECT c.id, c.post_number, c.section_title, c.content, f.rank \
          FROM fts_chunks f \
          JOIN chunks c ON c.id = f.rowid \
@@ -51,34 +51,90 @@ pub fn fts_search(conn: &Connection, query: &str, limit: u32) -> Result<Vec<FtsH
     Ok(rows)
 }
 
+const VEC_MAXSIM_OVERSAMPLE: u32 = 10;
+
 pub fn vec_search(
     conn: &Connection,
     query_embedding: &[f32],
     limit: u32,
 ) -> Result<Vec<VecHit>, StorageError> {
     let bytes: &[u8] = rurico::storage::f32_as_bytes(query_embedding);
+    let oversample = limit.saturating_mul(VEC_MAXSIM_OVERSAMPLE);
 
-    let mut stmt = conn.prepare(
-        "SELECT v.chunk_id, v.distance, c.post_number, c.section_title, c.content \
-         FROM vec_chunks v \
-         JOIN chunks c ON c.id = v.chunk_id \
-         WHERE v.embedding MATCH ?1 AND k = ?2 \
-         ORDER BY v.distance",
-    )?;
-
-    let rows: Vec<VecHit> = stmt
-        .query_map(rusqlite::params![bytes, limit], |row| {
-            Ok(VecHit {
-                chunk_id: row.get(0)?,
-                distance: row.get(1)?,
-                post_number: row.get(2)?,
-                section_title: row.get(3)?,
-                content: row.get(4)?,
-            })
+    // Step 1: KNN query — fetch only chunk_id + distance to avoid the sqlite-vec
+    // restriction that prohibits JOIN conditions on vec0 auxiliary columns (+chunk_id).
+    let knn_rows: Vec<(i64, f32)> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT chunk_id, distance FROM vec_chunks \
+             WHERE embedding MATCH ?1 AND k = ?2 \
+             ORDER BY distance",
+        )?;
+        stmt.query_map(rusqlite::params![bytes, oversample], |row| {
+            Ok((row.get(0)?, row.get(1)?))
         })?
-        .collect::<Result<Vec<_>, _>>()?;
+        .collect::<Result<Vec<_>, _>>()?
+    };
 
-    Ok(rows)
+    if knn_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // MaxSim: keep the sub-embedding with the smallest distance per chunk_id
+    let mut best: HashMap<i64, f32> = HashMap::new();
+    for (chunk_id, distance) in &knn_rows {
+        use std::collections::hash_map::Entry;
+        match best.entry(*chunk_id) {
+            Entry::Vacant(v) => {
+                v.insert(*distance);
+            }
+            Entry::Occupied(mut o) => {
+                if distance < o.get() {
+                    *o.get_mut() = *distance;
+                }
+            }
+        }
+    }
+
+    // Step 2: batch-fetch chunk metadata for the deduplicated chunk_ids
+    let chunk_ids: Vec<i64> = best.keys().copied().collect();
+    let sql = format!(
+        "SELECT id, post_number, section_title, content FROM chunks WHERE id IN ({})",
+        super::in_placeholders(chunk_ids.len())
+    );
+    let mut stmt2 = conn.prepare(&sql)?;
+    let params = super::as_sql_params(&chunk_ids);
+    let meta: HashMap<i64, (u32, Option<String>, String)> = stmt2
+        .query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, u32>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .map(|(id, pn, st, c)| (id, (pn, st, c)))
+        .collect();
+
+    let mut hits: Vec<VecHit> = best
+        .into_iter()
+        .filter_map(|(chunk_id, distance)| {
+            meta.get(&chunk_id)
+                .map(|(post_number, section_title, content)| VecHit {
+                    chunk_id,
+                    distance,
+                    post_number: *post_number,
+                    section_title: section_title.clone(),
+                    content: content.clone(),
+                })
+        })
+        .collect();
+
+    hits.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+    hits.truncate(limit as usize);
+
+    Ok(hits)
 }
 
 const RECENCY_HALF_LIFE: f64 = 30.0;
@@ -100,16 +156,17 @@ pub fn hybrid_search(
         Some(emb) if super::has_embeddings(conn) => match vec_search(conn, emb, candidate_limit) {
             Ok(hits) => hits,
             Err(e) => {
-                warn!(%e, "vec_search failed, falling back to FTS only");
+                eprintln!("  warning: vector search failed, falling back to text search only");
+                warn!(%e, %query, candidate_limit, "vec_search failed, falling back to FTS only");
                 Vec::new()
             }
         },
         _ => Vec::new(),
     };
 
-    let fts_ranked: Vec<(u32, f64)> = fts_hits.iter().map(|h| (h.post_number, 0.0)).collect();
-    let vec_ranked: Vec<(u32, f64)> = vec_hits.iter().map(|h| (h.post_number, 0.0)).collect();
-    let merged = rurico::storage::rrf_merge(&fts_ranked, &vec_ranked);
+    let fts_rrf_input: Vec<(u32, f64)> = fts_hits.iter().map(|h| (h.post_number, 0.0)).collect();
+    let vec_rrf_input: Vec<(u32, f64)> = vec_hits.iter().map(|h| (h.post_number, 0.0)).collect();
+    let merged = rurico::storage::rrf_merge(&fts_rrf_input, &vec_rrf_input);
 
     // Fetch metadata for all candidates (not just limit) to apply decay before truncation
     let candidate_numbers: Vec<u32> = merged.iter().map(|(pn, _)| *pn).collect();
@@ -120,37 +177,37 @@ pub fn hybrid_search(
 
     let scored = apply_recency_boost(merged, &post_meta, now);
 
-    let mut results = Vec::new();
-    for (post_number, score) in scored.into_iter().take(limit as usize) {
-        let meta = post_meta
-            .get(&post_number)
-            .cloned()
-            .unwrap_or_else(|| PostMeta {
-                name: format!("#{post_number}"),
-                url: String::new(),
-                updated_at: String::new(),
-            });
-
-        let (section_title, snippet) = fts_map
-            .get(&post_number)
-            .map(|h| (h.section_title.clone(), h.content.clone()))
-            .or_else(|| {
-                vec_map
-                    .get(&post_number)
-                    .map(|h| (h.section_title.clone(), h.content.clone()))
-            })
-            .unwrap_or_default();
-
-        results.push(SearchResult {
-            post_number,
-            post_name: meta.name,
-            post_url: meta.url,
-            section_title,
-            snippet: truncate_snippet(&snippet, 200),
-            score,
-        });
-    }
-
+    let results = scored
+        .into_iter()
+        .take(limit as usize)
+        .map(|(post_number, score)| {
+            let meta = post_meta
+                .get(&post_number)
+                .cloned()
+                .unwrap_or_else(|| PostMeta {
+                    name: format!("#{post_number}"),
+                    url: String::new(),
+                    updated_at: String::new(),
+                });
+            let (section_title, snippet) = fts_map
+                .get(&post_number)
+                .map(|h| (h.section_title.clone(), h.content.clone()))
+                .or_else(|| {
+                    vec_map
+                        .get(&post_number)
+                        .map(|h| (h.section_title.clone(), h.content.clone()))
+                })
+                .unwrap_or_default();
+            SearchResult {
+                post_number,
+                post_name: meta.name,
+                post_url: meta.url,
+                section_title,
+                snippet: truncate_snippet(&snippet, 200),
+                score,
+            }
+        })
+        .collect();
     Ok(results)
 }
 
@@ -203,10 +260,7 @@ fn batch_fetch_post_meta(
         super::in_placeholders(post_numbers.len())
     );
     let mut stmt = conn.prepare(&sql)?;
-    let params: Vec<&dyn rusqlite::types::ToSql> = post_numbers
-        .iter()
-        .map(|n| n as &dyn rusqlite::types::ToSql)
-        .collect();
+    let params = super::as_sql_params(post_numbers);
     let rows = stmt
         .query_map(params.as_slice(), |row| {
             Ok((
@@ -765,24 +819,186 @@ mod tests {
 
     #[test]
     fn hybrid_search_with_embeddings() {
-        use rurico::embed::EMBEDDING_DIMS;
+        use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
 
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
 
         let unembedded = storage::get_unembedded_chunks(db.conn(), 100).unwrap();
         assert!(!unembedded.is_empty());
-        let embeddings: Vec<(i64, Vec<f32>)> = unembedded
+        let embeddings: Vec<(i64, ChunkedEmbedding)> = unembedded
             .iter()
-            .map(|(id, _)| (*id, vec![0.1; EMBEDDING_DIMS as usize]))
+            .map(|(id, _)| {
+                (
+                    *id,
+                    ChunkedEmbedding {
+                        chunks: vec![vec![0.1; EMBEDDING_DIMS]],
+                    },
+                )
+            })
             .collect();
-        storage::add_embeddings(db.conn(), &embeddings).unwrap();
+        storage::add_chunked_embeddings(db.conn(), &embeddings).unwrap();
 
-        let query_emb = vec![0.1; EMBEDDING_DIMS as usize];
+        let query_emb = vec![0.1; EMBEDDING_DIMS];
         let results =
             hybrid_search(db.conn(), "認証", Some(&query_emb), 10, chrono::Utc::now()).unwrap();
         assert!(!results.is_empty());
         assert!(!results[0].post_name.is_empty());
         assert!(!results[0].post_url.is_empty());
+    }
+
+    /// Distinct embeddings produce different vec_search distances and ranking.
+    #[test]
+    fn vec_search_ranks_closer_embedding_first() {
+        use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
+
+        let db = Db::open_memory().unwrap();
+        setup_db_with_posts(&db);
+
+        // Distinct embeddings per chunk: vary dim 0 weight to control distance
+        let chunks = storage::get_unembedded_chunks(db.conn(), 100).unwrap();
+        assert!(chunks.len() >= 2, "need at least 2 chunks");
+
+        let embeddings: Vec<(i64, ChunkedEmbedding)> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| {
+                let mut emb = vec![0.01_f32; EMBEDDING_DIMS];
+                // chunk 0: strong dim-0 signal (close to query)
+                // chunk 1+: weaker dim-0 signal (farther from query)
+                emb[0] = if i == 0 { 1.0 } else { 0.01 };
+                emb[1] = if i == 0 { 0.01 } else { 1.0 };
+                (*id, ChunkedEmbedding { chunks: vec![emb] })
+            })
+            .collect();
+        storage::add_chunked_embeddings(db.conn(), &embeddings).unwrap();
+
+        // Query: strong dim-0 signal
+        let mut query_emb = vec![0.01_f32; EMBEDDING_DIMS];
+        query_emb[0] = 1.0;
+
+        let results =
+            hybrid_search(db.conn(), "認証", Some(&query_emb), 10, chrono::Utc::now()).unwrap();
+        assert!(results.len() >= 2, "expected at least 2 results");
+
+        // First result should come from the chunk with the closest embedding
+        // (chunk 0 with strong dim-0 matches query's strong dim-0)
+        assert!(
+            results[0].score >= results[1].score,
+            "closer embedding should score higher: s0={} s1={}",
+            results[0].score,
+            results[1].score,
+        );
+    }
+
+    /// MaxSim dedup: multiple sub-embeddings per chunk, best distance wins.
+    #[test]
+    fn maxsim_dedup_selects_best_sub_embedding() {
+        use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
+
+        let db = Db::open_memory().unwrap();
+        setup_db_with_posts(&db);
+
+        let chunks = storage::get_unembedded_chunks(db.conn(), 100).unwrap();
+        assert!(chunks.len() >= 2, "need at least 2 chunks");
+
+        // Each chunk gets 2 sub-embeddings with different dim-0 weights
+        let embeddings: Vec<(i64, ChunkedEmbedding)> = chunks
+            .iter()
+            .enumerate()
+            .map(|(i, (id, _))| {
+                // sub-emb A: closer to query for chunk 0, farther for others
+                let mut sub_a = vec![0.01_f32; EMBEDDING_DIMS];
+                sub_a[0] = if i == 0 { 0.9 } else { 0.01 };
+                sub_a[1] = if i == 0 { 0.01 } else { 0.9 };
+
+                // sub-emb B: always far from query
+                let mut sub_b = vec![0.01_f32; EMBEDDING_DIMS];
+                sub_b[2] = 1.0;
+
+                (
+                    *id,
+                    ChunkedEmbedding {
+                        chunks: vec![sub_a, sub_b],
+                    },
+                )
+            })
+            .collect();
+        storage::add_chunked_embeddings(db.conn(), &embeddings).unwrap();
+
+        // Query: strong dim-0
+        let mut query_emb = vec![0.01_f32; EMBEDDING_DIMS];
+        query_emb[0] = 1.0;
+
+        let results =
+            hybrid_search(db.conn(), "認証", Some(&query_emb), 10, chrono::Utc::now()).unwrap();
+        assert!(
+            !results.is_empty(),
+            "should have results with multi-sub embeddings"
+        );
+
+        // Dedup: each chunk_id produces at most one result (2 sub-embs per chunk → not 2× results)
+        assert!(
+            results.len() <= chunks.len(),
+            "dedup should keep at most one result per chunk: got {} results for {} chunks",
+            results.len(),
+            chunks.len()
+        );
+        // No duplicate (post_number, section_title) pairs in results
+        let mut seen = std::collections::HashSet::new();
+        for r in &results {
+            let key = (r.post_number, r.section_title.clone());
+            assert!(
+                seen.insert(key.clone()),
+                "duplicate chunk in results: post {} section {:?}",
+                key.0,
+                key.1
+            );
+        }
+    }
+
+    // TC-004: MaxSim selects the sub-embedding with the lower distance (closer to query)
+    #[test]
+    fn vec_search_maxsim_picks_closer_sub_embedding() {
+        use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
+
+        let db = Db::open_memory().unwrap();
+        let body = "# Rust\nOwnership and borrowing";
+        let post = test_post(1, "Rust", body);
+        storage::upsert_post(db.conn(), &post).unwrap();
+        storage::rechunk_post(db.conn(), 1, body).unwrap();
+
+        let chunks = storage::get_unembedded_chunks(db.conn(), 10).unwrap();
+        assert_eq!(chunks.len(), 1);
+        let chunk_id = chunks[0].0;
+
+        // sub_idx 0: orthogonal to query (far)
+        let mut sub_far = vec![0.0f32; EMBEDDING_DIMS];
+        sub_far[1] = 1.0;
+        // sub_idx 1: aligned with query (close, distance ≈ 0)
+        let mut sub_close = vec![0.0f32; EMBEDDING_DIMS];
+        sub_close[0] = 1.0;
+
+        storage::add_chunked_embeddings(
+            db.conn(),
+            &[(
+                chunk_id,
+                ChunkedEmbedding {
+                    chunks: vec![sub_far, sub_close],
+                },
+            )],
+        )
+        .unwrap();
+
+        let mut query = vec![0.0f32; EMBEDDING_DIMS];
+        query[0] = 1.0;
+
+        let hits = vec_search(db.conn(), &query, 1).unwrap();
+        assert_eq!(hits.len(), 1, "[TC-004] should return exactly one hit");
+        assert!(
+            hits[0].distance < 0.1,
+            "[TC-004] MaxSim must select sub_idx=1 (closer sub-embedding), got distance={}",
+            hits[0].distance
+        );
     }
 }
