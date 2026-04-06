@@ -24,7 +24,10 @@ pub(crate) fn in_placeholders(len: usize) -> String {
 pub(crate) fn as_sql_params<T: rusqlite::types::ToSql>(
     values: &[T],
 ) -> Vec<&dyn rusqlite::types::ToSql> {
-    values.iter().map(|v| v as &dyn rusqlite::types::ToSql).collect()
+    values
+        .iter()
+        .map(|v| v as &dyn rusqlite::types::ToSql)
+        .collect()
 }
 
 const DDL: &str = "
@@ -367,8 +370,7 @@ pub fn rechunk_post(
     use crate::chunker;
 
     let chunk_ids: Vec<i64> = {
-        let mut stmt =
-            conn.prepare_cached("SELECT id FROM chunks WHERE post_number = ?1")?;
+        let mut stmt = conn.prepare_cached("SELECT id FROM chunks WHERE post_number = ?1")?;
         let rows = stmt.query_map([post_number], |row| row.get(0))?;
         rows.collect::<Result<_, _>>()?
     };
@@ -988,7 +990,10 @@ mod tests {
     fn is_recoverable_for_database_corrupt() {
         use rusqlite::ffi::ErrorCode;
         let err = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error { code: ErrorCode::DatabaseCorrupt, extended_code: 11 },
+            rusqlite::ffi::Error {
+                code: ErrorCode::DatabaseCorrupt,
+                extended_code: 11,
+            },
             None,
         );
         assert!(is_recoverable_open_error(&err));
@@ -999,7 +1004,10 @@ mod tests {
     fn is_recoverable_for_cannot_open() {
         use rusqlite::ffi::ErrorCode;
         let err = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error { code: ErrorCode::CannotOpen, extended_code: 14 },
+            rusqlite::ffi::Error {
+                code: ErrorCode::CannotOpen,
+                extended_code: 14,
+            },
             None,
         );
         assert!(is_recoverable_open_error(&err));
@@ -1078,5 +1086,4 @@ mod tests {
             Err(e) => panic!("[TC-008] expected StorageError::Open, got {e:?}"),
         }
     }
-
 }

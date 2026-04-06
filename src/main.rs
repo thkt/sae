@@ -221,7 +221,9 @@ where
             .collect();
 
         let (flags, rest): (Vec<_>, Vec<_>) = args.iter().enumerate().partition(|(i, a)| {
-            *i > 0 && a.to_str().is_some_and(|s| global_flags.iter().any(|f| f == s))
+            *i > 0
+                && a.to_str()
+                    .is_some_and(|s| global_flags.iter().any(|f| f == s))
         });
         let rest: Vec<&std::ffi::OsString> = rest.into_iter().map(|(_, a)| a).collect();
 

@@ -120,13 +120,14 @@ pub fn vec_search(
     let mut hits: Vec<VecHit> = best
         .into_iter()
         .filter_map(|(chunk_id, distance)| {
-            meta.get(&chunk_id).map(|(post_number, section_title, content)| VecHit {
-                chunk_id,
-                distance,
-                post_number: *post_number,
-                section_title: section_title.clone(),
-                content: content.clone(),
-            })
+            meta.get(&chunk_id)
+                .map(|(post_number, section_title, content)| VecHit {
+                    chunk_id,
+                    distance,
+                    post_number: *post_number,
+                    section_title: section_title.clone(),
+                    content: content.clone(),
+                })
         })
         .collect();
 
@@ -915,9 +916,12 @@ mod tests {
                 let mut sub_b = vec![0.01_f32; EMBEDDING_DIMS];
                 sub_b[2] = 1.0;
 
-                (*id, ChunkedEmbedding {
-                    chunks: vec![sub_a, sub_b],
-                })
+                (
+                    *id,
+                    ChunkedEmbedding {
+                        chunks: vec![sub_a, sub_b],
+                    },
+                )
             })
             .collect();
         storage::add_chunked_embeddings(db.conn(), &embeddings).unwrap();
@@ -928,7 +932,10 @@ mod tests {
 
         let results =
             hybrid_search(db.conn(), "認証", Some(&query_emb), 10, chrono::Utc::now()).unwrap();
-        assert!(!results.is_empty(), "should have results with multi-sub embeddings");
+        assert!(
+            !results.is_empty(),
+            "should have results with multi-sub embeddings"
+        );
 
         // Dedup: each chunk_id produces at most one result (2 sub-embs per chunk → not 2× results)
         assert!(
@@ -974,7 +981,12 @@ mod tests {
 
         storage::add_chunked_embeddings(
             db.conn(),
-            &[(chunk_id, ChunkedEmbedding { chunks: vec![sub_far, sub_close] })],
+            &[(
+                chunk_id,
+                ChunkedEmbedding {
+                    chunks: vec![sub_far, sub_close],
+                },
+            )],
         )
         .unwrap();
 

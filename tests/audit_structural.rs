@@ -159,10 +159,7 @@ fn t_003_run_embed_no_eprintln() {
 #[test]
 fn t_003_run_embed_has_4_tracing_info() {
     let path = src_dir().join("commands").join("data.rs");
-    assert!(
-        path.exists(),
-        "[T-003] src/commands/data.rs does not exist"
-    );
+    assert!(path.exists(), "[T-003] src/commands/data.rs does not exist");
     let source = fs::read_to_string(&path).unwrap();
     let count = count_in_function(&source, "run_embed", "tracing::info!");
     // Also check for bare `info!` (if `use tracing::info;` is at the top)

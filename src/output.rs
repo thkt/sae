@@ -104,8 +104,12 @@ pub fn embed(
 ) -> Result<(), Box<dyn std::error::Error>> {
     if json {
         print_json(result)?;
-    } else if done == 0 {
-        println!("All chunks already embedded");
+    } else if result.chunks_embedded == 0 {
+        if done == 0 {
+            println!("Nothing to embed");
+        } else {
+            println!("All {done} chunks already embedded");
+        }
     } else {
         println!("Embedded {} chunks", result.chunks_embedded);
     }
@@ -229,13 +233,15 @@ mod tests {
     // TC-007: embed json → chunks_embedded field
     #[test]
     fn embed_json_contains_chunks_embedded() {
-        let result = sae::storage::EmbedResult { chunks_embedded: 42 };
+        let result = sae::storage::EmbedResult {
+            chunks_embedded: 42,
+        };
         let json = serde_json::to_string(&result).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["chunks_embedded"], 42);
     }
 
-    // TC-007: embed human-readable with done=0 → "already embedded" path
+    // TC-007: embed human-readable with done=0 → "Nothing to embed"
     #[test]
     fn embed_human_zero_done_no_panic() {
         let result = sae::storage::EmbedResult { chunks_embedded: 0 };

@@ -54,10 +54,7 @@ fn t_005_save_sync_state_none_optionals() {
         state.latest_updated_at, None,
         "[T-005] latest_updated_at should be None"
     );
-    assert_eq!(
-        state.last_page, None,
-        "[T-005] last_page should be None"
-    );
+    assert_eq!(state.last_page, None, "[T-005] last_page should be None");
 }
 
 /// [T-005] SyncStateUpdate borrows from caller's Option<String> via .as_deref()

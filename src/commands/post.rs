@@ -3,7 +3,7 @@ use std::io::Read;
 use sae::client::{CreatePostParams, UpdatePostParams};
 use sae::config::Config;
 
-use crate::{resolve_client, AppError};
+use crate::{AppError, resolve_client};
 
 pub(crate) struct CreateArgs {
     pub(crate) name: String,
@@ -75,7 +75,11 @@ pub(crate) async fn run_update(
     json: bool,
 ) -> Result<(), AppError> {
     let resolved_body = resolve_body(args.body.as_deref(), args.body_file.as_deref())?;
-    let tags: Option<Vec<String>> = if args.tag.is_empty() { None } else { Some(args.tag) };
+    let tags: Option<Vec<String>> = if args.tag.is_empty() {
+        None
+    } else {
+        Some(args.tag)
+    };
     if args.dry_run {
         crate::output::dry_run(&serde_json::json!({
             "number": args.number,
@@ -152,14 +156,16 @@ mod tests {
     #[test]
     fn resolve_body_nonexistent_file_is_error() {
         let result = resolve_body(None, Some("/nonexistent/path.md"));
-        assert!(result.is_err(), "[TC-009] nonexistent file should return error");
+        assert!(
+            result.is_err(),
+            "[TC-009] nonexistent file should return error"
+        );
     }
 
     // TC-010: resolve_body_with_reader(`-`) reads from stdin
     #[test]
     fn resolve_body_with_reader_reads_stdin_when_dash() {
-        let result =
-            resolve_body_with_reader(None, Some("-"), &mut Cursor::new("本文\n")).unwrap();
+        let result = resolve_body_with_reader(None, Some("-"), &mut Cursor::new("本文\n")).unwrap();
         assert_eq!(
             result.as_deref(),
             Some("本文\n"),
@@ -170,8 +176,7 @@ mod tests {
     // TC-010b: resolve_body_with_reader(`-`) with empty stdin → Some("")
     #[test]
     fn resolve_body_with_reader_empty_stdin_returns_empty_body() {
-        let result =
-            resolve_body_with_reader(None, Some("-"), &mut Cursor::new("")).unwrap();
+        let result = resolve_body_with_reader(None, Some("-"), &mut Cursor::new("")).unwrap();
         assert_eq!(
             result.as_deref(),
             Some(""),

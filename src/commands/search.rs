@@ -3,7 +3,7 @@ use std::io::{IsTerminal, Read};
 use rurico::embed::{Embed, Embedder, ModelId};
 use sae::config::Config;
 
-use crate::{require_db, AppError};
+use crate::{AppError, require_db};
 
 pub(crate) fn run_search(
     config: &Config,

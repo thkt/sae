@@ -1,7 +1,7 @@
 use rurico::embed::{Embedder, ModelId};
 use sae::config::Config;
 
-use crate::{require_db, resolve_client, AppError};
+use crate::{AppError, require_db, resolve_client};
 
 pub(crate) async fn run_harvest(
     config: &Config,
@@ -65,7 +65,8 @@ pub(crate) fn run_model_download(json: bool) -> Result<(), AppError> {
     Ok(())
 }
 
-pub(crate) fn require_embed_model() -> Result<rurico::embed::Artifacts, Box<dyn std::error::Error>> {
+pub(crate) fn require_embed_model() -> Result<rurico::embed::Artifacts, Box<dyn std::error::Error>>
+{
     let auto_download = std::env::var("SAE_AUTO_DOWNLOAD_MODEL").as_deref() == Ok("1");
     require_embed_model_with(auto_download, || {
         rurico::embed::cached_artifacts(ModelId::default())
@@ -106,8 +107,9 @@ mod tests {
     // T-007: cache check failure → wrapped error
     #[test]
     fn require_embed_model_err_on_cache_failure() {
-        let result =
-            require_embed_model_with(false, || Err::<Option<rurico::embed::Artifacts>, _>("cache broken"));
+        let result = require_embed_model_with(false, || {
+            Err::<Option<rurico::embed::Artifacts>, _>("cache broken")
+        });
         assert!(result.is_err());
         assert!(
             result
