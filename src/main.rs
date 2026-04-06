@@ -1,10 +1,8 @@
+mod commands;
 mod output;
 
-use std::io::{IsTerminal, Read};
-
 use clap::{CommandFactory, Parser, Subcommand};
-use rurico::embed::{Embed, Embedder};
-use sae::client::{CreatePostParams, EsaClient, UpdatePostParams};
+use sae::client::EsaClient;
 use sae::config::Config;
 
 #[derive(Parser)]
@@ -206,42 +204,48 @@ where
 {
     let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
 
-    let cmd = Cli::command();
-    let known: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
-    let global_flags: Vec<String> = cmd
-        .get_arguments()
-        .filter(|a| a.is_global_set())
-        .filter_map(|a| a.get_long().map(|l| format!("--{l}")))
-        .collect();
-
     // Shorthand: `sae "query"` or `sae --json "query"` → `sae [flags] search "query"`
-    let (flags, rest): (Vec<_>, Vec<_>) = args.iter().enumerate().partition(|(i, a)| {
-        *i > 0
-            && a.to_str()
-                .is_some_and(|s| global_flags.iter().any(|f| f == s))
-    });
-    let rest: Vec<&std::ffi::OsString> = rest.into_iter().map(|(_, a)| a).collect();
+    // Pre-filter: only build command tree when non-flag arg count suggests shorthand is possible.
+    let positional_count = args
+        .iter()
+        .filter(|a| !a.to_str().is_some_and(|s| s.starts_with('-')))
+        .count();
 
-    if rest.len() == 2
-        && let Some(first_arg) = rest[1].to_str()
-        && !first_arg.starts_with('-')
-        && !known.contains(&first_arg)
-    {
-        let mut expanded: Vec<std::ffi::OsString> = vec![rest[0].clone()];
-        for (_, f) in &flags {
-            expanded.push((*f).clone());
+    if positional_count == 2 {
+        let cmd = Cli::command();
+        let known: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
+        let global_flags: Vec<String> = cmd
+            .get_arguments()
+            .filter(|a| a.is_global_set())
+            .filter_map(|a| a.get_long().map(|l| format!("--{l}")))
+            .collect();
+
+        let (flags, rest): (Vec<_>, Vec<_>) = args.iter().enumerate().partition(|(i, a)| {
+            *i > 0 && a.to_str().is_some_and(|s| global_flags.iter().any(|f| f == s))
+        });
+        let rest: Vec<&std::ffi::OsString> = rest.into_iter().map(|(_, a)| a).collect();
+
+        if rest.len() == 2
+            && let Some(first_arg) = rest[1].to_str()
+            && !first_arg.starts_with('-')
+            && !known.contains(&first_arg)
+        {
+            let mut expanded: Vec<std::ffi::OsString> = vec![rest[0].clone()];
+            for (_, f) in &flags {
+                expanded.push((*f).clone());
+            }
+            expanded.push("search".into());
+            expanded.push(rest[1].clone());
+            return Cli::try_parse_from(expanded);
         }
-        expanded.push("search".into());
-        expanded.push(rest[1].clone());
-        return Cli::try_parse_from(expanded);
     }
 
     Cli::try_parse_from(args)
 }
 
-type AppError = Box<dyn std::error::Error>;
+pub(crate) type AppError = Box<dyn std::error::Error>;
 
-fn resolve_client<'a>(
+pub(crate) fn resolve_client<'a>(
     config: &'a Config,
     team: Option<&'a str>,
 ) -> Result<(&'a str, EsaClient), AppError> {
@@ -250,24 +254,12 @@ fn resolve_client<'a>(
     Ok((team, client))
 }
 
-fn require_db(config: &Config, team: &str) -> Result<sae::storage::Db, AppError> {
+pub(crate) fn require_db(config: &Config, team: &str) -> Result<sae::storage::Db, AppError> {
     let db_path = config.team_db_path(team)?;
     if !db_path.exists() {
         return Err(format!("No data for team '{team}'. Run `sae harvest {team}` first.").into());
     }
     Ok(sae::storage::Db::open(&db_path)?)
-}
-
-fn archive_category(current: Option<&str>) -> Option<String> {
-    let current = current.unwrap_or("");
-    if current.starts_with("Archived/") || current == "Archived" {
-        return None;
-    }
-    Some(if current.is_empty() {
-        "Archived".to_string()
-    } else {
-        format!("Archived/{current}")
-    })
 }
 
 #[tokio::main]
@@ -284,16 +276,18 @@ async fn main() -> Result<(), AppError> {
     let json = cli.json;
 
     match cli.command {
-        Command::Harvest { team, full } => run_harvest(&config, &team, full, json).await,
+        Command::Harvest { team, full } => {
+            commands::data::run_harvest(&config, &team, full, json).await
+        }
         Command::Search { query, team, limit } => {
-            let query = resolve_search_query(query)?;
-            run_search(&config, &query, team.as_deref(), limit, json)
+            let query = commands::search::resolve_search_query(query)?;
+            commands::search::run_search(&config, &query, team.as_deref(), limit, json)
         }
         Command::Get {
             number,
             team,
             with_body,
-        } => run_get(&config, number, team.as_deref(), with_body, json).await,
+        } => commands::post::run_get(&config, number, team.as_deref(), with_body, json).await,
         Command::Create {
             name,
             body,
@@ -304,9 +298,9 @@ async fn main() -> Result<(), AppError> {
             team,
             dry_run,
         } => {
-            run_create(
+            commands::post::run_create(
                 &config,
-                CreateArgs {
+                commands::post::CreateArgs {
                     name,
                     body,
                     body_file,
@@ -330,9 +324,9 @@ async fn main() -> Result<(), AppError> {
             team,
             dry_run,
         } => {
-            run_update(
+            commands::post::run_update(
                 &config,
-                UpdateArgs {
+                commands::post::UpdateArgs {
                     number,
                     name,
                     body,
@@ -346,471 +340,27 @@ async fn main() -> Result<(), AppError> {
             )
             .await
         }
-        Command::Embed { team } => run_embed(&config, &team, json),
+        Command::Embed { team } => commands::data::run_embed(&config, &team, json),
         Command::Archive {
             number,
             team,
             dry_run,
-        } => run_archive(&config, number, team.as_deref(), dry_run, json).await,
+        } => commands::archive::run_archive(&config, number, team.as_deref(), dry_run, json).await,
         Command::Ship {
             number,
             team,
             dry_run,
-        } => run_ship(&config, number, team.as_deref(), dry_run, json).await,
-        Command::Status { team } => run_status(&config, team.as_deref(), json),
+        } => commands::archive::run_ship(&config, number, team.as_deref(), dry_run, json).await,
+        Command::Status { team } => commands::status::run_status(&config, team.as_deref(), json),
         Command::Model { command } => match command {
-            ModelCommand::Download => run_model_download(json),
+            ModelCommand::Download => commands::data::run_model_download(json),
         },
-    }
-}
-
-async fn run_harvest(config: &Config, team: &str, full: bool, json: bool) -> Result<(), AppError> {
-    let (team, client) = resolve_client(config, Some(team))?;
-    let db_path = config.team_db_path(team)?;
-    let db = sae::storage::Db::open(&db_path)?;
-    let result = sae::sync::harvest(&client, &db, team, full).await?;
-    output::harvest(&result, json)?;
-    Ok(())
-}
-
-fn run_search(
-    config: &Config,
-    query: &str,
-    team: Option<&str>,
-    limit: u32,
-    json: bool,
-) -> Result<(), AppError> {
-    let team = config.resolve_team(team)?;
-    let db = require_db(config, team)?;
-    let embedder = try_load_embedder();
-    let query_embedding = embedder.as_ref().and_then(|e| match e.embed_query(query) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            tracing::warn!(error = %e, "embed_query failed, falling back to FTS");
-            None
-        }
-    });
-    let results = sae::storage::hybrid_search(
-        db.conn(),
-        query,
-        query_embedding.as_deref(),
-        limit,
-        chrono::Utc::now(),
-    )?;
-    output::search(&results, query, json)?;
-    Ok(())
-}
-
-async fn run_get(
-    config: &Config,
-    number: u32,
-    team: Option<&str>,
-    with_body: bool,
-    json: bool,
-) -> Result<(), AppError> {
-    let (team, client) = resolve_client(config, team)?;
-    let post = client.get_post(team, number).await?;
-    output::get(&post, json, with_body)?;
-    Ok(())
-}
-
-struct CreateArgs {
-    name: String,
-    body: Option<String>,
-    body_file: Option<String>,
-    category: Option<String>,
-    tag: Vec<String>,
-    wip: bool,
-    team: Option<String>,
-    dry_run: bool,
-}
-
-async fn run_create(config: &Config, args: CreateArgs, json: bool) -> Result<(), AppError> {
-    let resolved_body = resolve_body(args.body.as_deref(), args.body_file.as_deref())?;
-    if args.dry_run {
-        let payload = serde_json::json!({
-            "name": args.name,
-            "body_md": resolved_body,
-            "category": args.category,
-            "tags": args.tag,
-            "wip": args.wip,
-        });
-        println!("{}", serde_json::to_string(&payload)?);
-        return Ok(());
-    }
-    let (team, client) = resolve_client(config, args.team.as_deref())?;
-    let params = CreatePostParams {
-        name: &args.name,
-        body_md: resolved_body.as_deref(),
-        category: args.category.as_deref(),
-        tags: args.tag,
-        wip: args.wip,
-    };
-    let post = client.create_post(team, &params).await?;
-    output::post("Created", &post, json)?;
-    Ok(())
-}
-
-struct UpdateArgs {
-    number: u32,
-    name: Option<String>,
-    body: Option<String>,
-    body_file: Option<String>,
-    category: Option<String>,
-    tag: Vec<String>,
-    team: Option<String>,
-    dry_run: bool,
-}
-
-async fn run_update(config: &Config, args: UpdateArgs, json: bool) -> Result<(), AppError> {
-    let resolved_body = resolve_body(args.body.as_deref(), args.body_file.as_deref())?;
-    if args.dry_run {
-        let tags = if args.tag.is_empty() {
-            None
-        } else {
-            Some(&args.tag)
-        };
-        let payload = serde_json::json!({
-            "number": args.number,
-            "name": args.name,
-            "body_md": resolved_body,
-            "category": args.category,
-            "tags": tags,
-        });
-        println!("{}", serde_json::to_string(&payload)?);
-        return Ok(());
-    }
-    let (team, client) = resolve_client(config, args.team.as_deref())?;
-    let tags = if args.tag.is_empty() {
-        None
-    } else {
-        Some(args.tag)
-    };
-    let params = UpdatePostParams {
-        name: args.name.as_deref(),
-        body_md: resolved_body.as_deref(),
-        category: args.category.as_deref(),
-        tags,
-        ..Default::default()
-    };
-    let post = client.update_post(team, args.number, &params).await?;
-    output::post("Updated", &post, json)?;
-    Ok(())
-}
-
-fn run_embed(config: &Config, team: &str, json: bool) -> Result<(), AppError> {
-    let team = config.resolve_team(Some(team))?;
-    let db = require_db(config, team)?;
-
-    let paths = require_embed_model()?;
-    eprintln!("Loading model...");
-    let embedder = Embedder::new(&paths).map_err(|e| format!("Failed to load model: {e}"))?;
-    eprintln!("Model ready");
-
-    const BATCH_SIZE: u32 = 64;
-    let mut total_added = 0u32;
-    let mut done = 0u32;
-    loop {
-        let batch = sae::storage::get_unembedded_chunks(db.conn(), BATCH_SIZE)?;
-        if batch.is_empty() {
-            break;
-        }
-        if done == 0 {
-            eprintln!("Embedding chunks...");
-        }
-        let texts: Vec<&str> = batch.iter().map(|(_, content)| content.as_str()).collect();
-        let batch_len = batch.len() as u32;
-        let embs = embedder
-            .embed_documents_batch(&texts)
-            .map_err(|e| format!("Batch embedding failed: {e}"))?;
-        let embeddings: Vec<(i64, Vec<f32>)> = batch.iter().map(|(id, _)| *id).zip(embs).collect();
-        total_added += sae::storage::add_embeddings(db.conn(), &embeddings)?;
-        done += batch_len;
-        eprintln!("  {done} chunks processed");
-    }
-    let result = sae::storage::EmbedResult {
-        chunks_embedded: total_added,
-    };
-    output::embed(&result, done, json)?;
-    Ok(())
-}
-
-async fn run_archive(
-    config: &Config,
-    number: u32,
-    team: Option<&str>,
-    dry_run: bool,
-    json: bool,
-) -> Result<(), AppError> {
-    let (team, client) = resolve_client(config, team)?;
-    let post = client.get_post(team, number).await?;
-    let new_category = match archive_category(post.category.as_deref()) {
-        Some(c) => c,
-        None if dry_run => {
-            let payload = serde_json::json!({
-                "number": number,
-                "already_archived": true,
-                "category": post.category.as_deref().unwrap_or(""),
-            });
-            println!("{}", serde_json::to_string(&payload)?);
-            return Ok(());
-        }
-        None => {
-            output::post("Already archived", &post, json)?;
-            return Ok(());
-        }
-    };
-    if dry_run {
-        let payload = serde_json::json!({
-            "number": number,
-            "from_category": post.category.as_deref().unwrap_or(""),
-            "to_category": new_category,
-        });
-        println!("{}", serde_json::to_string(&payload)?);
-        return Ok(());
-    }
-    let params = UpdatePostParams {
-        category: Some(&new_category),
-        ..Default::default()
-    };
-    let post = client.update_post(team, number, &params).await?;
-    output::post("Archived", &post, json)?;
-    Ok(())
-}
-
-async fn run_ship(
-    config: &Config,
-    number: u32,
-    team: Option<&str>,
-    dry_run: bool,
-    json: bool,
-) -> Result<(), AppError> {
-    if dry_run {
-        let payload = serde_json::json!({
-            "number": number,
-            "wip": false,
-        });
-        println!("{}", serde_json::to_string(&payload)?);
-        return Ok(());
-    }
-    let (team, client) = resolve_client(config, team)?;
-    let params = UpdatePostParams {
-        wip: Some(false),
-        ..Default::default()
-    };
-    let post = client.update_post(team, number, &params).await?;
-    output::post("Shipped", &post, json)?;
-    Ok(())
-}
-
-fn run_status(config: &Config, team: Option<&str>, json: bool) -> Result<(), AppError> {
-    let target_teams: Vec<&str> = if let Some(t) = team {
-        vec![config.resolve_team(Some(t))?]
-    } else {
-        config
-            .teams
-            .iter()
-            .filter(|t| match sae::config::validate_team_name(t) {
-                Ok(_) => true,
-                Err(_) => {
-                    eprintln!("warning: skipping invalid team name: {t}");
-                    false
-                }
-            })
-            .map(String::as_str)
-            .collect()
-    };
-    let statuses = collect_team_statuses(config, &target_teams)?;
-    output::status(&statuses, json)?;
-    Ok(())
-}
-
-fn run_model_download(json: bool) -> Result<(), AppError> {
-    eprintln!("Downloading model...");
-    let paths =
-        rurico::embed::download_model().map_err(|e| format!("Failed to download model: {e}"))?;
-    let _embedder = Embedder::new(&paths).map_err(|e| format!("Failed to verify model: {e}"))?;
-    output::model_download(json)?;
-    Ok(())
-}
-
-fn team_error(team: &str, error: impl ToString) -> sae::storage::TeamStatus {
-    sae::storage::TeamStatus {
-        team: team.to_string(),
-        status: sae::storage::SyncStatus::Error,
-        posts: 0,
-        sync_state: None,
-        error: Some(error.to_string()),
-        db_path: None,
-    }
-}
-
-fn collect_team_statuses(
-    config: &Config,
-    teams: &[&str],
-) -> Result<Vec<sae::storage::TeamStatus>, Box<dyn std::error::Error>> {
-    let mut statuses = Vec::new();
-    for t in teams {
-        let ts = match config.team_db_path(t) {
-            Ok(path) if path.exists() => match query_team_status(t, &path) {
-                Ok(ts) => ts,
-                Err(e) => team_error(t, e),
-            },
-            Ok(path) => sae::storage::TeamStatus {
-                team: t.to_string(),
-                status: sae::storage::SyncStatus::NotSynced,
-                posts: 0,
-                sync_state: None,
-                error: None,
-                db_path: Some(path.display().to_string()),
-            },
-            Err(e) => team_error(t, e),
-        };
-        statuses.push(ts);
-    }
-    Ok(statuses)
-}
-
-fn query_team_status(
-    team: &str,
-    path: &std::path::Path,
-) -> Result<sae::storage::TeamStatus, Box<dyn std::error::Error>> {
-    let db = sae::storage::Db::open(path)?;
-    let count = sae::storage::count_posts(db.conn())?;
-    let state = sae::storage::get_sync_state(db.conn())?;
-    Ok(sae::storage::TeamStatus {
-        team: team.to_string(),
-        status: if state.is_some() {
-            sae::storage::SyncStatus::Synced
-        } else {
-            sae::storage::SyncStatus::NotSynced
-        },
-        posts: count,
-        sync_state: state,
-        error: None,
-        db_path: None,
-    })
-}
-
-fn resolve_body(
-    body: Option<&str>,
-    body_file: Option<&str>,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let mut stdin = std::io::stdin();
-    resolve_body_with_reader(body, body_file, &mut stdin)
-}
-
-fn resolve_body_with_reader(
-    body: Option<&str>,
-    body_file: Option<&str>,
-    stdin: &mut impl Read,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    match (body, body_file) {
-        (Some(b), None) => Ok(Some(b.to_string())),
-        (None, Some("-")) => {
-            let mut buf = String::new();
-            stdin.read_to_string(&mut buf)?;
-            Ok(Some(buf))
-        }
-        (None, Some(path)) => {
-            let content = std::fs::read_to_string(path)?;
-            Ok(Some(content))
-        }
-        (None, None) => Ok(None),
-        (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents this"),
-    }
-}
-
-fn resolve_search_query(query: Option<String>) -> Result<String, AppError> {
-    let stdin = std::io::stdin();
-    resolve_value_with_reader(
-        query,
-        stdin.lock(),
-        stdin.is_terminal(),
-        "search query",
-        "QUERY",
-    )
-}
-
-fn resolve_value_with_reader(
-    value: Option<String>,
-    mut stdin: impl Read,
-    stdin_is_terminal: bool,
-    label: &str,
-    placeholder: &str,
-) -> Result<String, AppError> {
-    match value {
-        Some(value) if value != "-" => Ok(value),
-        Some(_) => read_stdin_value(&mut stdin, label, placeholder),
-        None if stdin_is_terminal => Err(format!(
-            "Missing {label}. Pass {placeholder}, pipe it via stdin, or use `-` to read stdin interactively"
-        )
-        .into()),
-        None => read_stdin_value(&mut stdin, label, placeholder),
-    }
-}
-
-fn read_stdin_value(
-    mut stdin: impl Read,
-    label: &str,
-    placeholder: &str,
-) -> Result<String, AppError> {
-    let mut buf = String::new();
-    stdin.read_to_string(&mut buf)?;
-
-    let value = buf.trim();
-    if value.is_empty() {
-        return Err(format!(
-            "No {label} provided. Pass {placeholder}, pipe it via stdin, or use `-` to read stdin interactively"
-        )
-        .into());
-    }
-
-    Ok(value.to_string())
-}
-
-fn require_embed_model() -> Result<rurico::embed::ModelPaths, Box<dyn std::error::Error>> {
-    let auto_download = std::env::var("SAE_AUTO_DOWNLOAD_MODEL").as_deref() == Ok("1");
-    if auto_download {
-        eprintln!("Downloading model (SAE_AUTO_DOWNLOAD_MODEL=1)...");
-        return rurico::embed::download_model()
-            .map_err(|e| format!("Failed to download model: {e}").into());
-    }
-    match rurico::embed::model_paths_if_cached() {
-        Ok(Some(p)) => Ok(p),
-        Ok(None) => Err("Model not found. Run 'sae model download' first.".into()),
-        Err(e) => Err(format!("Failed to check model cache: {e}").into()),
-    }
-}
-
-fn try_load_embedder() -> Option<Embedder> {
-    let paths = match rurico::embed::model_paths_if_cached() {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            eprintln!(
-                "Hint: run 'sae model download && sae embed <team>' to enable semantic search"
-            );
-            return None;
-        }
-        Err(e) => {
-            tracing::warn!(error = %e, "embedding model not available");
-            return None;
-        }
-    };
-    match Embedder::new(&paths) {
-        Ok(e) => Some(e),
-        Err(e) => {
-            tracing::warn!(error = %e, "failed to load embedding model");
-            None
-        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
-    use tempfile::tempdir;
 
     fn subcommand_after_help(name: &str) -> String {
         let mut command = Cli::command();
@@ -904,33 +454,6 @@ mod tests {
         }
     }
 
-    // T-039: --body-file <tempfile> with create → file content becomes body
-    #[test]
-    fn body_file_reads_from_file() {
-        let dir = tempdir().unwrap();
-        let file_path = dir.path().join("body.md");
-        std::fs::write(&file_path, "# Hello\nBody from file").unwrap();
-
-        let result = resolve_body(None, Some(file_path.to_str().unwrap())).unwrap();
-        assert_eq!(
-            result.as_deref(),
-            Some("# Hello\nBody from file"),
-            "[T-039] body should contain file contents"
-        );
-    }
-
-    // T-040: --body-file - with create → stdin content becomes body
-    #[test]
-    fn body_file_dash_reads_from_stdin() {
-        let mut stdin = Cursor::new("# Hello\nBody from stdin\n");
-        let result = resolve_body_with_reader(None, Some("-"), &mut stdin).unwrap();
-        assert_eq!(
-            result.as_deref(),
-            Some("# Hello\nBody from stdin\n"),
-            "[T-040] body should contain stdin contents as-is"
-        );
-    }
-
     #[test]
     fn body_file_dash_parses_as_stdin() {
         let cli =
@@ -1015,116 +538,6 @@ mod tests {
         }
     }
 
-    // TC-008: resolve_body(Some, None) → inline body
-    #[test]
-    fn resolve_body_inline_text() {
-        let result = resolve_body(Some("inline text"), None).unwrap();
-        assert_eq!(result.as_deref(), Some("inline text"));
-    }
-
-    // TC-008: resolve_body(None, None) → no body
-    #[test]
-    fn resolve_body_none_returns_none() {
-        let result = resolve_body(None, None).unwrap();
-        assert_eq!(result, None);
-    }
-
-    // TC-009: resolve_body with nonexistent file → error
-    #[test]
-    fn resolve_body_nonexistent_file_is_error() {
-        let result = resolve_body(None, Some("/nonexistent/path.md"));
-        assert!(
-            result.is_err(),
-            "[TC-009] nonexistent file should return error"
-        );
-    }
-
-    // TC-010: resolve_body_with_reader(`-`) reads from stdin
-    #[test]
-    fn resolve_body_with_reader_reads_stdin_when_dash() {
-        let result = resolve_body_with_reader(None, Some("-"), &mut Cursor::new("本文\n")).unwrap();
-        assert_eq!(
-            result.as_deref(),
-            Some("本文\n"),
-            "[TC-010] body from stdin should preserve trailing newline"
-        );
-    }
-
-    // TC-010b: resolve_body_with_reader(`-`) with empty stdin → Some("")
-    #[test]
-    fn resolve_body_with_reader_empty_stdin_returns_empty_body() {
-        let result = resolve_body_with_reader(None, Some("-"), &mut Cursor::new("")).unwrap();
-        assert_eq!(
-            result.as_deref(),
-            Some(""),
-            "[TC-010b] empty stdin yields empty body string"
-        );
-    }
-
-    fn resolve_search(
-        value: Option<&str>,
-        stdin: &str,
-        is_terminal: bool,
-    ) -> Result<String, AppError> {
-        resolve_value_with_reader(
-            value.map(str::to_string),
-            Cursor::new(stdin),
-            is_terminal,
-            "search query",
-            "QUERY",
-        )
-    }
-
-    #[test]
-    fn resolve_value_reads_piped_stdin_when_missing() {
-        assert_eq!(resolve_search(None, "認証\n", false).unwrap(), "認証");
-    }
-
-    #[test]
-    fn resolve_value_reads_stdin_when_dash_is_passed() {
-        assert_eq!(resolve_search(Some("-"), "認証\n", true).unwrap(), "認証");
-    }
-
-    #[test]
-    fn resolve_value_returns_value_when_present() {
-        assert_eq!(
-            resolve_search(Some("認証"), "ignored", true).unwrap(),
-            "認証"
-        );
-    }
-
-    #[test]
-    fn resolve_value_rejects_dash_with_empty_stdin() {
-        let err = resolve_search(Some("-"), "", true).unwrap_err();
-        assert!(
-            err.to_string().contains("No search query provided"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn resolve_value_rejects_whitespace_only_piped_stdin() {
-        let err = resolve_search(None, "  \n  \t  ", false).unwrap_err();
-        assert!(
-            err.to_string().contains("No search query provided"),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn resolve_value_rejects_missing_on_terminal() {
-        let err = resolve_search(None, "", true).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("Missing search query"),
-            "unexpected error: {err}"
-        );
-        assert!(
-            msg.contains("Pass QUERY"),
-            "error should include placeholder: {err}"
-        );
-    }
-
     // TC-011: flag-like argument not treated as shorthand query
     #[test]
     fn flag_like_arg_not_shorthand() {
@@ -1182,31 +595,33 @@ mod tests {
         }
     }
 
+    // TC-012: multi-positional args are not treated as shorthand
     #[test]
-    fn archive_no_category() {
-        assert_eq!(archive_category(None), Some("Archived".into()));
-        assert_eq!(archive_category(Some("")), Some("Archived".into()));
-    }
-
-    #[test]
-    fn archive_with_category() {
-        assert_eq!(
-            archive_category(Some("dev/guide")),
-            Some("Archived/dev/guide".into())
+    fn multi_positional_args_not_shorthand() {
+        let result = parse_cli_args(["sae", "foo", "bar"]);
+        assert!(
+            result.is_err(),
+            "two positional args should be clap error, not shorthand"
         );
     }
 
+    // TC-013: bare dash is not treated as shorthand
     #[test]
-    fn archive_already_archived() {
-        assert_eq!(archive_category(Some("Archived")), None);
-        assert_eq!(archive_category(Some("Archived/dev")), None);
+    fn bare_dash_not_shorthand() {
+        let result = parse_cli_args(["sae", "-"]);
+        assert!(
+            result.is_err(),
+            "`sae -` should be clap error, not shorthand query"
+        );
     }
 
+    // T-001/FR-001: Compile-time check — fails until Phase 1 extraction is complete
     #[test]
-    fn archive_not_prefix_match() {
-        assert_eq!(
-            archive_category(Some("ArchivedData")),
-            Some("Archived/ArchivedData".into())
-        );
+    fn phase1_commands_extracted() {
+        let _ = &crate::commands::search::run_search;
+        let _ = &crate::commands::post::run_get;
+        let _ = &crate::commands::archive::run_archive;
+        let _ = &crate::commands::data::run_harvest;
+        let _ = &crate::commands::status::run_status;
     }
 }
