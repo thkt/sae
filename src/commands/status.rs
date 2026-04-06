@@ -1,0 +1,166 @@
+use sae::config::Config;
+use sae::storage::TeamStatus;
+
+use crate::AppError;
+
+pub(crate) fn run_status(config: &Config, team: Option<&str>, json: bool) -> Result<(), AppError> {
+    let target_teams: Vec<&str> = if let Some(t) = team {
+        vec![config.resolve_team(Some(t))?]
+    } else {
+        config
+            .teams
+            .iter()
+            .filter(|t| match sae::config::validate_team_name(t) {
+                Ok(_) => true,
+                Err(_) => {
+                    eprintln!("warning: skipping invalid team name: {t}");
+                    false
+                }
+            })
+            .map(String::as_str)
+            .collect()
+    };
+    let statuses = collect_team_statuses(config, &target_teams)?;
+    crate::output::status(&statuses, json)?;
+    Ok(())
+}
+
+fn collect_team_statuses(
+    config: &Config,
+    teams: &[&str],
+) -> Result<Vec<TeamStatus>, Box<dyn std::error::Error>> {
+    let mut statuses = Vec::new();
+    for t in teams {
+        let ts = match config.team_db_path(t) {
+            Ok(path) if path.exists() => match query_team_status(t, &path) {
+                Ok(ts) => ts,
+                Err(e) => TeamStatus::error(*t, e),
+            },
+            Ok(path) => TeamStatus::not_synced(*t, Some(path.display().to_string())),
+            Err(e) => TeamStatus::error(*t, e),
+        };
+        statuses.push(ts);
+    }
+    Ok(statuses)
+}
+
+fn query_team_status(
+    team: &str,
+    path: &std::path::Path,
+) -> Result<TeamStatus, Box<dyn std::error::Error>> {
+    let db = sae::storage::Db::open(path)?;
+    let count = sae::storage::count_posts(db.conn())?;
+    let state = sae::storage::get_sync_state(db.conn())?;
+    if state.is_some() {
+        Ok(TeamStatus::synced(team, count, state))
+    } else {
+        Ok(TeamStatus::not_synced(team, None))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // T-007: at least 1 test co-located with status handlers
+    #[test]
+    fn team_status_error_constructs_correctly() {
+        let ts = TeamStatus::error("myteam", "db error");
+        assert_eq!(ts.team, "myteam");
+        assert_eq!(ts.status, sae::storage::SyncStatus::Error);
+        assert_eq!(ts.error.as_deref(), Some("db error"));
+        assert_eq!(ts.posts, 0);
+    }
+
+    // TC-011: query_team_status with sync state present → TeamStatus::Synced
+    #[test]
+    fn query_team_status_returns_synced_when_state_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let db = sae::storage::Db::open(&path).unwrap();
+            sae::storage::upsert_post(
+                db.conn(),
+                &sae::storage::EsaPostRow {
+                    number: 1,
+                    name: "Post 1".into(),
+                    full_name: "dev/Post 1".into(),
+                    body_md: "# Post 1".into(),
+                    category: None,
+                    tags: vec![],
+                    wip: false,
+                    kind: "stock".into(),
+                    url: "https://example.esa.io/posts/1".into(),
+                    created_at: "2025-01-01T00:00:00+09:00".into(),
+                    updated_at: "2025-01-01T00:00:00+09:00".into(),
+                    created_by: "alice".into(),
+                    updated_by: "alice".into(),
+                    revision_number: 1,
+                },
+            )
+            .unwrap();
+            sae::storage::save_sync_state(
+                db.conn(),
+                &sae::storage::SyncStateUpdate {
+                    latest_updated_at: Some("2025-01-01T00:00:00+09:00"),
+                    total_count: 1,
+                    local_count: 1,
+                    last_page: None,
+                },
+            )
+            .unwrap();
+        }
+        let ts = query_team_status("myteam", &path).unwrap();
+        assert_eq!(ts.team, "myteam");
+        assert_eq!(ts.status, sae::storage::SyncStatus::Synced);
+        assert_eq!(ts.posts, 1);
+        assert!(ts.sync_state.is_some());
+    }
+
+    // TC-011: query_team_status with no sync state → TeamStatus::NotSynced
+    #[test]
+    fn query_team_status_returns_not_synced_when_no_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        let _db = sae::storage::Db::open(&path).unwrap();
+        let ts = query_team_status("myteam", &path).unwrap();
+        assert_eq!(ts.team, "myteam");
+        assert_eq!(ts.status, sae::storage::SyncStatus::NotSynced);
+        assert!(ts.sync_state.is_none());
+    }
+
+    // TC-009: posts exist but sync_state absent → NotSynced (bug: was reporting Synced)
+    #[test]
+    fn query_team_status_returns_not_synced_when_posts_exist_but_no_sync_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let db = sae::storage::Db::open(&path).unwrap();
+            sae::storage::upsert_post(
+                db.conn(),
+                &sae::storage::EsaPostRow {
+                    number: 1,
+                    name: "Post 1".into(),
+                    full_name: "dev/Post 1".into(),
+                    body_md: "# Post 1".into(),
+                    category: None,
+                    tags: vec![],
+                    wip: false,
+                    kind: "stock".into(),
+                    url: "https://example.esa.io/posts/1".into(),
+                    created_at: "2025-01-01T00:00:00+09:00".into(),
+                    updated_at: "2025-01-01T00:00:00+09:00".into(),
+                    created_by: "alice".into(),
+                    updated_by: "alice".into(),
+                    revision_number: 1,
+                },
+            )
+            .unwrap();
+            // sync_state intentionally NOT saved
+        }
+        let ts = query_team_status("myteam", &path).unwrap();
+        assert_eq!(ts.team, "myteam");
+        assert_eq!(ts.status, sae::storage::SyncStatus::NotSynced);
+        assert!(ts.sync_state.is_none());
+    }
+}
