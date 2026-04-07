@@ -4,7 +4,7 @@ mod commands;
 mod output;
 mod shorthand;
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use sae::client::EsaClient;
 use sae::config::Config;
 
@@ -252,6 +252,7 @@ async fn main() -> Result<(), AppError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     fn subcommand_after_help(name: &str) -> String {
         let mut command = Cli::command();
