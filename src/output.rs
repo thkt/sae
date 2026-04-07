@@ -58,9 +58,11 @@ pub(crate) fn get(post: &EsaPost, json: bool, with_body: bool) -> Result<String,
         if with_body {
             format_json(post)
         } else {
-            let mut post = post.clone();
-            post.body_md = None;
-            format_json(&post)
+            let mut val = serde_json::to_value(post)?;
+            if let Some(obj) = val.as_object_mut() {
+                obj.remove("body_md");
+            }
+            format_json(&val)
         }
     } else {
         Ok(format_post_frontmatter(post))
