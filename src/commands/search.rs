@@ -15,11 +15,11 @@ pub(crate) fn run_search(
     let team = config.resolve_team(team)?;
     let db = require_db(config, team)?;
     let embedder = try_load_embedder();
-    if let Some(ref emb) = embedder {
-        if let Err(e) = auto_embed_pending(&db, team, emb) {
-            eprintln!("Warning: auto-embed failed ({e}), continuing with existing embeddings");
-            tracing::warn!(error = %e, "auto_embed_pending failed, continuing search");
-        }
+    if let Some(ref emb) = embedder
+        && let Err(e) = auto_embed_pending(&db, team, emb)
+    {
+        eprintln!("Warning: auto-embed failed ({e}), continuing with existing embeddings");
+        tracing::warn!(error = %e, "auto_embed_pending failed, continuing search");
     }
     let query_embedding = embedder.as_ref().and_then(|e| match e.embed_query(query) {
         Ok(v) => Some(v),
@@ -80,7 +80,11 @@ where
             embs.len()
         )));
     }
-    let embeddings: Vec<(i64, _)> = batch.iter().zip(embs).map(|((id, _), emb)| (*id, emb)).collect();
+    let embeddings: Vec<(i64, _)> = batch
+        .iter()
+        .zip(embs)
+        .map(|((id, _), emb)| (*id, emb))
+        .collect();
     sae::storage::add_chunked_embeddings(db.conn(), &embeddings)?;
     Ok(batch.len() as u32 == budget)
 }
@@ -196,7 +200,10 @@ mod tests {
             Ok(vec![])
         });
         assert!(result.is_ok());
-        assert!(!called.get(), "embed_fn must not be called when no chunks pending");
+        assert!(
+            !called.get(),
+            "embed_fn must not be called when no chunks pending"
+        );
     }
 
     // TC-038: auto_embed_pending_with embeds chunks within budget
@@ -246,7 +253,10 @@ mod tests {
                 .collect())
         });
         assert!(result.is_ok());
-        assert!(result.unwrap(), "budget=1 with 2 chunks should signal budget exhausted");
+        assert!(
+            result.unwrap(),
+            "budget=1 with 2 chunks should signal budget exhausted"
+        );
         assert_eq!(
             sae::storage::count_unembedded_chunks(db.conn()).unwrap(),
             1,
@@ -264,9 +274,8 @@ mod tests {
 
         assert_eq!(sae::storage::count_unembedded_chunks(db.conn()).unwrap(), 1);
 
-        let result = auto_embed_pending_with(&db, 256, |_| {
-            Err(SaeError::Other("model OOM".into()))
-        });
+        let result =
+            auto_embed_pending_with(&db, 256, |_| Err(SaeError::Other("model OOM".into())));
         assert!(result.is_err(), "embed_fn error should propagate");
         assert!(result.unwrap_err().to_string().contains("model OOM"));
         assert_eq!(
@@ -287,7 +296,10 @@ mod tests {
         let result = auto_embed_pending_with(&db, 256, |_| Ok(vec![]));
         assert!(result.is_err(), "count mismatch should be an error");
         assert!(
-            result.unwrap_err().to_string().contains("Embedding count mismatch"),
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Embedding count mismatch"),
             "error should describe the mismatch"
         );
         assert_eq!(
