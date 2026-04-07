@@ -3,7 +3,7 @@ use std::io::Read;
 use sae::client::{CreatePostParams, UpdatePostParams};
 use sae::config::Config;
 
-use crate::{AppError, resolve_client};
+use crate::{SaeError, resolve_client};
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct CreateArgs {
@@ -39,7 +39,7 @@ pub(crate) async fn run_get(
     team: Option<&str>,
     with_body: bool,
     json: bool,
-) -> Result<String, AppError> {
+) -> Result<String, SaeError> {
     let (team, client) = resolve_client(config, team)?;
     let post = client.get_post(team, number).await?;
     crate::output::get(&post, json, with_body)
@@ -49,7 +49,7 @@ pub(crate) async fn run_create(
     config: &Config,
     args: CreateArgs,
     json: bool,
-) -> Result<String, AppError> {
+) -> Result<String, SaeError> {
     let resolved_body = resolve_body(args.body.as_deref(), args.body_file.as_deref())?;
     if args.dry_run {
         return crate::output::dry_run(&serde_json::json!({
@@ -103,7 +103,7 @@ pub(crate) async fn run_update(
     config: &Config,
     args: UpdateArgs,
     json: bool,
-) -> Result<String, AppError> {
+) -> Result<String, SaeError> {
     let resolved_body = resolve_body(args.body.as_deref(), args.body_file.as_deref())?;
     let tags: Option<Vec<String>> = if args.tag.is_empty() {
         None
@@ -134,7 +134,7 @@ pub(crate) async fn run_update(
 pub(crate) fn resolve_body(
     body: Option<&str>,
     body_file: Option<&str>,
-) -> Result<Option<String>, AppError> {
+) -> Result<Option<String>, SaeError> {
     let mut stdin = std::io::stdin();
     resolve_body_with_reader(body, body_file, &mut stdin)
 }
@@ -143,7 +143,7 @@ pub(crate) fn resolve_body_with_reader(
     body: Option<&str>,
     body_file: Option<&str>,
     stdin: &mut impl Read,
-) -> Result<Option<String>, AppError> {
+) -> Result<Option<String>, SaeError> {
     match (body, body_file) {
         (Some(b), None) => Ok(Some(b.to_string())),
         (None, Some("-")) => {

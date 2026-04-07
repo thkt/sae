@@ -107,3 +107,12 @@ sae --json status
 
 - DB: `~/.local/share/sae/{team}.db`（SQLite）
 - 設定: `~/.config/sae/config.json`
+
+## Exit code
+
+| Code | 意味               | 例                                       |
+| ---- | ------------------ | ---------------------------------------- |
+| 0    | 正常終了           |                                          |
+| 1    | Operational エラー | API エラー、ネットワーク障害             |
+| 2    | Input エラー       | 不明なチーム、トークン未設定、未 harvest |
+| 4    | Internal エラー    | DB 破損、JSON シリアライズ失敗           |

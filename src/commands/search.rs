@@ -3,7 +3,7 @@ use std::io::{IsTerminal, Read};
 use rurico::embed::{Embed, Embedder, ModelId};
 use sae::config::Config;
 
-use crate::{AppError, require_db};
+use crate::{SaeError, require_db};
 
 pub(crate) fn run_search(
     config: &Config,
@@ -11,7 +11,7 @@ pub(crate) fn run_search(
     team: Option<&str>,
     limit: u32,
     json: bool,
-) -> Result<String, AppError> {
+) -> Result<String, SaeError> {
     let team = config.resolve_team(team)?;
     let db = require_db(config, team)?;
     let embedder = try_load_embedder();
@@ -65,7 +65,7 @@ fn try_load_embedder_with<E: std::fmt::Display>(
     }
 }
 
-pub(crate) fn resolve_search_query(query: Option<String>) -> Result<String, AppError> {
+pub(crate) fn resolve_search_query(query: Option<String>) -> Result<String, SaeError> {
     let stdin = std::io::stdin();
     resolve_value_with_reader(
         query,
@@ -82,14 +82,13 @@ pub(crate) fn resolve_value_with_reader(
     stdin_is_terminal: bool,
     label: &str,
     placeholder: &str,
-) -> Result<String, AppError> {
+) -> Result<String, SaeError> {
     match value {
         Some(value) if value != "-" => Ok(value),
         Some(_) => read_stdin_value(&mut stdin, label, placeholder),
-        None if stdin_is_terminal => Err(format!(
+        None if stdin_is_terminal => Err(SaeError::Input(format!(
             "Missing {label}. Pass {placeholder}, pipe it via stdin, or use `-` to read stdin interactively"
-        )
-        .into()),
+        ))),
         None => read_stdin_value(&mut stdin, label, placeholder),
     }
 }
@@ -98,16 +97,15 @@ fn read_stdin_value(
     mut stdin: impl Read,
     label: &str,
     placeholder: &str,
-) -> Result<String, AppError> {
+) -> Result<String, SaeError> {
     let mut buf = String::new();
     stdin.read_to_string(&mut buf)?;
 
     let value = buf.trim();
     if value.is_empty() {
-        return Err(format!(
+        return Err(SaeError::Input(format!(
             "No {label} provided. Pass {placeholder}, pipe it via stdin, or use `-` to read stdin interactively"
-        )
-        .into());
+        )));
     }
 
     Ok(value.to_string())
@@ -137,7 +135,7 @@ mod tests {
         value: Option<&str>,
         stdin: &str,
         is_terminal: bool,
-    ) -> Result<String, AppError> {
+    ) -> Result<String, SaeError> {
         resolve_value_with_reader(
             value.map(str::to_string),
             Cursor::new(stdin),

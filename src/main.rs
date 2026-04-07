@@ -4,6 +4,8 @@ mod commands;
 mod output;
 mod shorthand;
 
+use std::process::ExitCode;
+
 use clap::{Parser, Subcommand};
 use sae::client::EsaClient;
 use sae::config::Config;
@@ -177,38 +179,65 @@ where
     Cli::try_parse_from(args)
 }
 
-pub(crate) type AppError = Box<dyn std::error::Error>;
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum SaeError {
+    #[error(transparent)]
+    Config(#[from] sae::config::ConfigError),
+    #[error(transparent)]
+    Client(#[from] sae::client::ClientError),
+    #[error(transparent)]
+    Storage(#[from] sae::storage::StorageError),
+    #[error(transparent)]
+    Sync(#[from] sae::sync::SyncError),
+    #[error(transparent)]
+    Json(#[from] serde_json::Error),
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    /// User action required (e.g., run harvest or model download first)
+    #[error("{0}")]
+    Input(String),
+    /// Operational failure (e.g., model load, embedding, download)
+    #[error("{0}")]
+    Other(String),
+}
 
 pub(crate) fn resolve_client<'a>(
     config: &'a Config,
     team: Option<&'a str>,
-) -> Result<(&'a str, EsaClient), AppError> {
+) -> Result<(&'a str, EsaClient), SaeError> {
     let team = config.resolve_team(team)?;
     let client = EsaClient::from_env()?;
     Ok((team, client))
 }
 
-pub(crate) fn require_db(config: &Config, team: &str) -> Result<sae::storage::Db, AppError> {
+pub(crate) fn require_db(config: &Config, team: &str) -> Result<sae::storage::Db, SaeError> {
     let db_path = config.team_db_path(team)?;
     if !db_path.exists() {
-        return Err(format!("No data for team '{team}'. Run `sae harvest {team}` first.").into());
+        return Err(SaeError::Input(format!(
+            "No data for team '{team}'. Run `sae harvest {team}` first."
+        )));
     }
     Ok(sae::storage::Db::open(&db_path)?)
 }
 
-#[tokio::main]
-async fn main() -> Result<(), AppError> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env().add_directive("sae=info".parse()?),
-        )
-        .init();
+fn exit_code_for(e: &SaeError) -> ExitCode {
+    use sae::client::ClientError;
+    use sae::sync::SyncError;
+    match e {
+        SaeError::Input(_) | SaeError::Config(_) => ExitCode::from(2),
+        SaeError::Client(ClientError::TokenNotSet) => ExitCode::from(2),
+        SaeError::Sync(SyncError::Client(ClientError::TokenNotSet)) => ExitCode::from(2),
+        SaeError::Storage(_) | SaeError::Sync(SyncError::Storage(_)) | SaeError::Json(_) => {
+            ExitCode::from(4)
+        }
+        SaeError::Client(_) | SaeError::Sync(_) | SaeError::Io(_) | SaeError::Other(_) => {
+            ExitCode::FAILURE
+        }
+    }
+}
 
-    let cli = parse_cli_args(std::env::args_os()).unwrap_or_else(|e| e.exit());
-    let config = Config::load()?;
+async fn run(cli: Cli, config: Config) -> Result<String, SaeError> {
     let json = cli.json;
-
     let output = match cli.command {
         Command::Harvest { team, full } => {
             commands::data::run_harvest(&config, &team, full, json).await?
@@ -242,10 +271,39 @@ async fn main() -> Result<(), AppError> {
             ModelCommand::Download => commands::data::run_model_download(json)?,
         },
     };
-    if !output.is_empty() {
-        println!("{output}");
+    Ok(output)
+}
+
+#[tokio::main]
+async fn main() -> ExitCode {
+    tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::from_default_env()
+                .add_directive("sae=info".parse().expect("hardcoded directive is valid")),
+        )
+        .init();
+
+    let cli = parse_cli_args(std::env::args_os()).unwrap_or_else(|e| e.exit());
+    let config = match Config::load() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return exit_code_for(&e.into());
+        }
+    };
+    match run(cli, config).await {
+        Ok(output) => {
+            if !output.is_empty() {
+                println!("{output}");
+            }
+            ExitCode::SUCCESS
+        }
+        Err(e) => {
+            eprintln!("error: {e}");
+            exit_code_for(&e)
+        }
     }
-    Ok(())
 }
 
 #[cfg(test)]
