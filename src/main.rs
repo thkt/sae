@@ -232,7 +232,9 @@ where
             && !first_arg.starts_with('-')
             && first_arg != "help"
             && !known.contains(&first_arg)
-            && !known.iter().any(|k| strsim::osa_distance(first_arg, k) <= 1)
+            && !known
+                .iter()
+                .any(|k| strsim::osa_distance(first_arg, k) <= 1)
         {
             let mut expanded: Vec<std::ffi::OsString> = vec![rest[0].clone()];
             for (_, f) in &flags {
@@ -600,7 +602,11 @@ mod tests {
         let cli = parse_cli_args(["sae", "query", "--limit", "2"]).unwrap();
         match cli.command {
             Command::Search { query, limit, .. } => {
-                assert_eq!(query.as_deref(), Some("query"), "[T-022] query should match");
+                assert_eq!(
+                    query.as_deref(),
+                    Some("query"),
+                    "[T-022] query should match"
+                );
                 assert_eq!(limit, 2, "[T-022] limit should be 2");
             }
             other => panic!("[T-022] expected Search, got {other:?}"),
@@ -614,7 +620,11 @@ mod tests {
         assert!(cli.json, "[T-023] json should be true");
         match cli.command {
             Command::Search { query, limit, .. } => {
-                assert_eq!(query.as_deref(), Some("query"), "[T-023] query should match");
+                assert_eq!(
+                    query.as_deref(),
+                    Some("query"),
+                    "[T-023] query should match"
+                );
                 assert_eq!(limit, 2, "[T-023] limit should be 2");
             }
             other => panic!("[T-023] expected Search, got {other:?}"),
@@ -627,8 +637,16 @@ mod tests {
         let cli = parse_cli_args(["sae", "query", "--team", "myteam"]).unwrap();
         match cli.command {
             Command::Search { query, team, .. } => {
-                assert_eq!(query.as_deref(), Some("query"), "[T-024] query should match");
-                assert_eq!(team.as_deref(), Some("myteam"), "[T-024] team should be myteam");
+                assert_eq!(
+                    query.as_deref(),
+                    Some("query"),
+                    "[T-024] query should match"
+                );
+                assert_eq!(
+                    team.as_deref(),
+                    Some("myteam"),
+                    "[T-024] team should be myteam"
+                );
             }
             other => panic!("[T-024] expected Search, got {other:?}"),
         }
