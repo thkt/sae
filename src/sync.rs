@@ -16,7 +16,7 @@ impl std::fmt::Display for HarvestResult {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Fetched {} posts, stored {}. Total: {} (local: {})",
+            "Fetched {} posts, stored {}. remote: {} | local: {}",
             self.posts_fetched, self.posts_stored, self.total_count, self.local_count,
         )?;
         if self.gap_detected {
