@@ -85,7 +85,10 @@ where
         return Ok(false);
     }
     eprintln!("Embedded {} new chunks", result.processed);
-    tracing::info!(chunks = result.processed, "auto_embed_pending: embedded chunks during search");
+    tracing::info!(
+        chunks = result.processed,
+        "auto_embed_pending: embedded chunks during search"
+    );
     Ok(result.budget_exhausted)
 }
 

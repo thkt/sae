@@ -89,7 +89,8 @@ fn require_embed_model_with<E: std::fmt::Display>(
     cache_check: impl FnOnce() -> Result<Option<rurico::embed::Artifacts>, E>,
 ) -> Result<rurico::embed::Artifacts, SaeError> {
     if auto_download {
-        let spinner = crate::progress::Spinner::new("Downloading model (SAE_AUTO_DOWNLOAD_MODEL=1)...");
+        let spinner =
+            crate::progress::Spinner::new("Downloading model (SAE_AUTO_DOWNLOAD_MODEL=1)...");
         return match rurico::embed::download_model(ModelId::default()) {
             Ok(paths) => {
                 spinner.finish("Model downloaded");
