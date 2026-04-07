@@ -1,7 +1,7 @@
 use sae::client::UpdatePostParams;
 use sae::config::Config;
 
-use crate::{AppError, resolve_client};
+use crate::{SaeError, resolve_client};
 
 pub(crate) fn archive_category(current: Option<&str>) -> Option<String> {
     let current = current.unwrap_or("");
@@ -21,7 +21,7 @@ pub(crate) async fn run_archive(
     team: Option<&str>,
     dry_run: bool,
     json: bool,
-) -> Result<String, AppError> {
+) -> Result<String, SaeError> {
     let (team, client) = resolve_client(config, team)?;
     let post = client.get_post(team, number).await?;
     let new_category = match archive_category(post.category.as_deref()) {
@@ -58,7 +58,7 @@ pub(crate) async fn run_ship(
     team: Option<&str>,
     dry_run: bool,
     json: bool,
-) -> Result<String, AppError> {
+) -> Result<String, SaeError> {
     if dry_run {
         return crate::output::dry_run(&serde_json::json!({
             "number": number,

@@ -1,14 +1,14 @@
 use rurico::embed::{Embedder, ModelId};
 use sae::config::Config;
 
-use crate::{AppError, require_db, resolve_client};
+use crate::{SaeError, require_db, resolve_client};
 
 pub(crate) async fn run_harvest(
     config: &Config,
     team: &str,
     full: bool,
     json: bool,
-) -> Result<String, AppError> {
+) -> Result<String, SaeError> {
     let (team, client) = resolve_client(config, Some(team))?;
     let db_path = config.team_db_path(team)?;
     let db = sae::storage::Db::open(&db_path)?;
@@ -16,7 +16,7 @@ pub(crate) async fn run_harvest(
     crate::output::harvest(&result, json)
 }
 
-pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<String, AppError> {
+pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<String, SaeError> {
     use rurico::embed::Embed;
 
     let team = config.resolve_team(Some(team))?;
@@ -24,7 +24,8 @@ pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<Strin
 
     let paths = require_embed_model()?;
     tracing::info!("Loading model...");
-    let embedder = Embedder::new(&paths).map_err(|e| format!("Failed to load model: {e}"))?;
+    let embedder = Embedder::new(&paths)
+        .map_err(|e| SaeError::Other(format!("Failed to load model: {e}")))?;
     tracing::info!("Model ready");
 
     const BATCH_SIZE: u32 = 64;
@@ -42,7 +43,7 @@ pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<Strin
         let batch_len = batch.len() as u32;
         let embs = embedder
             .embed_documents_batch(&texts)
-            .map_err(|e| format!("Batch embedding failed: {e}"))?;
+            .map_err(|e| SaeError::Other(format!("Batch embedding failed: {e}")))?;
         let embeddings: Vec<(i64, _)> = batch.iter().map(|(id, _)| *id).zip(embs).collect();
         total_added += sae::storage::add_chunked_embeddings(db.conn(), &embeddings)?;
         total_chunks += batch_len;
@@ -54,15 +55,16 @@ pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<Strin
     crate::output::embed(&result, total_chunks, json)
 }
 
-pub(crate) fn run_model_download(json: bool) -> Result<String, AppError> {
+pub(crate) fn run_model_download(json: bool) -> Result<String, SaeError> {
     eprintln!("Downloading model...");
     let paths = rurico::embed::download_model(ModelId::default())
-        .map_err(|e| format!("Failed to download model: {e}"))?;
-    let _embedder = Embedder::new(&paths).map_err(|e| format!("Failed to verify model: {e}"))?;
+        .map_err(|e| SaeError::Other(format!("Failed to download model: {e}")))?;
+    let _embedder = Embedder::new(&paths)
+        .map_err(|e| SaeError::Other(format!("Failed to verify model: {e}")))?;
     crate::output::model_download(json)
 }
 
-pub(crate) fn require_embed_model() -> Result<rurico::embed::Artifacts, AppError> {
+pub(crate) fn require_embed_model() -> Result<rurico::embed::Artifacts, SaeError> {
     let auto_download = std::env::var("SAE_AUTO_DOWNLOAD_MODEL").as_deref() == Ok("1");
     require_embed_model_with(auto_download, || {
         rurico::embed::cached_artifacts(ModelId::default())
@@ -72,17 +74,19 @@ pub(crate) fn require_embed_model() -> Result<rurico::embed::Artifacts, AppError
 fn require_embed_model_with<E: std::fmt::Display>(
     auto_download: bool,
     cache_check: impl FnOnce() -> Result<Option<rurico::embed::Artifacts>, E>,
-) -> Result<rurico::embed::Artifacts, AppError> {
+) -> Result<rurico::embed::Artifacts, SaeError> {
     if auto_download {
         eprintln!("Downloading model (SAE_AUTO_DOWNLOAD_MODEL=1)...");
         // Embedder::new verification skipped: caller (run_embed) calls it immediately after
         return rurico::embed::download_model(ModelId::default())
-            .map_err(|e| format!("Failed to download model: {e}").into());
+            .map_err(|e| SaeError::Other(format!("Failed to download model: {e}")));
     }
     match cache_check() {
         Ok(Some(p)) => Ok(p),
-        Ok(None) => Err("Model not found. Run 'sae model download' first.".into()),
-        Err(e) => Err(format!("Failed to check model cache: {e}").into()),
+        Ok(None) => Err(SaeError::Input(
+            "Model not found. Run 'sae model download' first.".to_string(),
+        )),
+        Err(e) => Err(SaeError::Other(format!("Failed to check model cache: {e}"))),
     }
 }
 

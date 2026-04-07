@@ -1,13 +1,13 @@
 use sae::config::Config;
 use sae::storage::TeamStatus;
 
-use crate::AppError;
+use crate::SaeError;
 
 pub(crate) fn run_status(
     config: &Config,
     team: Option<&str>,
     json: bool,
-) -> Result<String, AppError> {
+) -> Result<String, SaeError> {
     let target_teams: Vec<&str> = if let Some(t) = team {
         vec![config.resolve_team(Some(t))?]
     } else {
@@ -28,7 +28,7 @@ pub(crate) fn run_status(
     crate::output::status(&statuses, json)
 }
 
-fn collect_team_statuses(config: &Config, teams: &[&str]) -> Result<Vec<TeamStatus>, AppError> {
+fn collect_team_statuses(config: &Config, teams: &[&str]) -> Result<Vec<TeamStatus>, SaeError> {
     let mut statuses = Vec::new();
     for t in teams {
         let ts = match config.team_db_path(t) {
@@ -44,7 +44,7 @@ fn collect_team_statuses(config: &Config, teams: &[&str]) -> Result<Vec<TeamStat
     Ok(statuses)
 }
 
-fn query_team_status(team: &str, path: &std::path::Path) -> Result<TeamStatus, AppError> {
+fn query_team_status(team: &str, path: &std::path::Path) -> Result<TeamStatus, SaeError> {
     let db = sae::storage::Db::open(path)?;
     let count = sae::storage::count_posts(db.conn())?;
     let state = sae::storage::get_sync_state(db.conn())?;

@@ -2,13 +2,13 @@ use sae::client::EsaPost;
 use sae::storage::{EmbedResult, SearchResult, SyncStatus, TeamStatus};
 use sae::sync::HarvestResult;
 
-use crate::AppError;
+use crate::SaeError;
 
-fn format_json<T: serde::Serialize + ?Sized>(val: &T) -> Result<String, AppError> {
+fn format_json<T: serde::Serialize + ?Sized>(val: &T) -> Result<String, SaeError> {
     Ok(serde_json::to_string(val)?)
 }
 
-pub(crate) fn harvest(result: &HarvestResult, json: bool) -> Result<String, AppError> {
+pub(crate) fn harvest(result: &HarvestResult, json: bool) -> Result<String, SaeError> {
     if json {
         format_json(result)
     } else {
@@ -21,7 +21,7 @@ pub(crate) fn search(
     query: &str,
     json: bool,
     semantic: bool,
-) -> Result<String, AppError> {
+) -> Result<String, SaeError> {
     let search_mode = if semantic { "hybrid" } else { "fts" };
     if json {
         format_json(&serde_json::json!({
@@ -53,7 +53,7 @@ pub(crate) fn search(
     }
 }
 
-pub(crate) fn get(post: &EsaPost, json: bool, with_body: bool) -> Result<String, AppError> {
+pub(crate) fn get(post: &EsaPost, json: bool, with_body: bool) -> Result<String, SaeError> {
     if json {
         if with_body {
             format_json(post)
@@ -105,7 +105,7 @@ fn format_post_frontmatter(post: &EsaPost) -> String {
     lines.join("\n")
 }
 
-pub(crate) fn action_result(action: &str, post: &EsaPost, json: bool) -> Result<String, AppError> {
+pub(crate) fn action_result(action: &str, post: &EsaPost, json: bool) -> Result<String, SaeError> {
     if json {
         format_json(post)
     } else {
@@ -120,7 +120,7 @@ pub(crate) fn embed(
     result: &EmbedResult,
     total_chunks: u32,
     json: bool,
-) -> Result<String, AppError> {
+) -> Result<String, SaeError> {
     if json {
         format_json(result)
     } else if result.chunks_embedded == 0 {
@@ -135,11 +135,11 @@ pub(crate) fn embed(
 }
 
 /// Always emits JSON regardless of `--json` flag. Dry-run output is for machine consumption.
-pub(crate) fn dry_run(payload: &serde_json::Value) -> Result<String, AppError> {
+pub(crate) fn dry_run(payload: &serde_json::Value) -> Result<String, SaeError> {
     format_json(payload)
 }
 
-pub(crate) fn model_download(json: bool) -> Result<String, AppError> {
+pub(crate) fn model_download(json: bool) -> Result<String, SaeError> {
     if json {
         format_json(&serde_json::json!({"status": "ok"}))
     } else {
@@ -147,7 +147,7 @@ pub(crate) fn model_download(json: bool) -> Result<String, AppError> {
     }
 }
 
-pub(crate) fn status(statuses: &[TeamStatus], json: bool) -> Result<String, AppError> {
+pub(crate) fn status(statuses: &[TeamStatus], json: bool) -> Result<String, SaeError> {
     if json {
         format_json(statuses)
     } else {
@@ -189,7 +189,7 @@ pub(crate) fn status(statuses: &[TeamStatus], json: bool) -> Result<String, AppE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sae::storage::{SyncState, SyncStatus, TeamStatus};
+    use sae::storage::SyncState;
 
     fn make_synced(team: &str, posts: u32) -> TeamStatus {
         TeamStatus {
