@@ -204,14 +204,14 @@ where
 {
     let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
 
-    // Shorthand: `sae "query"` or `sae --json "query"` → `sae [flags] search "query"`
+    // Shorthand: `sae "query"` or `sae --json "query" --limit 2` → `sae [flags] search "query" --limit 2`
     // Pre-filter: only build command tree when non-flag arg count suggests shorthand is possible.
     let positional_count = args
         .iter()
         .filter(|a| !a.to_str().is_some_and(|s| s.starts_with('-')))
         .count();
 
-    if positional_count == 2 {
+    if positional_count >= 2 {
         let cmd = Cli::command();
         let known: Vec<&str> = cmd.get_subcommands().map(|s| s.get_name()).collect();
         let global_flags: Vec<String> = cmd
@@ -227,18 +227,26 @@ where
         });
         let rest: Vec<&std::ffi::OsString> = rest.into_iter().map(|(_, a)| a).collect();
 
-        if rest.len() == 2
+        if rest.len() >= 2
             && let Some(first_arg) = rest[1].to_str()
             && !first_arg.starts_with('-')
+            && first_arg != "help"
             && !known.contains(&first_arg)
+            && !known.iter().any(|k| strsim::osa_distance(first_arg, k) <= 1)
         {
             let mut expanded: Vec<std::ffi::OsString> = vec![rest[0].clone()];
             for (_, f) in &flags {
                 expanded.push((*f).clone());
             }
             expanded.push("search".into());
-            expanded.push(rest[1].clone());
-            return Cli::try_parse_from(expanded);
+            for arg in &rest[1..] {
+                expanded.push((*arg).clone());
+            }
+            if let Ok(cli) = Cli::try_parse_from(expanded.clone()) {
+                let display: Vec<_> = expanded.iter().filter_map(|a| a.to_str()).collect();
+                eprintln!("→ {}", display.join(" "));
+                return Ok(cli);
+            }
         }
     }
 
@@ -421,17 +429,6 @@ mod tests {
         assert!(result.is_err(), "harvest without team should be clap error");
     }
 
-    // T-037: parse_cli_args(["sae", "--json", "query"]) → Command::Search + json=true
-    #[test]
-    fn shorthand_with_json_flag_becomes_search_with_json() {
-        let cli = parse_cli_args(["sae", "--json", "query"]).unwrap();
-        assert!(cli.json, "[T-037] global json flag should be true");
-        match cli.command {
-            Command::Search { query, .. } => assert_eq!(query.as_deref(), Some("query")),
-            other => panic!("[T-037] expected Search, got {other:?}"),
-        }
-    }
-
     // T-049: parse_cli_args(["sae", "query"]) → Command::Search (json=false) - regression
     #[test]
     fn shorthand_without_flags_has_json_false() {
@@ -597,7 +594,57 @@ mod tests {
         }
     }
 
-    // TC-012: multi-positional args are not treated as shorthand
+    // T-022: `sae "query" --limit 2` → Command::Search with limit=2
+    #[test]
+    fn shorthand_with_limit_option() {
+        let cli = parse_cli_args(["sae", "query", "--limit", "2"]).unwrap();
+        match cli.command {
+            Command::Search { query, limit, .. } => {
+                assert_eq!(query.as_deref(), Some("query"), "[T-022] query should match");
+                assert_eq!(limit, 2, "[T-022] limit should be 2");
+            }
+            other => panic!("[T-022] expected Search, got {other:?}"),
+        }
+    }
+
+    // T-023: `sae --json "query" --limit 2` → json=true + Command::Search with limit=2
+    #[test]
+    fn shorthand_with_json_and_limit() {
+        let cli = parse_cli_args(["sae", "--json", "query", "--limit", "2"]).unwrap();
+        assert!(cli.json, "[T-023] json should be true");
+        match cli.command {
+            Command::Search { query, limit, .. } => {
+                assert_eq!(query.as_deref(), Some("query"), "[T-023] query should match");
+                assert_eq!(limit, 2, "[T-023] limit should be 2");
+            }
+            other => panic!("[T-023] expected Search, got {other:?}"),
+        }
+    }
+
+    // T-024: `sae "query" --team myteam` → Command::Search with team=Some("myteam")
+    #[test]
+    fn shorthand_with_team_option() {
+        let cli = parse_cli_args(["sae", "query", "--team", "myteam"]).unwrap();
+        match cli.command {
+            Command::Search { query, team, .. } => {
+                assert_eq!(query.as_deref(), Some("query"), "[T-024] query should match");
+                assert_eq!(team.as_deref(), Some("myteam"), "[T-024] team should be myteam");
+            }
+            other => panic!("[T-024] expected Search, got {other:?}"),
+        }
+    }
+
+    // T-025: `sae serach` → clap error (OSA distance ≤ 1 guard blocks shorthand)
+    #[test]
+    fn typo_near_subcommand_is_clap_error() {
+        let result = parse_cli_args(["sae", "serach"]);
+        assert!(
+            result.is_err(),
+            "[T-025] typo 'serach' (osa=1 from 'search') should be clap error"
+        );
+    }
+
+    // TC-012: multi-positional args without valid search expansion → clap error
     #[test]
     fn multi_positional_args_not_shorthand() {
         let result = parse_cli_args(["sae", "foo", "bar"]);
@@ -615,6 +662,13 @@ mod tests {
             result.is_err(),
             "`sae -` should be clap error, not shorthand query"
         );
+    }
+
+    #[test]
+    fn osa_distance_properties() {
+        assert_eq!(strsim::osa_distance("search", "search"), 0); // equal → 0
+        assert_eq!(strsim::osa_distance("serach", "search"), 1); // transposition → 1
+        assert!(strsim::osa_distance("query", "search") > 1); // unrelated → guard passes
     }
 
     // T-001/FR-001: Compile-time check — fails until Phase 1 extraction is complete
