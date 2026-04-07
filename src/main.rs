@@ -689,6 +689,139 @@ mod tests {
         assert!(strsim::osa_distance("query", "search") > 1); // unrelated → guard passes
     }
 
+    // T-050: `sae get 42` → Command::Get { number: 42, team: None, with_body: false }
+    #[test]
+    fn get_basic_parses_correctly() {
+        let cli = parse_cli_args(["sae", "get", "42"]).unwrap();
+        match cli.command {
+            Command::Get {
+                number,
+                team,
+                with_body,
+            } => {
+                assert_eq!(number, 42, "[T-050] post number should be 42");
+                assert_eq!(team, None, "[T-050] team should be None");
+                assert!(!with_body, "[T-050] with_body should default to false");
+            }
+            other => panic!("[T-050] expected Get, got {other:?}"),
+        }
+    }
+
+    // T-051: `sae get 42 --team myteam --with-body` → all fields set
+    #[test]
+    fn get_with_team_and_body_flag() {
+        let cli = parse_cli_args(["sae", "get", "42", "--team", "myteam", "--with-body"]).unwrap();
+        match cli.command {
+            Command::Get {
+                number,
+                team,
+                with_body,
+            } => {
+                assert_eq!(number, 42, "[T-051] post number should be 42");
+                assert_eq!(
+                    team.as_deref(),
+                    Some("myteam"),
+                    "[T-051] team should be myteam"
+                );
+                assert!(with_body, "[T-051] with_body should be true");
+            }
+            other => panic!("[T-051] expected Get, got {other:?}"),
+        }
+    }
+
+    // T-052: `sae update 42 --name "New Title"` → Command::Update with name set
+    #[test]
+    fn update_with_name_parses_correctly() {
+        let cli = parse_cli_args(["sae", "update", "42", "--name", "New Title"]).unwrap();
+        match cli.command {
+            Command::Update { number, name, .. } => {
+                assert_eq!(number, 42, "[T-052] post number should be 42");
+                assert_eq!(
+                    name.as_deref(),
+                    Some("New Title"),
+                    "[T-052] name should match"
+                );
+            }
+            other => panic!("[T-052] expected Update, got {other:?}"),
+        }
+    }
+
+    // T-053: `sae ship 42` → Command::Ship { number: 42, dry_run: false }
+    #[test]
+    fn ship_basic_parses_correctly() {
+        let cli = parse_cli_args(["sae", "ship", "42"]).unwrap();
+        match cli.command {
+            Command::Ship {
+                number, dry_run, ..
+            } => {
+                assert_eq!(number, 42, "[T-053] post number should be 42");
+                assert!(!dry_run, "[T-053] dry_run should default to false");
+            }
+            other => panic!("[T-053] expected Ship, got {other:?}"),
+        }
+    }
+
+    // T-054: `sae ship 42 --dry-run` → dry_run=true
+    #[test]
+    fn ship_with_dry_run_parses_dry_run_flag() {
+        let cli = parse_cli_args(["sae", "ship", "42", "--dry-run"]).unwrap();
+        match cli.command {
+            Command::Ship {
+                number, dry_run, ..
+            } => {
+                assert_eq!(number, 42, "[T-054] post number should be 42");
+                assert!(dry_run, "[T-054] dry_run should be true");
+            }
+            other => panic!("[T-054] expected Ship, got {other:?}"),
+        }
+    }
+
+    // T-055: `sae status` → Command::Status { team: None }
+    #[test]
+    fn status_no_team_parses_correctly() {
+        let cli = parse_cli_args(["sae", "status"]).unwrap();
+        match cli.command {
+            Command::Status { team } => {
+                assert_eq!(team, None, "[T-055] team should be None");
+            }
+            other => panic!("[T-055] expected Status, got {other:?}"),
+        }
+    }
+
+    // T-056: `sae status --team myteam` → Command::Status { team: Some("myteam") }
+    #[test]
+    fn status_with_team_parses_correctly() {
+        let cli = parse_cli_args(["sae", "status", "--team", "myteam"]).unwrap();
+        match cli.command {
+            Command::Status { team } => {
+                assert_eq!(
+                    team.as_deref(),
+                    Some("myteam"),
+                    "[T-056] team should be myteam"
+                );
+            }
+            other => panic!("[T-056] expected Status, got {other:?}"),
+        }
+    }
+
+    // TC-014: non-search subcommand names are not rewritten as search shorthand
+    #[test]
+    fn all_subcommands_not_shorthand() {
+        // `search` itself parses as Command::Search via the normal path — excluded.
+        for cmd in [
+            "harvest", "get", "update", "ship", "archive", "embed", "status", "model",
+        ] {
+            let result = parse_cli_args(["sae", cmd]);
+            assert!(
+                !matches!(
+                    result.as_ref().map(|c| &c.command),
+                    Ok(Command::Search { .. })
+                ),
+                "[TC-014] subcommand '{cmd}' should not be rewritten as Search shorthand"
+            );
+        }
+    }
+
     // T-001/FR-001: Compile-time check — fails until Phase 1 extraction is complete
     #[test]
     fn phase1_commands_extracted() {
