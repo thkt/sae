@@ -14,7 +14,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
-rurico = { git = "https://github.com/thkt/rurico", rev = "2e3a3b6" }
+rurico = { git = "https://github.com/thkt/rurico", rev = "07e20b1" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 strsim = "0.11"
 

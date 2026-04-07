@@ -24,8 +24,8 @@ pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<Strin
 
     let paths = require_embed_model()?;
     tracing::info!("Loading model...");
-    let embedder = Embedder::new(&paths)
-        .map_err(|e| SaeError::Other(format!("Failed to load model: {e}")))?;
+    let embedder =
+        Embedder::new(&paths).map_err(|e| SaeError::Other(format!("Failed to load model: {e}")))?;
     tracing::info!("Model ready");
 
     const BATCH_SIZE: u32 = 64;
