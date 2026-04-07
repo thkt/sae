@@ -170,6 +170,12 @@ pub(crate) fn status(statuses: &[TeamStatus], json: bool) -> Result<String, SaeE
                 }
                 SyncStatus::Synced => {
                     lines.push(format!("  Posts: {}", ts.posts));
+                    if ts.pending_embed > 0 {
+                        lines.push(format!(
+                            "  Pending embed: {} chunks (run 'sae embed {}' to index)",
+                            ts.pending_embed, ts.team
+                        ));
+                    }
                     if let Some(ref s) = ts.sync_state {
                         lines.push(format!(
                             "  Last sync: {} (total: {}, local: {})",
@@ -196,6 +202,7 @@ mod tests {
             team: team.to_string(),
             status: SyncStatus::Synced,
             posts,
+            pending_embed: 0,
             sync_state: Some(SyncState {
                 latest_updated_at: None,
                 total_count: posts,
@@ -213,6 +220,7 @@ mod tests {
             team: team.to_string(),
             status: SyncStatus::NotSynced,
             posts: 0,
+            pending_embed: 0,
             sync_state: None,
             error: None,
             db_path: Some("/tmp/team.db".to_string()),
@@ -224,6 +232,7 @@ mod tests {
             team: team.to_string(),
             status: SyncStatus::Error,
             posts: 0,
+            pending_embed: 0,
             sync_state: None,
             error: Some(msg.to_string()),
             db_path: None,
@@ -298,6 +307,7 @@ mod tests {
             team: "team-c".to_string(),
             status: SyncStatus::Synced,
             posts: 5,
+            pending_embed: 0,
             sync_state: Some(SyncState {
                 latest_updated_at: None,
                 total_count: 100,

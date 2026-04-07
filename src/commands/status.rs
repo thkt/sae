@@ -48,11 +48,14 @@ fn query_team_status(team: &str, path: &std::path::Path) -> Result<TeamStatus, S
     let db = sae::storage::Db::open(path)?;
     let count = sae::storage::count_posts(db.conn())?;
     let state = sae::storage::get_sync_state(db.conn())?;
-    if state.is_some() {
-        Ok(TeamStatus::synced(team, count, state))
+    let pending_embed = sae::storage::count_unembedded_chunks(db.conn())?;
+    let mut ts = if state.is_some() {
+        TeamStatus::synced(team, count, state)
     } else {
-        Ok(TeamStatus::not_synced(team, None))
-    }
+        TeamStatus::not_synced(team, None)
+    };
+    ts.pending_embed = pending_embed;
+    Ok(ts)
 }
 
 #[cfg(test)]
@@ -140,5 +143,55 @@ mod tests {
         assert_eq!(ts.team, "myteam");
         assert_eq!(ts.status, sae::storage::SyncStatus::NotSynced);
         assert!(ts.sync_state.is_none());
+    }
+
+    // RC-004: unembedded chunks after interrupted embed → pending_embed > 0
+    #[test]
+    fn query_team_status_reports_pending_embed_when_chunks_unembedded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let db = sae::storage::Db::open(&path).unwrap();
+            let mut row = make_post_row();
+            row.body_md = "# Section\n\nSome content here to generate a chunk.".into();
+            sae::storage::upsert_post(db.conn(), &row).unwrap();
+            sae::storage::rechunk_post(db.conn(), row.number, &row.body_md).unwrap();
+            sae::storage::save_sync_state(
+                db.conn(),
+                &sae::storage::SyncStateUpdate {
+                    latest_updated_at: Some("2025-01-01T00:00:00+09:00"),
+                    total_count: 1,
+                    local_count: 1,
+                    last_page: None,
+                },
+            )
+            .unwrap();
+            // embed intentionally NOT run → chunks remain unembedded
+        }
+        let ts = query_team_status("myteam", &path).unwrap();
+        assert_eq!(ts.status, sae::storage::SyncStatus::Synced);
+        assert!(ts.pending_embed > 0, "should report unembedded chunks");
+    }
+
+    // RC-004: no unembedded chunks → pending_embed == 0
+    #[test]
+    fn query_team_status_reports_zero_pending_embed_when_no_chunks() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("test.db");
+        {
+            let db = sae::storage::Db::open(&path).unwrap();
+            sae::storage::save_sync_state(
+                db.conn(),
+                &sae::storage::SyncStateUpdate {
+                    latest_updated_at: Some("2025-01-01T00:00:00+09:00"),
+                    total_count: 0,
+                    local_count: 0,
+                    last_page: None,
+                },
+            )
+            .unwrap();
+        }
+        let ts = query_team_status("myteam", &path).unwrap();
+        assert_eq!(ts.pending_embed, 0);
     }
 }
