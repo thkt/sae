@@ -24,38 +24,32 @@ pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<Strin
 
     let paths = require_embed_model()?;
     tracing::info!("Loading model...");
+    let spinner = crate::progress::Spinner::new("Loading model...");
     let embedder =
         Embedder::new(&paths).map_err(|e| SaeError::Other(format!("Failed to load model: {e}")))?;
+    spinner.finish("Model ready");
     tracing::info!("Model ready");
 
-    const BATCH_SIZE: u32 = 256;
+    const BATCH_SIZE: u32 = 128;
     let mut total_added = 0u32;
     let mut total_chunks = 0u32;
     loop {
-        let batch = sae::storage::get_unembedded_chunks(db.conn(), BATCH_SIZE)?;
-        if batch.is_empty() {
+        let result = super::embed_batch::embed_one_batch(db.conn(), BATCH_SIZE, |texts| {
+            embedder
+                .embed_documents_batch(texts)
+                .map_err(|e| SaeError::Other(format!("Batch embedding failed: {e}")))
+        })?;
+        if result.processed == 0 {
             break;
         }
         if total_chunks == 0 {
             tracing::info!("Embedding chunks...");
         }
-        let texts: Vec<&str> = batch.iter().map(|(_, content)| content.as_str()).collect();
-        let batch_len = batch.len() as u32;
-        let embs = embedder
-            .embed_documents_batch(&texts)
-            .map_err(|e| SaeError::Other(format!("Batch embedding failed: {e}")))?;
-        if embs.len() != batch.len() {
-            return Err(SaeError::Other(format!(
-                "Embedding count mismatch: expected {}, got {}",
-                batch.len(),
-                embs.len()
-            )));
-        }
-        let embeddings: Vec<(i64, _)> = batch.iter().map(|(id, _)| *id).zip(embs).collect();
-        total_added += sae::storage::add_chunked_embeddings(db.conn(), &embeddings)?;
-        total_chunks += batch_len;
+        total_added += result.added;
+        total_chunks += result.processed;
         tracing::info!("  {total_chunks} chunks processed");
     }
+    tracing::info!(total_added, total_chunks, "embed complete");
     let result = sae::storage::EmbedResult {
         chunks_embedded: total_added,
     };
@@ -63,12 +57,24 @@ pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<Strin
 }
 
 pub(crate) fn run_model_download(json: bool) -> Result<String, SaeError> {
-    eprintln!("Downloading model...");
-    let paths = rurico::embed::download_model(ModelId::default())
-        .map_err(|e| SaeError::Other(format!("Failed to download model: {e}")))?;
-    let _embedder = Embedder::new(&paths)
-        .map_err(|e| SaeError::Other(format!("Failed to verify model: {e}")))?;
-    crate::output::model_download(json)
+    let spinner = crate::progress::Spinner::new("Downloading model...");
+    let paths = match rurico::embed::download_model(ModelId::default()) {
+        Ok(p) => p,
+        Err(e) => {
+            spinner.cancel();
+            return Err(SaeError::Other(format!("Failed to download model: {e}")));
+        }
+    };
+    match Embedder::new(&paths) {
+        Ok(_) => {
+            spinner.finish("Model ready");
+            crate::output::model_download(json)
+        }
+        Err(e) => {
+            spinner.cancel();
+            Err(SaeError::Other(format!("Failed to verify model: {e}")))
+        }
+    }
 }
 
 pub(crate) fn require_embed_model() -> Result<rurico::embed::Artifacts, SaeError> {
@@ -83,10 +89,18 @@ fn require_embed_model_with<E: std::fmt::Display>(
     cache_check: impl FnOnce() -> Result<Option<rurico::embed::Artifacts>, E>,
 ) -> Result<rurico::embed::Artifacts, SaeError> {
     if auto_download {
-        eprintln!("Downloading model (SAE_AUTO_DOWNLOAD_MODEL=1)...");
-        // Verification deferred to caller — download-only path
-        return rurico::embed::download_model(ModelId::default())
-            .map_err(|e| SaeError::Other(format!("Failed to download model: {e}")));
+        let spinner =
+            crate::progress::Spinner::new("Downloading model (SAE_AUTO_DOWNLOAD_MODEL=1)...");
+        return match rurico::embed::download_model(ModelId::default()) {
+            Ok(paths) => {
+                spinner.finish("Model downloaded");
+                Ok(paths)
+            }
+            Err(e) => {
+                spinner.cancel();
+                Err(SaeError::Other(format!("Failed to download model: {e}")))
+            }
+        };
     }
     match cache_check() {
         Ok(Some(p)) => Ok(p),

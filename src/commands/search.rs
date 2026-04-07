@@ -15,20 +15,34 @@ pub(crate) fn run_search(
     let team = config.resolve_team(team)?;
     let db = require_db(config, team)?;
     let embedder = try_load_embedder();
-    if let Some(ref emb) = embedder
+    match &embedder {
+        ModelLoad::Absent => eprintln!(
+            "Hint: run 'sae model download && sae embed <team>' to enable semantic search"
+        ),
+        ModelLoad::Failed(e) => {
+            eprintln!("Warning: embedding model not available ({e})");
+            tracing::warn!(error = %e, "embedding model not available");
+        }
+        ModelLoad::Ready(_) => {}
+    }
+    if let ModelLoad::Ready(ref emb) = embedder
         && let Err(e) = auto_embed_pending(&db, team, emb)
     {
         eprintln!("Warning: auto-embed failed ({e}), continuing with existing embeddings");
         tracing::warn!(error = %e, "auto_embed_pending failed, continuing search");
     }
-    let query_embedding = embedder.as_ref().and_then(|e| match e.embed_query(query) {
-        Ok(v) => Some(v),
-        Err(e) => {
-            eprintln!("Warning: embed_query failed ({e}), falling back to FTS");
-            tracing::warn!(error = %e, %query, "embed_query failed, falling back to FTS");
-            None
+    let query_embedding = if let ModelLoad::Ready(ref e) = embedder {
+        match e.embed_query(query) {
+            Ok(v) => Some(v),
+            Err(e) => {
+                eprintln!("Warning: embed_query failed ({e}), falling back to FTS");
+                tracing::warn!(error = %e, %query, "embed_query failed, falling back to FTS");
+                None
+            }
         }
-    });
+    } else {
+        None
+    };
     let results = sae::storage::hybrid_search(
         db.conn(),
         query,
@@ -45,7 +59,7 @@ fn auto_embed_pending(
     team: &str,
     embedder: &Embedder,
 ) -> Result<(), SaeError> {
-    const EMBED_BUDGET: u32 = 256;
+    const EMBED_BUDGET: u32 = 128;
     let budget_exhausted = auto_embed_pending_with(db, EMBED_BUDGET, |texts| {
         embedder
             .embed_documents_batch(texts)
@@ -66,56 +80,45 @@ fn auto_embed_pending_with<F>(
 where
     F: Fn(&[&str]) -> Result<Vec<ChunkedEmbedding>, SaeError>,
 {
-    let batch = sae::storage::get_unembedded_chunks(db.conn(), budget)?;
-    if batch.is_empty() {
+    let result = super::embed_batch::embed_one_batch(db.conn(), budget, embed_fn)?;
+    if result.processed == 0 {
         return Ok(false);
     }
-    eprintln!("Embedding {} new chunks...", batch.len());
-    let texts: Vec<&str> = batch.iter().map(|(_, c)| c.as_str()).collect();
-    let embs = embed_fn(&texts)?;
-    if embs.len() != batch.len() {
-        return Err(SaeError::Other(format!(
-            "Embedding count mismatch: expected {}, got {}",
-            batch.len(),
-            embs.len()
-        )));
-    }
-    let embeddings: Vec<(i64, _)> = batch
-        .iter()
-        .zip(embs)
-        .map(|((id, _), emb)| (*id, emb))
-        .collect();
-    sae::storage::add_chunked_embeddings(db.conn(), &embeddings)?;
-    Ok(batch.len() as u32 == budget)
+    eprintln!("Embedded {} new chunks", result.processed);
+    tracing::info!(
+        chunks = result.processed,
+        "auto_embed_pending: embedded chunks during search"
+    );
+    Ok(result.budget_exhausted)
 }
 
-pub(crate) fn try_load_embedder() -> Option<Embedder> {
+pub(crate) enum ModelLoad {
+    Ready(Box<Embedder>),
+    Absent,
+    Failed(String),
+}
+
+pub(crate) fn try_load_embedder() -> ModelLoad {
     try_load_embedder_with(|| rurico::embed::cached_artifacts(ModelId::default()))
 }
 
 fn try_load_embedder_with<E: std::fmt::Display>(
     cache_check: impl FnOnce() -> Result<Option<rurico::embed::Artifacts>, E>,
-) -> Option<Embedder> {
+) -> ModelLoad {
     let paths = match cache_check() {
         Ok(Some(p)) => p,
-        Ok(None) => {
-            eprintln!(
-                "Hint: run 'sae model download && sae embed <team>' to enable semantic search"
-            );
-            return None;
-        }
-        Err(e) => {
-            eprintln!("Warning: embedding model not available ({e})");
-            tracing::warn!(error = %e, "embedding model not available");
-            return None;
-        }
+        Ok(None) => return ModelLoad::Absent,
+        Err(e) => return ModelLoad::Failed(e.to_string()),
     };
+    let spinner = crate::progress::Spinner::new("Loading model...");
     match Embedder::new(&paths) {
-        Ok(e) => Some(e),
+        Ok(e) => {
+            spinner.finish("Model ready");
+            ModelLoad::Ready(Box::new(e))
+        }
         Err(e) => {
-            eprintln!("Warning: failed to load embedding model ({e})");
-            tracing::warn!(error = %e, "failed to load embedding model");
-            None
+            spinner.cancel();
+            ModelLoad::Failed(e.to_string())
         }
     }
 }
@@ -173,20 +176,9 @@ mod tests {
 
     fn make_test_row(number: u32) -> sae::storage::EsaPostRow {
         sae::storage::EsaPostRow {
-            number,
-            name: format!("Post {number}"),
-            full_name: format!("Post {number}"),
             body_md: "# Hello\nWorld".into(),
             category: None,
-            tags: vec![],
-            wip: false,
-            kind: "stock".into(),
-            url: format!("https://example.esa.io/posts/{number}"),
-            created_at: "2025-01-01T00:00:00+09:00".into(),
-            updated_at: "2025-01-01T00:00:00+09:00".into(),
-            created_by: "user".into(),
-            updated_by: "user".into(),
-            revision_number: 1,
+            ..sae::storage::test_post_row(number)
         }
     }
 
@@ -313,7 +305,7 @@ mod tests {
     #[test]
     fn try_load_embedder_with_returns_none_when_no_model() {
         let result = try_load_embedder_with(|| Ok::<_, &str>(None));
-        assert!(result.is_none());
+        assert!(matches!(result, ModelLoad::Absent));
     }
 
     // TC-010: try_load_embedder_with returns None on cache check error
@@ -321,7 +313,7 @@ mod tests {
     fn try_load_embedder_with_returns_none_on_cache_error() {
         let result =
             try_load_embedder_with(|| Err::<Option<rurico::embed::Artifacts>, _>("cache error"));
-        assert!(result.is_none());
+        assert!(matches!(result, ModelLoad::Failed(_)));
     }
 
     fn resolve_search(

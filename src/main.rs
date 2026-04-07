@@ -2,6 +2,7 @@
 
 mod commands;
 mod output;
+mod progress;
 mod shorthand;
 
 use std::process::ExitCode;
