@@ -1,7 +1,9 @@
 pub mod embed;
 pub mod search;
 pub mod types;
-pub use embed::{add_chunked_embeddings, get_unembedded_chunks, has_embeddings};
+pub use embed::{
+    add_chunked_embeddings, count_unembedded_chunks, get_unembedded_chunks, has_embeddings,
+};
 pub use search::{SearchResult, hybrid_search};
 pub use types::*;
 

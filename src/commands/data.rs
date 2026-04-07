@@ -28,7 +28,7 @@ pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<Strin
         Embedder::new(&paths).map_err(|e| SaeError::Other(format!("Failed to load model: {e}")))?;
     tracing::info!("Model ready");
 
-    const BATCH_SIZE: u32 = 64;
+    const BATCH_SIZE: u32 = 256;
     let mut total_added = 0u32;
     let mut total_chunks = 0u32;
     loop {
@@ -44,6 +44,13 @@ pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<Strin
         let embs = embedder
             .embed_documents_batch(&texts)
             .map_err(|e| SaeError::Other(format!("Batch embedding failed: {e}")))?;
+        if embs.len() != batch.len() {
+            return Err(SaeError::Other(format!(
+                "Embedding count mismatch: expected {}, got {}",
+                batch.len(),
+                embs.len()
+            )));
+        }
         let embeddings: Vec<(i64, _)> = batch.iter().map(|(id, _)| *id).zip(embs).collect();
         total_added += sae::storage::add_chunked_embeddings(db.conn(), &embeddings)?;
         total_chunks += batch_len;
@@ -77,7 +84,7 @@ fn require_embed_model_with<E: std::fmt::Display>(
 ) -> Result<rurico::embed::Artifacts, SaeError> {
     if auto_download {
         eprintln!("Downloading model (SAE_AUTO_DOWNLOAD_MODEL=1)...");
-        // Embedder::new verification skipped: caller (run_embed) calls it immediately after
+        // Verification deferred to caller — download-only path
         return rurico::embed::download_model(ModelId::default())
             .map_err(|e| SaeError::Other(format!("Failed to download model: {e}")));
     }
