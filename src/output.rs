@@ -2,169 +2,186 @@ use sae::client::EsaPost;
 use sae::storage::{EmbedResult, SearchResult, SyncStatus, TeamStatus};
 use sae::sync::HarvestResult;
 
-fn print_json<T: serde::Serialize + ?Sized>(val: &T) -> Result<(), Box<dyn std::error::Error>> {
-    println!("{}", serde_json::to_string(val)?);
-    Ok(())
+use crate::AppError;
+
+fn format_json<T: serde::Serialize + ?Sized>(val: &T) -> Result<String, AppError> {
+    Ok(serde_json::to_string(val)?)
 }
 
-pub fn harvest(result: &HarvestResult, json: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn harvest(result: &HarvestResult, json: bool) -> Result<String, AppError> {
     if json {
-        print_json(result)?;
+        format_json(result)
     } else {
-        println!("{result}");
+        Ok(result.to_string())
     }
-    Ok(())
 }
 
-pub fn search(
+pub(crate) fn search(
     results: &[SearchResult],
     query: &str,
     json: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+    semantic: bool,
+) -> Result<String, AppError> {
+    let search_mode = if semantic { "hybrid" } else { "fts" };
     if json {
-        print_json(results)?;
+        format_json(&serde_json::json!({
+            "search_mode": search_mode,
+            "results": results,
+        }))
     } else if results.is_empty() {
-        println!("No results for '{query}'");
+        Ok(format!("No results for '{query}'"))
     } else {
+        let mut lines = Vec::new();
+        if !semantic {
+            lines.push("(semantic search unavailable, showing text-match results)".to_string());
+        }
         for r in results {
             let section = r
                 .section_title
                 .as_deref()
                 .map(|s| format!(" > {s}"))
                 .unwrap_or_default();
-            println!(
+            lines.push(format!(
                 "[{:.4}] {}{} (#{})  {}",
                 r.score, r.post_name, section, r.post_number, r.post_url
-            );
+            ));
             if !r.snippet.is_empty() {
-                println!("  {}", r.snippet.replace('\n', " "));
+                lines.push(format!("  {}", r.snippet.replace('\n', " ")));
             }
         }
+        Ok(lines.join("\n"))
     }
-    Ok(())
 }
 
-pub fn get(post: &EsaPost, json: bool, with_body: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn get(post: &EsaPost, json: bool, with_body: bool) -> Result<String, AppError> {
     if json {
-        let mut post = post.clone();
-        if !with_body {
-            post.body_md = None;
-        }
-        print_json(&post)?;
-    } else {
-        println!("---");
-        println!("title: \"{}\"", post.full_name.replace('"', "\\\""));
-        if let Some(ref cat) = post.category
-            && !cat.is_empty()
-        {
-            println!("category: \"{}\"", cat.replace('"', "\\\""));
-        }
-        if !post.tags.is_empty() {
-            let tags: Vec<String> = post
-                .tags
-                .iter()
-                .map(|t| format!("\"{}\"", t.replace('"', "\\\"")))
-                .collect();
-            println!("tags: [{}]", tags.join(", "));
-        }
-        println!("author: \"@{}\"", post.created_by.screen_name);
-        if post.updated_by.screen_name != post.created_by.screen_name {
-            println!("updated_by: \"@{}\"", post.updated_by.screen_name);
-        }
-        println!("updated_at: \"{}\"", post.updated_at);
-        if post.wip {
-            println!("wip: true");
-        }
-        println!("number: {}", post.number);
-        println!("url: {}", post.url);
-        println!("---");
-        println!();
-        println!("{}", post.body_md.as_deref().unwrap_or("(empty)"));
-    }
-    Ok(())
-}
-
-pub fn action_result(
-    action: &str,
-    post: &EsaPost,
-    json: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if json {
-        print_json(post)?;
-    } else {
-        println!("{action}: {} (#{}) {}", post.name, post.number, post.url);
-    }
-    Ok(())
-}
-
-pub fn embed(
-    result: &EmbedResult,
-    done: u32,
-    json: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
-    if json {
-        print_json(result)?;
-    } else if result.chunks_embedded == 0 {
-        if done == 0 {
-            println!("Nothing to embed");
+        if with_body {
+            format_json(post)
         } else {
-            println!("All {done} chunks already embedded");
+            let mut post = post.clone();
+            post.body_md = None;
+            format_json(&post)
         }
     } else {
-        println!("Embedded {} chunks", result.chunks_embedded);
+        Ok(format_post_frontmatter(post))
     }
-    Ok(())
 }
 
-pub fn dry_run(payload: &serde_json::Value) -> Result<(), Box<dyn std::error::Error>> {
-    print_json(payload)
-}
-
-pub fn model_download(json: bool) -> Result<(), Box<dyn std::error::Error>> {
-    if json {
-        print_json(&serde_json::json!({"status": "ok"}))?;
-    } else {
-        println!("Model downloaded and verified");
+fn format_post_frontmatter(post: &EsaPost) -> String {
+    let mut lines = Vec::new();
+    lines.push("---".to_string());
+    lines.push(format!(
+        "title: \"{}\"",
+        post.full_name.replace('"', "\\\"")
+    ));
+    if let Some(ref cat) = post.category
+        && !cat.is_empty()
+    {
+        lines.push(format!("category: \"{}\"", cat.replace('"', "\\\"")));
     }
-    Ok(())
+    if !post.tags.is_empty() {
+        let tags: Vec<String> = post
+            .tags
+            .iter()
+            .map(|t| format!("\"{}\"", t.replace('"', "\\\"")))
+            .collect();
+        lines.push(format!("tags: [{}]", tags.join(", ")));
+    }
+    lines.push(format!("author: \"@{}\"", post.created_by.screen_name));
+    if post.updated_by.screen_name != post.created_by.screen_name {
+        lines.push(format!("updated_by: \"@{}\"", post.updated_by.screen_name));
+    }
+    lines.push(format!("updated_at: \"{}\"", post.updated_at));
+    if post.wip {
+        lines.push("wip: true".to_string());
+    }
+    lines.push(format!("number: {}", post.number));
+    lines.push(format!("url: {}", post.url));
+    lines.push("---".to_string());
+    lines.push(String::new());
+    lines.push(post.body_md.as_deref().unwrap_or("(empty)").to_string());
+    lines.join("\n")
 }
 
-pub fn status(statuses: &[TeamStatus], json: bool) -> Result<(), Box<dyn std::error::Error>> {
+pub(crate) fn action_result(action: &str, post: &EsaPost, json: bool) -> Result<String, AppError> {
     if json {
-        print_json(statuses)?;
+        format_json(post)
     } else {
+        Ok(format!(
+            "{action}: {} (#{}) {}",
+            post.name, post.number, post.url
+        ))
+    }
+}
+
+pub(crate) fn embed(
+    result: &EmbedResult,
+    total_chunks: u32,
+    json: bool,
+) -> Result<String, AppError> {
+    if json {
+        format_json(result)
+    } else if result.chunks_embedded == 0 {
+        if total_chunks == 0 {
+            Ok("Nothing to embed".to_string())
+        } else {
+            Ok(format!("All {total_chunks} chunks already embedded"))
+        }
+    } else {
+        Ok(format!("Embedded {} chunks", result.chunks_embedded))
+    }
+}
+
+/// Always emits JSON regardless of `--json` flag. Dry-run output is for machine consumption.
+pub(crate) fn dry_run(payload: &serde_json::Value) -> Result<String, AppError> {
+    format_json(payload)
+}
+
+pub(crate) fn model_download(json: bool) -> Result<String, AppError> {
+    if json {
+        format_json(&serde_json::json!({"status": "ok"}))
+    } else {
+        Ok("Model downloaded and verified".to_string())
+    }
+}
+
+pub(crate) fn status(statuses: &[TeamStatus], json: bool) -> Result<String, AppError> {
+    if json {
+        format_json(statuses)
+    } else {
+        let mut lines = Vec::new();
         for ts in statuses {
-            println!("--- {} ---", ts.team);
+            lines.push(format!("--- {} ---", ts.team));
             match ts.status {
                 SyncStatus::Error => {
-                    println!(
+                    lines.push(format!(
                         "  Error: {}",
                         ts.error.as_deref().unwrap_or("unknown error")
-                    );
+                    ));
                 }
                 SyncStatus::NotSynced => {
                     if let Some(ref path) = ts.db_path {
-                        println!("  Not yet synced (no DB at {path})");
+                        lines.push(format!("  Not yet synced (no DB at {path})"));
                     } else {
-                        println!("  Not yet synced");
+                        lines.push("  Not yet synced".to_string());
                     }
                 }
                 SyncStatus::Synced => {
-                    println!("  Posts: {}", ts.posts);
+                    lines.push(format!("  Posts: {}", ts.posts));
                     if let Some(ref s) = ts.sync_state {
-                        println!(
+                        lines.push(format!(
                             "  Last sync: {} (total: {}, local: {})",
                             s.updated_at, s.total_count, s.local_count
-                        );
+                        ));
                         if let Some(pg) = s.last_page {
-                            println!("  Checkpoint: page {pg} (interrupted)");
+                            lines.push(format!("  Checkpoint: page {pg} (interrupted)"));
                         }
                     }
                 }
             }
         }
+        Ok(lines.join("\n"))
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -211,10 +228,28 @@ mod tests {
         }
     }
 
-    // TC-007: status human-readable empty list — no panic
+    // TC-007: status human-readable empty list → empty string
     #[test]
-    fn status_human_empty_no_panic() {
-        status(&[], false).unwrap();
+    fn status_human_empty_returns_empty_string() {
+        let out = status(&[], false).unwrap();
+        assert!(out.is_empty(), "empty list should produce empty output");
+    }
+
+    // TC-007: status human-readable synced team → expected lines
+    #[test]
+    fn status_human_synced_contains_expected_lines() {
+        let out = status(&[make_synced("team-a", 10)], false).unwrap();
+        assert!(out.contains("--- team-a ---"));
+        assert!(out.contains("Posts: 10"));
+        assert!(out.contains("Last sync: 2025-01-01 00:00:00"));
+    }
+
+    // TC-007: status human-readable not-synced team → expected lines
+    #[test]
+    fn status_human_not_synced_contains_expected_lines() {
+        let out = status(&[make_not_synced("team-b")], false).unwrap();
+        assert!(out.contains("--- team-b ---"));
+        assert!(out.contains("Not yet synced"));
     }
 
     // TC-007: embed json → chunks_embedded field
@@ -230,9 +265,18 @@ mod tests {
 
     // TC-007: embed human-readable with done=0 → "Nothing to embed"
     #[test]
-    fn embed_human_zero_done_no_panic() {
+    fn embed_human_zero_done_returns_nothing_to_embed() {
         let result = sae::storage::EmbedResult { chunks_embedded: 0 };
-        embed(&result, 0, false).unwrap();
+        let out = embed(&result, 0, false).unwrap();
+        assert_eq!(out, "Nothing to embed");
+    }
+
+    // TC-007: embed human-readable chunks > 0 → "Embedded N chunks"
+    #[test]
+    fn embed_human_nonzero_returns_embedded_count() {
+        let result = sae::storage::EmbedResult { chunks_embedded: 5 };
+        let out = embed(&result, 5, false).unwrap();
+        assert_eq!(out, "Embedded 5 chunks");
     }
 
     // TC-007: status error variant — error field displayed
@@ -265,5 +309,52 @@ mod tests {
         let json = serde_json::to_string(&ts).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(v["sync_state"]["last_page"], 3);
+    }
+
+    // TC-007: search json includes search_mode hybrid
+    #[test]
+    fn search_json_hybrid_includes_search_mode() {
+        let out = search(&[], "test", true, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["search_mode"], "hybrid");
+        assert!(v["results"].is_array());
+    }
+
+    // TC-007: search json includes search_mode fts
+    #[test]
+    fn search_json_fts_includes_search_mode() {
+        let out = search(&[], "test", true, false).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["search_mode"], "fts");
+    }
+
+    // TC-007: search human fts fallback shows notice
+    #[test]
+    fn search_human_fts_fallback_shows_notice() {
+        let results = vec![SearchResult {
+            post_number: 1,
+            post_name: "Test".to_string(),
+            post_url: "https://example.com".to_string(),
+            section_title: None,
+            snippet: String::new(),
+            score: 0.5,
+        }];
+        let out = search(&results, "q", false, false).unwrap();
+        assert!(out.contains("semantic search unavailable"));
+    }
+
+    // TC-007: search human hybrid does not show fallback notice
+    #[test]
+    fn search_human_hybrid_no_fallback_notice() {
+        let results = vec![SearchResult {
+            post_number: 1,
+            post_name: "Test".to_string(),
+            post_url: "https://example.com".to_string(),
+            section_title: None,
+            snippet: String::new(),
+            score: 0.5,
+        }];
+        let out = search(&results, "q", false, true).unwrap();
+        assert!(!out.contains("semantic search unavailable"));
     }
 }

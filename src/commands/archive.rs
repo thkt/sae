@@ -21,39 +21,35 @@ pub(crate) async fn run_archive(
     team: Option<&str>,
     dry_run: bool,
     json: bool,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
     let (team, client) = resolve_client(config, team)?;
     let post = client.get_post(team, number).await?;
     let new_category = match archive_category(post.category.as_deref()) {
         Some(c) => c,
         None if dry_run => {
-            crate::output::dry_run(&serde_json::json!({
+            return crate::output::dry_run(&serde_json::json!({
                 "number": number,
                 "already_archived": true,
                 "category": post.category.as_deref().unwrap_or(""),
-            }))?;
-            return Ok(());
+            }));
         }
         None => {
-            crate::output::action_result("Already archived", &post, json)?;
-            return Ok(());
+            return crate::output::action_result("Already archived", &post, json);
         }
     };
     if dry_run {
-        crate::output::dry_run(&serde_json::json!({
+        return crate::output::dry_run(&serde_json::json!({
             "number": number,
             "from_category": post.category.as_deref().unwrap_or(""),
             "to_category": new_category,
-        }))?;
-        return Ok(());
+        }));
     }
     let params = UpdatePostParams {
         category: Some(&new_category),
         ..Default::default()
     };
     let post = client.update_post(team, number, &params).await?;
-    crate::output::action_result("Archived", &post, json)?;
-    Ok(())
+    crate::output::action_result("Archived", &post, json)
 }
 
 pub(crate) async fn run_ship(
@@ -62,13 +58,12 @@ pub(crate) async fn run_ship(
     team: Option<&str>,
     dry_run: bool,
     json: bool,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
     if dry_run {
-        crate::output::dry_run(&serde_json::json!({
+        return crate::output::dry_run(&serde_json::json!({
             "number": number,
             "wip": false,
-        }))?;
-        return Ok(());
+        }));
     }
     let (team, client) = resolve_client(config, team)?;
     let params = UpdatePostParams {
@@ -76,8 +71,7 @@ pub(crate) async fn run_ship(
         ..Default::default()
     };
     let post = client.update_post(team, number, &params).await?;
-    crate::output::action_result("Shipped", &post, json)?;
-    Ok(())
+    crate::output::action_result("Shipped", &post, json)
 }
 
 #[cfg(test)]
