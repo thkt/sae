@@ -23,31 +23,31 @@ pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<Strin
     let db = require_db(config, team)?;
 
     let paths = require_embed_model()?;
-    tracing::info!("Loading model...");
     let spinner = crate::progress::Spinner::new("Loading model...");
     let embedder =
         Embedder::new(&paths).map_err(|e| SaeError::Other(format!("Failed to load model: {e}")))?;
     spinner.finish("Model ready");
-    tracing::info!("Model ready");
 
     const BATCH_SIZE: u32 = 128;
+    let pending = sae::storage::count_unembedded_chunks(db.conn())?;
     let mut total_added = 0u32;
     let mut total_chunks = 0u32;
-    loop {
-        let result = super::embed_batch::embed_one_batch(db.conn(), BATCH_SIZE, |texts| {
-            embedder
-                .embed_documents_batch(texts)
-                .map_err(|e| SaeError::Other(format!("Batch embedding failed: {e}")))
-        })?;
-        if result.processed == 0 {
-            break;
+    if pending > 0 {
+        let spinner = crate::progress::Spinner::new(&format!("Embedding... 0/{pending} chunks"));
+        loop {
+            let result = super::embed_batch::embed_one_batch(db.conn(), BATCH_SIZE, |texts| {
+                embedder
+                    .embed_documents_batch(texts)
+                    .map_err(|e| SaeError::Other(format!("Batch embedding failed: {e}")))
+            })?;
+            if result.processed == 0 {
+                break;
+            }
+            total_added += result.added;
+            total_chunks += result.processed;
+            spinner.set_message(&format!("Embedding... {total_chunks}/{pending} chunks"));
         }
-        if total_chunks == 0 {
-            tracing::info!("Embedding chunks...");
-        }
-        total_added += result.added;
-        total_chunks += result.processed;
-        tracing::info!("  {total_chunks} chunks processed");
+        spinner.finish(&format!("Embedded {total_chunks} chunks"));
     }
     tracing::info!(total_added, total_chunks, "embed complete");
     let result = sae::storage::EmbedResult {

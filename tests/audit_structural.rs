@@ -157,18 +157,14 @@ fn t_003_run_embed_no_eprintln() {
 }
 
 #[test]
-fn t_003_run_embed_has_4_tracing_info() {
+fn t_003_run_embed_has_1_tracing_info() {
     let path = src_dir().join("commands").join("data.rs");
     assert!(path.exists(), "[T-003] src/commands/data.rs does not exist");
     let source = fs::read_to_string(&path).unwrap();
     let count = count_in_function(&source, "run_embed", "tracing::info!");
-    // Also check for bare `info!` (if `use tracing::info;` is at the top)
-    let count_bare = count_in_function(&source, "run_embed", "info!");
-    // Subtract tracing::info! matches from info! matches to avoid double count
-    let total = if count > 0 { count } else { count_bare };
     assert_eq!(
-        total, 5,
-        "[T-003] run_embed should contain 5 tracing::info!/info! calls, found {total}"
+        count, 1,
+        "[T-003] run_embed should contain 1 tracing::info! call, found {count}"
     );
 }
 

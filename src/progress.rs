@@ -1,6 +1,6 @@
 use std::io::{IsTerminal, Write};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicBool, Ordering},
 };
 use std::thread;
@@ -11,16 +11,18 @@ const TICK_MS: u64 = 80;
 
 pub(crate) struct Spinner {
     done: Arc<AtomicBool>,
+    message: Arc<Mutex<String>>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Spinner {
     pub(crate) fn new(msg: &str) -> Self {
         let done = Arc::new(AtomicBool::new(false));
-        let message = msg.to_string();
+        let message = Arc::new(Mutex::new(msg.to_string()));
 
         let thread = if std::io::stderr().is_terminal() {
             let done = Arc::clone(&done);
+            let message = Arc::clone(&message);
             Some(thread::spawn(move || {
                 let mut err = std::io::stderr();
                 let mut i = 0;
@@ -28,7 +30,8 @@ impl Spinner {
                     if done.load(Ordering::Relaxed) {
                         break;
                     }
-                    eprint!("\r\x1b[2K{} {}", FRAMES[i % FRAMES.len()], message);
+                    let msg = message.lock().map(|m| m.clone()).unwrap_or_default();
+                    let _ = write!(err, "\r\x1b[2K{} {}", FRAMES[i % FRAMES.len()], msg);
                     let _ = err.flush();
                     thread::sleep(Duration::from_millis(TICK_MS));
                     i += 1;
@@ -38,11 +41,23 @@ impl Spinner {
             None
         };
 
-        Self { done, thread }
+        Self {
+            done,
+            message,
+            thread,
+        }
+    }
+
+    pub(crate) fn set_message(&self, msg: &str) {
+        if let Ok(mut m) = self.message.lock() {
+            *m = msg.to_string();
+        }
     }
 
     pub(crate) fn finish(self, msg: &str) {
         let is_tty = self.thread.is_some();
+        // Drop first: signals the thread to stop and clears the spinner line via Drop::drop.
+        // The eprintln! must come after, or the success message would be overwritten.
         drop(self);
         if is_tty {
             eprintln!("\x1b[32m✓\x1b[0m {msg}");

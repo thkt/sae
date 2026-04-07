@@ -51,7 +51,12 @@ pub(crate) fn run_search(
         chrono::Utc::now(),
     )?;
     let semantic = query_embedding.is_some();
-    crate::output::search(&results, query, json, semantic)
+    let output = crate::output::search(&results, query, json, semantic)?;
+    const PREFETCH_TTL_SECS: u64 = 5 * 60;
+    if !sae::storage::sync_harvested_within(db.conn(), PREFETCH_TTL_SECS) {
+        spawn_background_harvest(team);
+    }
+    Ok(output)
 }
 
 fn auto_embed_pending(
@@ -107,19 +112,43 @@ fn try_load_embedder_with<E: std::fmt::Display>(
 ) -> ModelLoad {
     let paths = match cache_check() {
         Ok(Some(p)) => p,
-        Ok(None) => return ModelLoad::Absent,
-        Err(e) => return ModelLoad::Failed(e.to_string()),
+        Ok(None) => {
+            tracing::debug!("embedding model not cached");
+            return ModelLoad::Absent;
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "embedding model cache check failed");
+            return ModelLoad::Failed(e.to_string());
+        }
     };
     let spinner = crate::progress::Spinner::new("Loading model...");
     match Embedder::new(&paths) {
         Ok(e) => {
             spinner.finish("Model ready");
+            tracing::debug!("embedding model loaded");
             ModelLoad::Ready(Box::new(e))
         }
         Err(e) => {
             spinner.cancel();
+            tracing::debug!(error = %e, "embedding model load failed");
             ModelLoad::Failed(e.to_string())
         }
+    }
+}
+
+fn spawn_background_harvest(team: &str) {
+    let Ok(exe) = std::env::current_exe() else {
+        tracing::debug!("background harvest skipped: current_exe() failed");
+        return;
+    };
+    if let Err(e) = std::process::Command::new(exe)
+        .args(["harvest", team])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+    {
+        tracing::debug!(error = %e, "background harvest spawn failed");
     }
 }
 
