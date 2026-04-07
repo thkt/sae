@@ -168,9 +168,8 @@ where
     T: Into<std::ffi::OsString> + Clone,
 {
     let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
-    if let Some(expanded) =
-        shorthand::try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS)
-    {
+    let expanded = shorthand::try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS);
+    if let Some(expanded) = expanded {
         let display: Vec<_> = expanded.iter().filter_map(|a| a.to_str()).collect();
         eprintln!("→ {}", display.join(" "));
         return Cli::try_parse_from(expanded);
