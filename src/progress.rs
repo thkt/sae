@@ -45,7 +45,7 @@ impl Spinner {
         let is_tty = self.thread.is_some();
         drop(self);
         if is_tty {
-            done(msg);
+            eprintln!("\x1b[32m✓\x1b[0m {msg}");
         }
     }
 
@@ -63,8 +63,4 @@ impl Drop for Spinner {
             let _ = std::io::stderr().flush();
         }
     }
-}
-
-fn done(msg: &str) {
-    eprintln!("\x1b[32m✓\x1b[0m {msg}");
 }

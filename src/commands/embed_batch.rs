@@ -8,7 +8,6 @@ pub(crate) struct BatchResult {
     pub budget_exhausted: bool,
 }
 
-/// Embed one batch of pending chunks: fetch → embed → verify → store.
 pub(crate) fn embed_one_batch<F>(
     conn: &rusqlite::Connection,
     budget: u32,

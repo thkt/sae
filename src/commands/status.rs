@@ -64,20 +64,8 @@ mod tests {
 
     fn make_post_row() -> sae::storage::EsaPostRow {
         sae::storage::EsaPostRow {
-            number: 1,
-            name: "Post 1".into(),
-            full_name: "dev/Post 1".into(),
-            body_md: "# Post 1".into(),
             category: None,
-            tags: vec![],
-            wip: false,
-            kind: "stock".into(),
-            url: "https://example.esa.io/posts/1".into(),
-            created_at: "2025-01-01T00:00:00+09:00".into(),
-            updated_at: "2025-01-01T00:00:00+09:00".into(),
-            created_by: "alice".into(),
-            updated_by: "alice".into(),
-            revision_number: 1,
+            ..sae::storage::test_post_row(1)
         }
     }
 

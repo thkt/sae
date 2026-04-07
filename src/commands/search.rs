@@ -84,12 +84,13 @@ where
     if result.processed == 0 {
         return Ok(false);
     }
-    eprintln!("Embedding {} new chunks...", result.processed);
+    eprintln!("Embedded {} new chunks", result.processed);
+    tracing::info!(chunks = result.processed, "auto_embed_pending: embedded chunks during search");
     Ok(result.budget_exhausted)
 }
 
 pub(crate) enum ModelLoad {
-    Ready(Embedder),
+    Ready(Box<Embedder>),
     Absent,
     Failed(String),
 }
@@ -110,7 +111,7 @@ fn try_load_embedder_with<E: std::fmt::Display>(
     match Embedder::new(&paths) {
         Ok(e) => {
             spinner.finish("Model ready");
-            ModelLoad::Ready(e)
+            ModelLoad::Ready(Box::new(e))
         }
         Err(e) => {
             spinner.cancel();
@@ -172,20 +173,9 @@ mod tests {
 
     fn make_test_row(number: u32) -> sae::storage::EsaPostRow {
         sae::storage::EsaPostRow {
-            number,
-            name: format!("Post {number}"),
-            full_name: format!("Post {number}"),
             body_md: "# Hello\nWorld".into(),
             category: None,
-            tags: vec![],
-            wip: false,
-            kind: "stock".into(),
-            url: format!("https://example.esa.io/posts/{number}"),
-            created_at: "2025-01-01T00:00:00+09:00".into(),
-            updated_at: "2025-01-01T00:00:00+09:00".into(),
-            created_by: "user".into(),
-            updated_by: "user".into(),
-            revision_number: 1,
+            ..sae::storage::test_post_row(number)
         }
     }
 

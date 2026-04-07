@@ -49,6 +49,7 @@ pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<Strin
         total_chunks += result.processed;
         tracing::info!("  {total_chunks} chunks processed");
     }
+    tracing::info!(total_added, total_chunks, "embed complete");
     let result = sae::storage::EmbedResult {
         chunks_embedded: total_added,
     };

@@ -167,8 +167,8 @@ fn t_003_run_embed_has_4_tracing_info() {
     // Subtract tracing::info! matches from info! matches to avoid double count
     let total = if count > 0 { count } else { count_bare };
     assert_eq!(
-        total, 4,
-        "[T-003] run_embed should contain 4 tracing::info!/info! calls, found {total}"
+        total, 5,
+        "[T-003] run_embed should contain 5 tracing::info!/info! calls, found {total}"
     );
 }
 

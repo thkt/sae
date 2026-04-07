@@ -436,8 +436,8 @@ pub fn rechunk_post(
     }
 }
 
-#[cfg(test)]
-pub(crate) fn test_post_row(number: u32) -> EsaPostRow {
+#[doc(hidden)]
+pub fn test_post_row(number: u32) -> EsaPostRow {
     EsaPostRow {
         number,
         name: format!("Post {number}"),
