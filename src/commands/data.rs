@@ -8,16 +8,15 @@ pub(crate) async fn run_harvest(
     team: &str,
     full: bool,
     json: bool,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
     let (team, client) = resolve_client(config, Some(team))?;
     let db_path = config.team_db_path(team)?;
     let db = sae::storage::Db::open(&db_path)?;
     let result = sae::sync::harvest(&client, &db, team, full).await?;
-    crate::output::harvest(&result, json)?;
-    Ok(())
+    crate::output::harvest(&result, json)
 }
 
-pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<(), AppError> {
+pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<String, AppError> {
     use rurico::embed::Embed;
 
     let team = config.resolve_team(Some(team))?;
@@ -30,13 +29,13 @@ pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<(), A
 
     const BATCH_SIZE: u32 = 64;
     let mut total_added = 0u32;
-    let mut done = 0u32;
+    let mut total_chunks = 0u32;
     loop {
         let batch = sae::storage::get_unembedded_chunks(db.conn(), BATCH_SIZE)?;
         if batch.is_empty() {
             break;
         }
-        if done == 0 {
+        if total_chunks == 0 {
             tracing::info!("Embedding chunks...");
         }
         let texts: Vec<&str> = batch.iter().map(|(_, content)| content.as_str()).collect();
@@ -46,27 +45,24 @@ pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<(), A
             .map_err(|e| format!("Batch embedding failed: {e}"))?;
         let embeddings: Vec<(i64, _)> = batch.iter().map(|(id, _)| *id).zip(embs).collect();
         total_added += sae::storage::add_chunked_embeddings(db.conn(), &embeddings)?;
-        done += batch_len;
-        tracing::info!("  {done} chunks processed");
+        total_chunks += batch_len;
+        tracing::info!("  {total_chunks} chunks processed");
     }
     let result = sae::storage::EmbedResult {
         chunks_embedded: total_added,
     };
-    crate::output::embed(&result, done, json)?;
-    Ok(())
+    crate::output::embed(&result, total_chunks, json)
 }
 
-pub(crate) fn run_model_download(json: bool) -> Result<(), AppError> {
+pub(crate) fn run_model_download(json: bool) -> Result<String, AppError> {
     eprintln!("Downloading model...");
     let paths = rurico::embed::download_model(ModelId::default())
         .map_err(|e| format!("Failed to download model: {e}"))?;
     let _embedder = Embedder::new(&paths).map_err(|e| format!("Failed to verify model: {e}"))?;
-    crate::output::model_download(json)?;
-    Ok(())
+    crate::output::model_download(json)
 }
 
-pub(crate) fn require_embed_model() -> Result<rurico::embed::Artifacts, Box<dyn std::error::Error>>
-{
+pub(crate) fn require_embed_model() -> Result<rurico::embed::Artifacts, AppError> {
     let auto_download = std::env::var("SAE_AUTO_DOWNLOAD_MODEL").as_deref() == Ok("1");
     require_embed_model_with(auto_download, || {
         rurico::embed::cached_artifacts(ModelId::default())
@@ -76,9 +72,10 @@ pub(crate) fn require_embed_model() -> Result<rurico::embed::Artifacts, Box<dyn 
 fn require_embed_model_with<E: std::fmt::Display>(
     auto_download: bool,
     cache_check: impl FnOnce() -> Result<Option<rurico::embed::Artifacts>, E>,
-) -> Result<rurico::embed::Artifacts, Box<dyn std::error::Error>> {
+) -> Result<rurico::embed::Artifacts, AppError> {
     if auto_download {
         eprintln!("Downloading model (SAE_AUTO_DOWNLOAD_MODEL=1)...");
+        // Embedder::new verification skipped: caller (run_embed) calls it immediately after
         return rurico::embed::download_model(ModelId::default())
             .map_err(|e| format!("Failed to download model: {e}").into());
     }

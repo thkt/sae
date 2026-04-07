@@ -11,7 +11,7 @@ pub(crate) fn run_search(
     team: Option<&str>,
     limit: u32,
     json: bool,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
     let team = config.resolve_team(team)?;
     let db = require_db(config, team)?;
     let embedder = try_load_embedder();
@@ -30,8 +30,8 @@ pub(crate) fn run_search(
         limit,
         chrono::Utc::now(),
     )?;
-    crate::output::search(&results, query, json)?;
-    Ok(())
+    let semantic = query_embedding.is_some();
+    crate::output::search(&results, query, json, semantic)
 }
 
 pub(crate) fn try_load_embedder() -> Option<Embedder> {

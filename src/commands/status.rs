@@ -3,7 +3,11 @@ use sae::storage::TeamStatus;
 
 use crate::AppError;
 
-pub(crate) fn run_status(config: &Config, team: Option<&str>, json: bool) -> Result<(), AppError> {
+pub(crate) fn run_status(
+    config: &Config,
+    team: Option<&str>,
+    json: bool,
+) -> Result<String, AppError> {
     let target_teams: Vec<&str> = if let Some(t) = team {
         vec![config.resolve_team(Some(t))?]
     } else {
@@ -21,14 +25,10 @@ pub(crate) fn run_status(config: &Config, team: Option<&str>, json: bool) -> Res
             .collect()
     };
     let statuses = collect_team_statuses(config, &target_teams)?;
-    crate::output::status(&statuses, json)?;
-    Ok(())
+    crate::output::status(&statuses, json)
 }
 
-fn collect_team_statuses(
-    config: &Config,
-    teams: &[&str],
-) -> Result<Vec<TeamStatus>, Box<dyn std::error::Error>> {
+fn collect_team_statuses(config: &Config, teams: &[&str]) -> Result<Vec<TeamStatus>, AppError> {
     let mut statuses = Vec::new();
     for t in teams {
         let ts = match config.team_db_path(t) {
@@ -44,10 +44,7 @@ fn collect_team_statuses(
     Ok(statuses)
 }
 
-fn query_team_status(
-    team: &str,
-    path: &std::path::Path,
-) -> Result<TeamStatus, Box<dyn std::error::Error>> {
+fn query_team_status(team: &str, path: &std::path::Path) -> Result<TeamStatus, AppError> {
     let db = sae::storage::Db::open(path)?;
     let count = sae::storage::count_posts(db.conn())?;
     let state = sae::storage::get_sync_state(db.conn())?;
@@ -61,6 +58,25 @@ fn query_team_status(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn make_post_row() -> sae::storage::EsaPostRow {
+        sae::storage::EsaPostRow {
+            number: 1,
+            name: "Post 1".into(),
+            full_name: "dev/Post 1".into(),
+            body_md: "# Post 1".into(),
+            category: None,
+            tags: vec![],
+            wip: false,
+            kind: "stock".into(),
+            url: "https://example.esa.io/posts/1".into(),
+            created_at: "2025-01-01T00:00:00+09:00".into(),
+            updated_at: "2025-01-01T00:00:00+09:00".into(),
+            created_by: "alice".into(),
+            updated_by: "alice".into(),
+            revision_number: 1,
+        }
+    }
 
     // T-007: at least 1 test co-located with status handlers
     #[test]
@@ -79,26 +95,7 @@ mod tests {
         let path = dir.path().join("test.db");
         {
             let db = sae::storage::Db::open(&path).unwrap();
-            sae::storage::upsert_post(
-                db.conn(),
-                &sae::storage::EsaPostRow {
-                    number: 1,
-                    name: "Post 1".into(),
-                    full_name: "dev/Post 1".into(),
-                    body_md: "# Post 1".into(),
-                    category: None,
-                    tags: vec![],
-                    wip: false,
-                    kind: "stock".into(),
-                    url: "https://example.esa.io/posts/1".into(),
-                    created_at: "2025-01-01T00:00:00+09:00".into(),
-                    updated_at: "2025-01-01T00:00:00+09:00".into(),
-                    created_by: "alice".into(),
-                    updated_by: "alice".into(),
-                    revision_number: 1,
-                },
-            )
-            .unwrap();
+            sae::storage::upsert_post(db.conn(), &make_post_row()).unwrap();
             sae::storage::save_sync_state(
                 db.conn(),
                 &sae::storage::SyncStateUpdate {
@@ -136,26 +133,7 @@ mod tests {
         let path = dir.path().join("test.db");
         {
             let db = sae::storage::Db::open(&path).unwrap();
-            sae::storage::upsert_post(
-                db.conn(),
-                &sae::storage::EsaPostRow {
-                    number: 1,
-                    name: "Post 1".into(),
-                    full_name: "dev/Post 1".into(),
-                    body_md: "# Post 1".into(),
-                    category: None,
-                    tags: vec![],
-                    wip: false,
-                    kind: "stock".into(),
-                    url: "https://example.esa.io/posts/1".into(),
-                    created_at: "2025-01-01T00:00:00+09:00".into(),
-                    updated_at: "2025-01-01T00:00:00+09:00".into(),
-                    created_by: "alice".into(),
-                    updated_by: "alice".into(),
-                    revision_number: 1,
-                },
-            )
-            .unwrap();
+            sae::storage::upsert_post(db.conn(), &make_post_row()).unwrap();
             // sync_state intentionally NOT saved
         }
         let ts = query_team_status("myteam", &path).unwrap();

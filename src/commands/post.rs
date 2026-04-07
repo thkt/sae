@@ -5,14 +5,31 @@ use sae::config::Config;
 
 use crate::{AppError, resolve_client};
 
+#[derive(Debug, clap::Args)]
 pub(crate) struct CreateArgs {
+    /// Post title
+    #[arg(long)]
     pub(crate) name: String,
+    /// Post body (Markdown)
+    #[arg(long, conflicts_with = "body_file")]
     pub(crate) body: Option<String>,
+    /// Read body from file (use "-" for stdin)
+    #[arg(long, conflicts_with = "body")]
     pub(crate) body_file: Option<String>,
+    /// Category path
+    #[arg(long)]
     pub(crate) category: Option<String>,
+    /// Tags
+    #[arg(long)]
     pub(crate) tag: Vec<String>,
+    /// Mark as WIP
+    #[arg(long)]
     pub(crate) wip: bool,
+    /// Team name
+    #[arg(long)]
     pub(crate) team: Option<String>,
+    /// Preview without creating (no mutation API calls)
+    #[arg(long)]
     pub(crate) dry_run: bool,
 }
 
@@ -22,28 +39,26 @@ pub(crate) async fn run_get(
     team: Option<&str>,
     with_body: bool,
     json: bool,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
     let (team, client) = resolve_client(config, team)?;
     let post = client.get_post(team, number).await?;
-    crate::output::get(&post, json, with_body)?;
-    Ok(())
+    crate::output::get(&post, json, with_body)
 }
 
 pub(crate) async fn run_create(
     config: &Config,
     args: CreateArgs,
     json: bool,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
     let resolved_body = resolve_body(args.body.as_deref(), args.body_file.as_deref())?;
     if args.dry_run {
-        crate::output::dry_run(&serde_json::json!({
+        return crate::output::dry_run(&serde_json::json!({
             "name": args.name,
             "body_md": resolved_body,
             "category": args.category,
             "tags": args.tag,
             "wip": args.wip,
-        }))?;
-        return Ok(());
+        }));
     }
     let (team, client) = resolve_client(config, args.team.as_deref())?;
     let params = CreatePostParams {
@@ -54,18 +69,33 @@ pub(crate) async fn run_create(
         wip: args.wip,
     };
     let post = client.create_post(team, &params).await?;
-    crate::output::action_result("Created", &post, json)?;
-    Ok(())
+    crate::output::action_result("Created", &post, json)
 }
 
+#[derive(Debug, clap::Args)]
 pub(crate) struct UpdateArgs {
+    /// Post number
     pub(crate) number: u32,
+    /// New title
+    #[arg(long)]
     pub(crate) name: Option<String>,
+    /// New body (Markdown)
+    #[arg(long, conflicts_with = "body_file")]
     pub(crate) body: Option<String>,
+    /// Read body from file (use "-" for stdin)
+    #[arg(long, conflicts_with = "body")]
     pub(crate) body_file: Option<String>,
+    /// New category path
+    #[arg(long)]
     pub(crate) category: Option<String>,
+    /// New tags (replaces existing)
+    #[arg(long)]
     pub(crate) tag: Vec<String>,
+    /// Team name
+    #[arg(long)]
     pub(crate) team: Option<String>,
+    /// Preview without updating (no mutation API calls)
+    #[arg(long)]
     pub(crate) dry_run: bool,
 }
 
@@ -73,7 +103,7 @@ pub(crate) async fn run_update(
     config: &Config,
     args: UpdateArgs,
     json: bool,
-) -> Result<(), AppError> {
+) -> Result<String, AppError> {
     let resolved_body = resolve_body(args.body.as_deref(), args.body_file.as_deref())?;
     let tags: Option<Vec<String>> = if args.tag.is_empty() {
         None
@@ -81,14 +111,13 @@ pub(crate) async fn run_update(
         Some(args.tag)
     };
     if args.dry_run {
-        crate::output::dry_run(&serde_json::json!({
+        return crate::output::dry_run(&serde_json::json!({
             "number": args.number,
             "name": args.name,
             "body_md": resolved_body,
             "category": args.category,
             "tags": tags.as_deref(),
-        }))?;
-        return Ok(());
+        }));
     }
     let (team, client) = resolve_client(config, args.team.as_deref())?;
     let params = UpdatePostParams {
@@ -99,14 +128,13 @@ pub(crate) async fn run_update(
         ..Default::default()
     };
     let post = client.update_post(team, args.number, &params).await?;
-    crate::output::action_result("Updated", &post, json)?;
-    Ok(())
+    crate::output::action_result("Updated", &post, json)
 }
 
 pub(crate) fn resolve_body(
     body: Option<&str>,
     body_file: Option<&str>,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
+) -> Result<Option<String>, AppError> {
     let mut stdin = std::io::stdin();
     resolve_body_with_reader(body, body_file, &mut stdin)
 }
@@ -115,7 +143,7 @@ pub(crate) fn resolve_body_with_reader(
     body: Option<&str>,
     body_file: Option<&str>,
     stdin: &mut impl Read,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
+) -> Result<Option<String>, AppError> {
     match (body, body_file) {
         (Some(b), None) => Ok(Some(b.to_string())),
         (None, Some("-")) => {
