@@ -1,6 +1,6 @@
 use std::io::{IsTerminal, Read};
 
-use rurico::embed::{Embed, Embedder, ModelId};
+use rurico::embed::{ChunkedEmbedding, Embed, Embedder, ModelId};
 use sae::config::Config;
 
 use crate::{SaeError, require_db};
@@ -15,6 +15,12 @@ pub(crate) fn run_search(
     let team = config.resolve_team(team)?;
     let db = require_db(config, team)?;
     let embedder = try_load_embedder();
+    if let Some(ref emb) = embedder {
+        if let Err(e) = auto_embed_pending(&db, team, emb) {
+            eprintln!("Warning: auto-embed failed ({e}), continuing with existing embeddings");
+            tracing::warn!(error = %e, "auto_embed_pending failed, continuing search");
+        }
+    }
     let query_embedding = embedder.as_ref().and_then(|e| match e.embed_query(query) {
         Ok(v) => Some(v),
         Err(e) => {
@@ -32,6 +38,51 @@ pub(crate) fn run_search(
     )?;
     let semantic = query_embedding.is_some();
     crate::output::search(&results, query, json, semantic)
+}
+
+fn auto_embed_pending(
+    db: &sae::storage::Db,
+    team: &str,
+    embedder: &Embedder,
+) -> Result<(), SaeError> {
+    const EMBED_BUDGET: u32 = 256;
+    let budget_exhausted = auto_embed_pending_with(db, EMBED_BUDGET, |texts| {
+        embedder
+            .embed_documents_batch(texts)
+            .map_err(|e| SaeError::Other(format!("Batch embedding failed: {e}")))
+    })?;
+    if budget_exhausted {
+        eprintln!("Hint: more chunks pending. Run 'sae embed {team}' to index all.");
+    }
+    Ok(())
+}
+
+/// Returns `Ok(true)` when the budget was fully consumed (more chunks may be pending).
+fn auto_embed_pending_with<F>(
+    db: &sae::storage::Db,
+    budget: u32,
+    embed_fn: F,
+) -> Result<bool, SaeError>
+where
+    F: Fn(&[&str]) -> Result<Vec<ChunkedEmbedding>, SaeError>,
+{
+    let batch = sae::storage::get_unembedded_chunks(db.conn(), budget)?;
+    if batch.is_empty() {
+        return Ok(false);
+    }
+    eprintln!("Embedding {} new chunks...", batch.len());
+    let texts: Vec<&str> = batch.iter().map(|(_, c)| c.as_str()).collect();
+    let embs = embed_fn(&texts)?;
+    if embs.len() != batch.len() {
+        return Err(SaeError::Other(format!(
+            "Embedding count mismatch: expected {}, got {}",
+            batch.len(),
+            embs.len()
+        )));
+    }
+    let embeddings: Vec<(i64, _)> = batch.iter().zip(embs).map(|((id, _), emb)| (*id, emb)).collect();
+    sae::storage::add_chunked_embeddings(db.conn(), &embeddings)?;
+    Ok(batch.len() as u32 == budget)
 }
 
 pub(crate) fn try_load_embedder() -> Option<Embedder> {
@@ -115,6 +166,136 @@ fn read_stdin_value(
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    fn make_test_row(number: u32) -> sae::storage::EsaPostRow {
+        sae::storage::EsaPostRow {
+            number,
+            name: format!("Post {number}"),
+            full_name: format!("Post {number}"),
+            body_md: "# Hello\nWorld".into(),
+            category: None,
+            tags: vec![],
+            wip: false,
+            kind: "stock".into(),
+            url: format!("https://example.esa.io/posts/{number}"),
+            created_at: "2025-01-01T00:00:00+09:00".into(),
+            updated_at: "2025-01-01T00:00:00+09:00".into(),
+            created_by: "user".into(),
+            updated_by: "user".into(),
+            revision_number: 1,
+        }
+    }
+
+    // TC-037: auto_embed_pending_with skips embed_fn when no unembedded chunks
+    #[test]
+    fn auto_embed_skips_when_no_unembedded_chunks() {
+        let db = sae::storage::Db::open_memory().unwrap();
+        let called = std::cell::Cell::new(false);
+        let result = auto_embed_pending_with(&db, 256, |_| {
+            called.set(true);
+            Ok(vec![])
+        });
+        assert!(result.is_ok());
+        assert!(!called.get(), "embed_fn must not be called when no chunks pending");
+    }
+
+    // TC-038: auto_embed_pending_with embeds chunks within budget
+    #[test]
+    fn auto_embed_embeds_pending_chunks() {
+        use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
+
+        let db = sae::storage::Db::open_memory().unwrap();
+        let row = make_test_row(1);
+        sae::storage::upsert_post(db.conn(), &row).unwrap();
+        sae::storage::rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
+
+        assert_eq!(sae::storage::count_unembedded_chunks(db.conn()).unwrap(), 1);
+
+        let result = auto_embed_pending_with(&db, 256, |texts| {
+            Ok(texts
+                .iter()
+                .map(|_| ChunkedEmbedding {
+                    chunks: vec![vec![0.5; EMBEDDING_DIMS]],
+                })
+                .collect())
+        });
+        assert!(result.is_ok());
+        assert_eq!(sae::storage::count_unembedded_chunks(db.conn()).unwrap(), 0);
+    }
+
+    // TC-039: auto_embed_pending_with respects budget and leaves excess chunks unembedded
+    #[test]
+    fn auto_embed_respects_budget() {
+        use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
+
+        let db = sae::storage::Db::open_memory().unwrap();
+        for i in 1u32..=2 {
+            let row = make_test_row(i);
+            sae::storage::upsert_post(db.conn(), &row).unwrap();
+            sae::storage::rechunk_post(db.conn(), i, "# Hello\nWorld").unwrap();
+        }
+
+        assert_eq!(sae::storage::count_unembedded_chunks(db.conn()).unwrap(), 2);
+
+        let result = auto_embed_pending_with(&db, 1, |texts| {
+            Ok(texts
+                .iter()
+                .map(|_| ChunkedEmbedding {
+                    chunks: vec![vec![0.5; EMBEDDING_DIMS]],
+                })
+                .collect())
+        });
+        assert!(result.is_ok());
+        assert!(result.unwrap(), "budget=1 with 2 chunks should signal budget exhausted");
+        assert_eq!(
+            sae::storage::count_unembedded_chunks(db.conn()).unwrap(),
+            1,
+            "budget=1 should leave 1 chunk unembedded"
+        );
+    }
+
+    // TC-040: auto_embed_pending_with propagates embed_fn error without side effects
+    #[test]
+    fn auto_embed_propagates_embed_error() {
+        let db = sae::storage::Db::open_memory().unwrap();
+        let row = make_test_row(1);
+        sae::storage::upsert_post(db.conn(), &row).unwrap();
+        sae::storage::rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
+
+        assert_eq!(sae::storage::count_unembedded_chunks(db.conn()).unwrap(), 1);
+
+        let result = auto_embed_pending_with(&db, 256, |_| {
+            Err(SaeError::Other("model OOM".into()))
+        });
+        assert!(result.is_err(), "embed_fn error should propagate");
+        assert!(result.unwrap_err().to_string().contains("model OOM"));
+        assert_eq!(
+            sae::storage::count_unembedded_chunks(db.conn()).unwrap(),
+            1,
+            "failed embed must not change unembedded count"
+        );
+    }
+
+    // TC-041: auto_embed_pending_with rejects embedding count mismatch
+    #[test]
+    fn auto_embed_rejects_count_mismatch() {
+        let db = sae::storage::Db::open_memory().unwrap();
+        let row = make_test_row(1);
+        sae::storage::upsert_post(db.conn(), &row).unwrap();
+        sae::storage::rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
+
+        let result = auto_embed_pending_with(&db, 256, |_| Ok(vec![]));
+        assert!(result.is_err(), "count mismatch should be an error");
+        assert!(
+            result.unwrap_err().to_string().contains("Embedding count mismatch"),
+            "error should describe the mismatch"
+        );
+        assert_eq!(
+            sae::storage::count_unembedded_chunks(db.conn()).unwrap(),
+            1,
+            "mismatched embed must not change unembedded count"
+        );
+    }
 
     // TC-010: try_load_embedder_with returns None when model is not cached
     #[test]

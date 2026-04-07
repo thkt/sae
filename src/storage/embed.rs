@@ -71,6 +71,17 @@ pub fn get_unembedded_chunks(
     Ok(rows)
 }
 
+pub fn count_unembedded_chunks(conn: &Connection) -> Result<u32, StorageError> {
+    conn.query_row(
+        "SELECT COUNT(*) FROM chunks c \
+         LEFT JOIN embedded_chunk_ids e ON c.id = e.chunk_id \
+         WHERE e.chunk_id IS NULL",
+        [],
+        |row| row.get(0),
+    )
+    .map_err(StorageError::from)
+}
+
 pub fn has_embeddings(conn: &Connection) -> bool {
     conn.query_row(
         "SELECT EXISTS(SELECT 1 FROM embedded_chunk_ids)",
@@ -155,5 +166,28 @@ mod tests {
 
         assert!(get_unembedded_chunks(db.conn(), 100).unwrap().is_empty());
         assert!(has_embeddings(db.conn()));
+    }
+
+    #[test]
+    fn count_unembedded_returns_zero_on_empty_db() {
+        let db = Db::open_memory().unwrap();
+        assert_eq!(count_unembedded_chunks(db.conn()).unwrap(), 0);
+    }
+
+    #[test]
+    fn count_unembedded_returns_correct_count_before_and_after_embed() {
+        let db = Db::open_memory().unwrap();
+        let mut row = crate::storage::test_post_row(1);
+        row.body_md = "# Hello\nWorld".into();
+        crate::storage::upsert_post(db.conn(), &row).unwrap();
+        crate::storage::rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
+
+        assert_eq!(count_unembedded_chunks(db.conn()).unwrap(), 1);
+
+        let chunks = get_unembedded_chunks(db.conn(), 100).unwrap();
+        let emb = vec![(chunks[0].0, make_chunked(0.5))];
+        add_chunked_embeddings(db.conn(), &emb).unwrap();
+
+        assert_eq!(count_unembedded_chunks(db.conn()).unwrap(), 0);
     }
 }
