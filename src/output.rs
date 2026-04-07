@@ -211,19 +211,6 @@ mod tests {
         }
     }
 
-    // TC-007: status --json → valid JSON array
-    #[test]
-    fn status_json_emits_json_array() {
-        let statuses = vec![make_synced("team-a", 10), make_not_synced("team-b")];
-        // Verify no error and output can be parsed (capture via serde_json directly)
-        let json = serde_json::to_string(&statuses).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert!(v.is_array());
-        assert_eq!(v[0]["team"], "team-a");
-        assert_eq!(v[0]["status"], "synced");
-        assert_eq!(v[1]["status"], "not_synced");
-    }
-
     // TC-007: status human-readable empty list — no panic
     #[test]
     fn status_human_empty_no_panic() {

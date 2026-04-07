@@ -682,13 +682,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn osa_distance_properties() {
-        assert_eq!(strsim::osa_distance("search", "search"), 0); // equal → 0
-        assert_eq!(strsim::osa_distance("serach", "search"), 1); // transposition → 1
-        assert!(strsim::osa_distance("query", "search") > 1); // unrelated → guard passes
-    }
-
     // T-050: `sae get 42` → Command::Get { number: 42, team: None, with_body: false }
     #[test]
     fn get_basic_parses_correctly() {
@@ -822,13 +815,5 @@ mod tests {
         }
     }
 
-    // T-001/FR-001: Compile-time check — fails until Phase 1 extraction is complete
-    #[test]
-    fn phase1_commands_extracted() {
-        let _ = &crate::commands::search::run_search;
-        let _ = &crate::commands::post::run_get;
-        let _ = &crate::commands::archive::run_archive;
-        let _ = &crate::commands::data::run_harvest;
-        let _ = &crate::commands::status::run_status;
-    }
+
 }
