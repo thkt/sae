@@ -132,7 +132,10 @@ pub(crate) fn migrate_v5(conn: &Connection, from_version: u32) -> Result<(), Sto
     set_schema_version(&tx, 5)?;
     tx.commit()?;
     if from_version > 0 {
-        warn!(from = from_version, "schema upgraded to v5: embeddings cleared, please re-run `sae embed`");
+        warn!(
+            from = from_version,
+            "schema upgraded to v5: embeddings cleared, please re-run `sae embed`"
+        );
     }
     Ok(())
 }
@@ -170,7 +173,11 @@ fn get_schema_version(conn: &Connection) -> Result<u32, StorageError> {
 }
 
 pub(crate) fn migrate(conn: &Connection, from_version: u32) -> Result<(), StorageError> {
-    tracing::info!(from = from_version, to = SCHEMA_VERSION, "running schema migration");
+    tracing::info!(
+        from = from_version,
+        to = SCHEMA_VERSION,
+        "running schema migration"
+    );
     if from_version < 4 {
         migrate_fts_v4(conn)?;
     }
@@ -203,9 +210,10 @@ impl Db {
             StorageError::Open(msg) => {
                 StorageError::Open(format!("{msg} (database: {})", path.display()))
             }
-            StorageError::Db(err) => {
-                StorageError::Open(format!("Database error: {err} (database: {})", path.display()))
-            }
+            StorageError::Db(err) => StorageError::Open(format!(
+                "Database error: {err} (database: {})",
+                path.display()
+            )),
             other => other,
         })?;
         Ok(db)
@@ -652,7 +660,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("test.db");
         let db = Db::open(&path).unwrap();
-        assert!(path.exists(), "Db::open should create the database file on disk");
+        assert!(
+            path.exists(),
+            "Db::open should create the database file on disk"
+        );
         upsert_post(db.conn(), &test_post_row(1)).unwrap();
         assert_eq!(count_posts(db.conn()).unwrap(), 1);
     }
@@ -1008,7 +1019,10 @@ mod tests {
         let db = Db::open(&db_path).unwrap();
 
         let version = get_schema_version(db.conn()).unwrap();
-        assert_eq!(version, 5, "[T-004] schema_version should be 5 after full migration");
+        assert_eq!(
+            version, 5,
+            "[T-004] schema_version should be 5 after full migration"
+        );
 
         // section_title の語で検索可能
         let hits: u32 = db
@@ -1073,7 +1087,10 @@ mod tests {
         let db = Db::open(&db_path).unwrap();
 
         let version = get_schema_version(db.conn()).unwrap();
-        assert_eq!(version, 5, "[T-010] schema_version should be 5 after v4→v5 migration");
+        assert_eq!(
+            version, 5,
+            "[T-010] schema_version should be 5 after v4→v5 migration"
+        );
 
         // FTS データが保持されている（再構築されていない）
         let hits: u32 = db
@@ -1096,7 +1113,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(tbl_count, 1, "[T-010] vec_chunks table should exist after v5 migration");
+        assert_eq!(
+            tbl_count, 1,
+            "[T-010] vec_chunks table should exist after v5 migration"
+        );
     }
 
     // T-011: migrate() が from=0 で v4, v5 を累積適用する
