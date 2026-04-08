@@ -21,6 +21,8 @@ pub(crate) fn search(
     query: &str,
     json: bool,
     semantic: bool,
+    embed_info: Option<(u32, bool)>,
+    team: &str,
 ) -> Result<String, SaeError> {
     let search_mode = if semantic { "hybrid" } else { "fts" };
     if json {
@@ -47,6 +49,16 @@ pub(crate) fn search(
             ));
             if !r.snippet.is_empty() {
                 lines.push(format!("  {}", r.snippet.replace('\n', " ")));
+            }
+        }
+        if let Some((processed, budget_exhausted)) = embed_info {
+            if processed > 0 {
+                lines.push(format!("(Embedded {processed} new chunks)"));
+            }
+            if budget_exhausted {
+                lines.push(format!(
+                    "Hint: more chunks pending. Run 'sae embed {team}' to index all."
+                ));
             }
         }
         Ok(lines.join("\n"))
@@ -269,8 +281,8 @@ mod tests {
         let result = sae::storage::EmbedResult {
             chunks_embedded: 42,
         };
-        let json = serde_json::to_string(&result).unwrap();
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let out = embed(&result, 42, true).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["chunks_embedded"], 42);
     }
 
@@ -326,7 +338,7 @@ mod tests {
     // TC-007: search json includes search_mode hybrid
     #[test]
     fn search_json_hybrid_includes_search_mode() {
-        let out = search(&[], "test", true, true).unwrap();
+        let out = search(&[], "test", true, true, None, "").unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["search_mode"], "hybrid");
         assert!(v["results"].is_array());
@@ -335,7 +347,7 @@ mod tests {
     // TC-007: search json includes search_mode fts
     #[test]
     fn search_json_fts_includes_search_mode() {
-        let out = search(&[], "test", true, false).unwrap();
+        let out = search(&[], "test", true, false, None, "").unwrap();
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["search_mode"], "fts");
     }
@@ -351,7 +363,7 @@ mod tests {
             snippet: String::new(),
             score: 0.5,
         }];
-        let out = search(&results, "q", false, false).unwrap();
+        let out = search(&results, "q", false, false, None, "").unwrap();
         assert!(out.contains("semantic search unavailable"));
     }
 
@@ -366,7 +378,7 @@ mod tests {
             snippet: String::new(),
             score: 0.5,
         }];
-        let out = search(&results, "q", false, true).unwrap();
+        let out = search(&results, "q", false, true, None, "").unwrap();
         assert!(!out.contains("semantic search unavailable"));
     }
 }
