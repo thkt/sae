@@ -5,6 +5,14 @@ use sae::config::Config;
 
 use crate::{SaeError, require_db};
 
+/// Emit a user-visible warning to stderr and a structured log entry.
+macro_rules! warn_user {
+    ($user_msg:literal; $($log:tt)+) => {{
+        eprintln!("Warning: {}", format_args!($user_msg));
+        tracing::warn!($($log)+);
+    }};
+}
+
 pub(crate) fn run_search(
     config: &Config,
     query: &str,
@@ -20,23 +28,26 @@ pub(crate) fn run_search(
             "Hint: run 'sae model download && sae embed <team>' to enable semantic search"
         ),
         ModelLoad::Failed(e) => {
-            eprintln!("Warning: embedding model not available ({e})");
-            tracing::warn!(error = %e, "embedding model not available");
+            warn_user!("embedding model not available ({e})"; error = %e, "embedding model not available");
         }
         ModelLoad::Ready(_) => {}
     }
-    if let ModelLoad::Ready(ref emb) = embedder
-        && let Err(e) = auto_embed_pending(&db, team, emb)
-    {
-        eprintln!("Warning: auto-embed failed ({e}), continuing with existing embeddings");
-        tracing::warn!(error = %e, "auto_embed_pending failed, continuing search");
-    }
+    let embed_info = if let ModelLoad::Ready(ref emb) = embedder {
+        match auto_embed_pending(&db, emb) {
+            Ok(info) => Some(info),
+            Err(e) => {
+                warn_user!("auto-embed failed ({e}), continuing with existing embeddings"; error = %e, "auto_embed_pending failed, continuing search");
+                None
+            }
+        }
+    } else {
+        None
+    };
     let query_embedding = if let ModelLoad::Ready(ref e) = embedder {
         match e.embed_query(query) {
             Ok(v) => Some(v),
             Err(e) => {
-                eprintln!("Warning: embed_query failed ({e}), falling back to FTS");
-                tracing::warn!(error = %e, %query, "embed_query failed, falling back to FTS");
+                warn_user!("embed_query failed ({e}), falling back to FTS"; error = %e, %query, "embed_query failed, falling back to FTS");
                 None
             }
         }
@@ -51,7 +62,7 @@ pub(crate) fn run_search(
         chrono::Utc::now(),
     )?;
     let semantic = query_embedding.is_some();
-    let output = crate::output::search(&results, query, json, semantic)?;
+    let output = crate::output::search(&results, query, json, semantic, embed_info, team)?;
     const PREFETCH_TTL_SECS: u64 = 5 * 60;
     if !sae::storage::sync_harvested_within(db.conn(), PREFETCH_TTL_SECS) {
         spawn_background_harvest(team);
@@ -61,40 +72,35 @@ pub(crate) fn run_search(
 
 fn auto_embed_pending(
     db: &sae::storage::Db,
-    team: &str,
     embedder: &Embedder,
-) -> Result<(), SaeError> {
+) -> Result<(u32, bool), SaeError> {
     const EMBED_BUDGET: u32 = 128;
-    let budget_exhausted = auto_embed_pending_with(db, EMBED_BUDGET, |texts| {
+    auto_embed_pending_with(db, EMBED_BUDGET, |texts| {
         embedder
             .embed_documents_batch(texts)
             .map_err(|e| SaeError::Other(format!("Batch embedding failed: {e}")))
-    })?;
-    if budget_exhausted {
-        eprintln!("Hint: more chunks pending. Run 'sae embed {team}' to index all.");
-    }
-    Ok(())
+    })
 }
 
-/// Returns `Ok(true)` when the budget was fully consumed (more chunks may be pending).
+/// Embeds up to `budget` pending chunks in one batch.
+/// Returns `(processed, budget_exhausted)` — `budget_exhausted` signals more chunks remain.
 fn auto_embed_pending_with<F>(
     db: &sae::storage::Db,
     budget: u32,
     embed_fn: F,
-) -> Result<bool, SaeError>
+) -> Result<(u32, bool), SaeError>
 where
     F: Fn(&[&str]) -> Result<Vec<ChunkedEmbedding>, SaeError>,
 {
     let result = super::embed_batch::embed_one_batch(db.conn(), budget, embed_fn)?;
     if result.processed == 0 {
-        return Ok(false);
+        return Ok((0, false));
     }
-    eprintln!("Embedded {} new chunks", result.processed);
-    tracing::info!(
+    tracing::debug!(
         chunks = result.processed,
         "auto_embed_pending: embedded chunks during search"
     );
-    Ok(result.budget_exhausted)
+    Ok((result.processed, result.budget_exhausted))
 }
 
 pub(crate) enum ModelLoad {
@@ -121,15 +127,12 @@ fn try_load_embedder_with<E: std::fmt::Display>(
             return ModelLoad::Failed(e.to_string());
         }
     };
-    let spinner = crate::progress::Spinner::new("Loading model...");
     match Embedder::new(&paths) {
         Ok(e) => {
-            spinner.finish("Model ready");
             tracing::debug!("embedding model loaded");
             ModelLoad::Ready(Box::new(e))
         }
         Err(e) => {
-            spinner.cancel();
             tracing::debug!(error = %e, "embedding model load failed");
             ModelLoad::Failed(e.to_string())
         }
@@ -275,7 +278,7 @@ mod tests {
         });
         assert!(result.is_ok());
         assert!(
-            result.unwrap(),
+            result.unwrap().1,
             "budget=1 with 2 chunks should signal budget exhausted"
         );
         assert_eq!(

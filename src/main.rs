@@ -173,7 +173,9 @@ where
     let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
     let expanded = shorthand::try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS);
     if let Some(expanded) = expanded {
-        let display: Vec<_> = expanded.iter().filter_map(|a| a.to_str()).collect();
+        let display: Vec<_> = std::iter::once("sae")
+            .chain(expanded[1..].iter().filter_map(|a| a.to_str()))
+            .collect();
         eprintln!("→ {}", display.join(" "));
         return Cli::try_parse_from(expanded);
     }
