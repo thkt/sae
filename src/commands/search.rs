@@ -3,7 +3,7 @@ use std::io::{IsTerminal, Read};
 use rurico::embed::{ChunkedEmbedding, Embed, Embedder, ModelId};
 use sae::config::Config;
 
-use crate::{SaeError, require_db};
+use crate::{require_db, SaeError};
 
 /// Emit a user-visible warning to stderr and a structured log entry.
 macro_rules! warn_user {
@@ -70,10 +70,7 @@ pub(crate) fn run_search(
     Ok(output)
 }
 
-fn auto_embed_pending(
-    db: &sae::storage::Db,
-    embedder: &Embedder,
-) -> Result<(u32, bool), SaeError> {
+fn auto_embed_pending(db: &sae::storage::Db, embedder: &Embedder) -> Result<(u32, bool), SaeError> {
     const EMBED_BUDGET: u32 = 128;
     auto_embed_pending_with(db, EMBED_BUDGET, |texts| {
         embedder
