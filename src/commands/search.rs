@@ -3,7 +3,7 @@ use std::io::{IsTerminal, Read};
 use rurico::embed::{ChunkedEmbedding, Embed, Embedder, ModelId};
 use sae::config::Config;
 
-use crate::{require_db, SaeError};
+use crate::{SaeError, require_db};
 
 /// Emit a user-visible warning to stderr and a structured log entry.
 macro_rules! warn_user {
