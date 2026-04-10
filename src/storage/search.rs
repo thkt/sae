@@ -15,7 +15,14 @@ pub struct SearchResult {
     pub score: f64,
 }
 
-pub fn fts_search(conn: &Connection, query: &str, limit: u32) -> Result<Vec<FtsHit>, StorageError> {
+pub fn fts_search(
+    conn: &Connection,
+    query: &str,
+    limit: u32,
+    tags: Option<&[&str]>,
+    category: Option<&str>,
+    created_by: Option<&str>,
+) -> Result<Vec<FtsHit>, StorageError> {
     let normalized = normalize_punctuation(query);
     let matched = match rurico::storage::prepare_match_query(conn, &normalized) {
         Ok(m) => m,
@@ -24,20 +31,26 @@ pub fn fts_search(conn: &Connection, query: &str, limit: u32) -> Result<Vec<FtsH
             return Ok(Vec::new());
         }
     };
-
     let match_query = clean_for_trigram(matched.as_str());
 
-    let mut stmt = conn.prepare_cached(
+    let mut sql = String::from(
         "SELECT c.id, c.post_number, c.section_title, c.content, f.rank \
          FROM fts_chunks f \
          JOIN chunks c ON c.id = f.rowid \
-         WHERE fts_chunks MATCH ?1 \
-         ORDER BY f.rank \
-         LIMIT ?2",
-    )?;
+         JOIN posts p ON p.number = c.post_number \
+         WHERE fts_chunks MATCH ?",
+    );
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(match_query)];
 
+    append_tags_filter(&mut sql, &mut params, tags);
+    append_eq_filter(&mut sql, &mut params, "p.category", category);
+    append_eq_filter(&mut sql, &mut params, "p.created_by", created_by);
+    sql.push_str(" ORDER BY f.rank LIMIT ?");
+    params.push(Box::new(limit));
+
+    let mut stmt = conn.prepare(&sql)?;
     let rows: Vec<FtsHit> = stmt
-        .query_map(rusqlite::params![&match_query, limit], |row| {
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
             Ok(FtsHit {
                 chunk_id: row.get(0)?,
                 post_number: row.get(1)?,
@@ -57,6 +70,9 @@ pub fn vec_search(
     conn: &Connection,
     query_embedding: &[f32],
     limit: u32,
+    tags: Option<&[&str]>,
+    category: Option<&str>,
+    created_by: Option<&str>,
 ) -> Result<Vec<VecHit>, StorageError> {
     let bytes: &[u8] = rurico::storage::f32_as_bytes(query_embedding);
     let oversample = limit.saturating_mul(VEC_MAXSIM_OVERSAMPLE);
@@ -82,29 +98,35 @@ pub fn vec_search(
     // MaxSim: keep the sub-embedding with the smallest distance per chunk_id
     let mut best: HashMap<i64, f32> = HashMap::new();
     for (chunk_id, distance) in &knn_rows {
-        use std::collections::hash_map::Entry;
-        match best.entry(*chunk_id) {
-            Entry::Vacant(v) => {
-                v.insert(*distance);
-            }
-            Entry::Occupied(mut o) => {
-                if distance < o.get() {
-                    *o.get_mut() = *distance;
+        best.entry(*chunk_id)
+            .and_modify(|d| {
+                if *distance < *d {
+                    *d = *distance;
                 }
-            }
-        }
+            })
+            .or_insert(*distance);
     }
 
     // Step 2: batch-fetch chunk metadata for the deduplicated chunk_ids
     let chunk_ids: Vec<i64> = best.keys().copied().collect();
-    let sql = format!(
-        "SELECT id, post_number, section_title, content FROM chunks WHERE id IN ({})",
-        super::in_placeholders(chunk_ids.len())
+    let mut sql = format!(
+        "SELECT c.id, c.post_number, c.section_title, c.content \
+         FROM chunks c \
+         JOIN posts p ON p.number = c.post_number \
+         WHERE c.id IN ({})",
+        super::anon_placeholders(chunk_ids.len())
     );
+    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = chunk_ids
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
+        .collect();
+    append_tags_filter(&mut sql, &mut params, tags);
+    append_eq_filter(&mut sql, &mut params, "p.category", category);
+    append_eq_filter(&mut sql, &mut params, "p.created_by", created_by);
+
     let mut stmt2 = conn.prepare(&sql)?;
-    let params = super::as_sql_params(&chunk_ids);
     let meta: HashMap<i64, (u32, Option<String>, String)> = stmt2
-        .query_map(params.as_slice(), |row| {
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
                 row.get::<_, u32>(1)?,
@@ -147,20 +169,25 @@ pub fn hybrid_search(
     query_embedding: Option<&[f32]>,
     limit: u32,
     now: chrono::DateTime<chrono::Utc>,
+    tags: Option<&[&str]>,
+    category: Option<&str>,
+    created_by: Option<&str>,
 ) -> Result<Vec<SearchResult>, StorageError> {
     let candidate_limit = limit * 3;
 
-    let fts_hits = fts_search(conn, query, candidate_limit)?;
+    let fts_hits = fts_search(conn, query, candidate_limit, tags, category, created_by)?;
 
     let vec_hits = match query_embedding {
-        Some(emb) if super::has_embeddings(conn) => match vec_search(conn, emb, candidate_limit) {
-            Ok(hits) => hits,
-            Err(e) => {
-                eprintln!("  warning: vector search failed, falling back to text search only");
-                warn!(%e, %query, candidate_limit, "vec_search failed, falling back to FTS only");
-                Vec::new()
+        Some(emb) if super::has_embeddings(conn) => {
+            match vec_search(conn, emb, candidate_limit, tags, category, created_by) {
+                Ok(hits) => hits,
+                Err(e) => {
+                    eprintln!("  warning: vector search failed, falling back to text search only");
+                    warn!(%e, %query, candidate_limit, "vec_search failed, falling back to FTS only");
+                    Vec::new()
+                }
             }
-        },
+        }
         _ => Vec::new(),
     };
 
@@ -209,6 +236,36 @@ pub fn hybrid_search(
         })
         .collect();
     Ok(results)
+}
+
+fn append_tags_filter(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    tags: Option<&[&str]>,
+) {
+    if let Some(tags) = tags
+        && !tags.is_empty()
+    {
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM json_each(p.tags) jt WHERE jt.value IN ({}))",
+            super::anon_placeholders(tags.len())
+        ));
+        for &tag in tags {
+            params.push(Box::new(tag.to_string()));
+        }
+    }
+}
+
+fn append_eq_filter(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    column: &str,
+    value: Option<&str>,
+) {
+    if let Some(v) = value {
+        sql.push_str(&format!(" AND {column} = ?"));
+        params.push(Box::new(v.to_string()));
+    }
 }
 
 fn apply_recency_boost(
@@ -452,7 +509,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
 
-        let hits = fts_search(db.conn(), "ガイド", 10).unwrap();
+        let hits = fts_search(db.conn(), "ガイド", 10, None, None, None).unwrap();
         assert!(!hits.is_empty());
         let post_nums: Vec<u32> = hits.iter().map(|h| h.post_number).collect();
         assert!(post_nums.contains(&3));
@@ -463,7 +520,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
 
-        let hits = fts_search(db.conn(), "認証", 10).unwrap();
+        let hits = fts_search(db.conn(), "認証", 10, None, None, None).unwrap();
         assert!(!hits.is_empty());
         let post_nums: Vec<u32> = hits.iter().map(|h| h.post_number).collect();
         assert!(post_nums.contains(&1) || post_nums.contains(&2));
@@ -474,7 +531,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
 
-        let hits = fts_search(db.conn(), "設", 10).unwrap();
+        let hits = fts_search(db.conn(), "設", 10, None, None, None).unwrap();
         assert!(!hits.is_empty());
     }
 
@@ -493,8 +550,17 @@ mod tests {
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
 
-        let results =
-            hybrid_search(db.conn(), "認証の仕組み", None, 10, chrono::Utc::now()).unwrap();
+        let results = hybrid_search(
+            db.conn(),
+            "認証の仕組み",
+            None,
+            10,
+            chrono::Utc::now(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!results.is_empty());
         assert_eq!(results[0].post_number, 1);
         assert!(!results[0].post_name.is_empty());
@@ -506,7 +572,17 @@ mod tests {
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
 
-        let results = hybrid_search(db.conn(), "", None, 10, chrono::Utc::now()).unwrap();
+        let results = hybrid_search(
+            db.conn(),
+            "",
+            None,
+            10,
+            chrono::Utc::now(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(results.is_empty());
     }
 
@@ -571,7 +647,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
 
-        fts_search(db.conn(), "認証、フロー", 10).unwrap();
+        fts_search(db.conn(), "認証、フロー", 10, None, None, None).unwrap();
     }
 
     #[test]
@@ -596,19 +672,19 @@ mod tests {
         }
 
         // C++ should match post 10 (+ is preserved, no rurico quoting issue)
-        let hits = fts_search(db.conn(), "C++", 10).unwrap();
+        let hits = fts_search(db.conn(), "C++", 10, None, None, None).unwrap();
         assert!(!hits.is_empty(), "C++ should match");
         assert!(hits.iter().any(|h| h.post_number == 10));
 
         // rate-limit → "rate limit" (- stripped). Both ≥3 chars, no vocab
         // expansion needed, so no single-element parenthesization issue.
-        let hits = fts_search(db.conn(), "rate-limit", 10).unwrap();
+        let hits = fts_search(db.conn(), "rate-limit", 10, None, None, None).unwrap();
         assert!(!hits.is_empty(), "rate-limit (split) should match");
         assert!(hits.iter().any(|h| h.post_number == 11));
 
         // std::io → "std io" (: stripped). "io" (2 chars) expands via vocab.
         // clean_for_trigram unwraps single-element parens for trigram compat.
-        let hits = fts_search(db.conn(), "std::io", 10).unwrap();
+        let hits = fts_search(db.conn(), "std::io", 10, None, None, None).unwrap();
         assert!(!hits.is_empty(), "std::io (split) should match");
         assert!(hits.iter().any(|h| h.post_number == 10));
     }
@@ -652,7 +728,8 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2025-02-01T00:00:00+00:00")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let results = hybrid_search(db.conn(), "認証の仕組み", None, 10, now).unwrap();
+        let results =
+            hybrid_search(db.conn(), "認証の仕組み", None, 10, now, None, None, None).unwrap();
         assert!(results.len() >= 2, "both posts should match");
 
         let score_a = results.iter().find(|r| r.post_number == 1).unwrap().score;
@@ -678,7 +755,8 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2025-02-01T00:00:00+00:00")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let results = hybrid_search(db.conn(), "認証の仕組み", None, 10, now).unwrap();
+        let results =
+            hybrid_search(db.conn(), "認証の仕組み", None, 10, now, None, None, None).unwrap();
 
         assert!(!results.is_empty(), "post should still be returned");
         assert!(
@@ -696,7 +774,7 @@ mod tests {
         storage::upsert_post(db.conn(), &post).unwrap();
         storage::rechunk_post(db.conn(), 1, body).unwrap();
 
-        let hits = fts_search(db.conn(), "フローの説明", 10).unwrap();
+        let hits = fts_search(db.conn(), "フローの説明", 10, None, None, None).unwrap();
         assert!(
             !hits.is_empty(),
             "[T-002] content-only term must still be found (regression)"
@@ -714,7 +792,7 @@ mod tests {
         let count = storage::rechunk_post(db.conn(), 1, body).unwrap();
         assert_eq!(count, 1, "[T-003] preamble should produce 1 chunk");
 
-        let hits = fts_search(db.conn(), "見出しなし", 10).unwrap();
+        let hits = fts_search(db.conn(), "見出しなし", 10, None, None, None).unwrap();
         assert!(
             !hits.is_empty(),
             "[T-003] preamble chunk should be searchable by content"
@@ -734,7 +812,7 @@ mod tests {
         storage::upsert_post(db.conn(), &post).unwrap();
         storage::rechunk_post(db.conn(), 1, body).unwrap();
 
-        let hits = fts_search(db.conn(), "認証ガイド", 10).unwrap();
+        let hits = fts_search(db.conn(), "認証ガイド", 10, None, None, None).unwrap();
         assert!(
             !hits.is_empty(),
             "[T-001] section_title-only term should be found via FTS"
@@ -758,19 +836,19 @@ mod tests {
         storage::rechunk_post(db.conn(), 1, &enriched).unwrap();
 
         // Post name
-        let hits = fts_search(db.conn(), "Daily振り返り", 10).unwrap();
+        let hits = fts_search(db.conn(), "Daily振り返り", 10, None, None, None).unwrap();
         assert!(!hits.is_empty(), "post name should be searchable");
 
         // Author
-        let hits = fts_search(db.conn(), "thkt", 10).unwrap();
+        let hits = fts_search(db.conn(), "thkt", 10, None, None, None).unwrap();
         assert!(!hits.is_empty(), "author should be searchable");
 
         // Category
-        let hits = fts_search(db.conn(), "日報", 10).unwrap();
+        let hits = fts_search(db.conn(), "日報", 10, None, None, None).unwrap();
         assert!(!hits.is_empty(), "category/tag should be searchable");
 
         // Combined query (matching esa web search behavior)
-        let hits = fts_search(db.conn(), "Daily 振り返り thkt", 10).unwrap();
+        let hits = fts_search(db.conn(), "Daily 振り返り thkt", 10, None, None, None).unwrap();
         assert!(
             !hits.is_empty(),
             "combined name + author query should match"
@@ -840,8 +918,17 @@ mod tests {
         storage::add_chunked_embeddings(db.conn(), &embeddings).unwrap();
 
         let query_emb = vec![0.1; EMBEDDING_DIMS];
-        let results =
-            hybrid_search(db.conn(), "認証", Some(&query_emb), 10, chrono::Utc::now()).unwrap();
+        let results = hybrid_search(
+            db.conn(),
+            "認証",
+            Some(&query_emb),
+            10,
+            chrono::Utc::now(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(!results.is_empty());
         assert!(!results[0].post_name.is_empty());
         assert!(!results[0].post_url.is_empty());
@@ -877,8 +964,17 @@ mod tests {
         let mut query_emb = vec![0.01_f32; EMBEDDING_DIMS];
         query_emb[0] = 1.0;
 
-        let results =
-            hybrid_search(db.conn(), "認証", Some(&query_emb), 10, chrono::Utc::now()).unwrap();
+        let results = hybrid_search(
+            db.conn(),
+            "認証",
+            Some(&query_emb),
+            10,
+            chrono::Utc::now(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(results.len() >= 2, "expected at least 2 results");
 
         // First result should come from the chunk with the closest embedding
@@ -930,8 +1026,17 @@ mod tests {
         let mut query_emb = vec![0.01_f32; EMBEDDING_DIMS];
         query_emb[0] = 1.0;
 
-        let results =
-            hybrid_search(db.conn(), "認証", Some(&query_emb), 10, chrono::Utc::now()).unwrap();
+        let results = hybrid_search(
+            db.conn(),
+            "認証",
+            Some(&query_emb),
+            10,
+            chrono::Utc::now(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
         assert!(
             !results.is_empty(),
             "should have results with multi-sub embeddings"
@@ -993,12 +1098,142 @@ mod tests {
         let mut query = vec![0.0f32; EMBEDDING_DIMS];
         query[0] = 1.0;
 
-        let hits = vec_search(db.conn(), &query, 1).unwrap();
+        let hits = vec_search(db.conn(), &query, 1, None, None, None).unwrap();
         assert_eq!(hits.len(), 1, "[TC-004] should return exactly one hit");
         assert!(
             hits[0].distance < 0.1,
             "[TC-004] MaxSim must select sub_idx=1 (closer sub-embedding), got distance={}",
             hits[0].distance
+        );
+    }
+
+    #[test]
+    fn fts_filter_category_narrows_results() {
+        let db = Db::open_memory().unwrap();
+
+        let mut post1 = storage::test_post_row(1);
+        post1.body_md = "# 認証フロー\n認証の仕組みを説明します".into();
+        post1.category = Some("backend".into());
+        storage::upsert_post(db.conn(), &post1).unwrap();
+        storage::rechunk_post(db.conn(), 1, &post1.body_md).unwrap();
+
+        let mut post2 = storage::test_post_row(2);
+        post2.body_md = "# 認証フロー\n認証の実装".into();
+        post2.category = Some("frontend".into());
+        storage::upsert_post(db.conn(), &post2).unwrap();
+        storage::rechunk_post(db.conn(), 2, &post2.body_md).unwrap();
+
+        let hits = fts_search(db.conn(), "認証", 10, None, Some("backend"), None).unwrap();
+        assert!(!hits.is_empty(), "category filter should return results");
+        assert!(
+            hits.iter().all(|h| h.post_number == 1),
+            "category=backend should only match post 1"
+        );
+    }
+
+    #[test]
+    fn fts_filter_created_by_narrows_results() {
+        let db = Db::open_memory().unwrap();
+
+        let mut post1 = storage::test_post_row(1);
+        post1.body_md = "# 認証フロー\n認証の仕組みを説明します".into();
+        post1.created_by = "alice".into();
+        storage::upsert_post(db.conn(), &post1).unwrap();
+        storage::rechunk_post(db.conn(), 1, &post1.body_md).unwrap();
+
+        let mut post2 = storage::test_post_row(2);
+        post2.body_md = "# 認証フロー\n認証の実装".into();
+        post2.created_by = "bob".into();
+        storage::upsert_post(db.conn(), &post2).unwrap();
+        storage::rechunk_post(db.conn(), 2, &post2.body_md).unwrap();
+
+        let hits = fts_search(db.conn(), "認証", 10, None, None, Some("alice")).unwrap();
+        assert!(!hits.is_empty(), "created_by filter should return results");
+        assert!(
+            hits.iter().all(|h| h.post_number == 1),
+            "created_by=alice should only match post 1"
+        );
+    }
+
+    #[test]
+    fn fts_filter_tags_narrows_results() {
+        let db = Db::open_memory().unwrap();
+
+        let mut post1 = storage::test_post_row(1);
+        post1.body_md = "# 認証フロー\n認証の仕組みを説明します".into();
+        post1.tags = vec!["security".into(), "auth".into()];
+        storage::upsert_post(db.conn(), &post1).unwrap();
+        storage::rechunk_post(db.conn(), 1, &post1.body_md).unwrap();
+
+        let mut post2 = storage::test_post_row(2);
+        post2.body_md = "# 認証フロー\n認証の実装".into();
+        post2.tags = vec!["frontend".into()];
+        storage::upsert_post(db.conn(), &post2).unwrap();
+        storage::rechunk_post(db.conn(), 2, &post2.body_md).unwrap();
+
+        let hits = fts_search(db.conn(), "認証", 10, Some(&["security"]), None, None).unwrap();
+        assert!(!hits.is_empty(), "tags filter should return results");
+        assert!(
+            hits.iter().all(|h| h.post_number == 1),
+            "tags=[security] should only match post 1"
+        );
+    }
+
+    #[test]
+    fn fts_filter_all_none_returns_all_matching() {
+        let db = Db::open_memory().unwrap();
+        setup_db_with_posts(&db);
+
+        let hits = fts_search(db.conn(), "認証", 10, None, None, None).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "no filters should return all matching posts"
+        );
+    }
+
+    #[test]
+    fn fts_filter_empty_tags_returns_all_matching() {
+        let db = Db::open_memory().unwrap();
+        setup_db_with_posts(&db);
+
+        let hits = fts_search(db.conn(), "認証", 10, Some(&[]), None, None).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "empty tags slice should not filter anything"
+        );
+    }
+
+    #[test]
+    fn hybrid_search_filter_category_narrows_results() {
+        let db = Db::open_memory().unwrap();
+
+        let mut post1 = storage::test_post_row(1);
+        post1.body_md = "# 認証フロー\n認証の仕組みを説明します".into();
+        post1.category = Some("backend".into());
+        storage::upsert_post(db.conn(), &post1).unwrap();
+        storage::rechunk_post(db.conn(), 1, &post1.body_md).unwrap();
+
+        let mut post2 = storage::test_post_row(2);
+        post2.body_md = "# 認証フロー\n認証の実装".into();
+        post2.category = Some("frontend".into());
+        storage::upsert_post(db.conn(), &post2).unwrap();
+        storage::rechunk_post(db.conn(), 2, &post2.body_md).unwrap();
+
+        let results = hybrid_search(
+            db.conn(),
+            "認証の仕組み",
+            None,
+            10,
+            chrono::Utc::now(),
+            None,
+            Some("backend"),
+            None,
+        )
+        .unwrap();
+        assert!(!results.is_empty(), "category filter should return results");
+        assert!(
+            results.iter().all(|r| r.post_number == 1),
+            "category=backend should only match post 1"
         );
     }
 }

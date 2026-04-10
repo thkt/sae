@@ -23,6 +23,12 @@ pub(crate) fn in_placeholders(len: usize) -> String {
         .join(", ")
 }
 
+// Use when multiple IN clauses share a parameter list: unnamed `?` avoids
+// index collisions that numbered `?N` would cause when params are appended incrementally.
+pub(crate) fn anon_placeholders(n: usize) -> String {
+    vec!["?"; n].join(", ")
+}
+
 pub(crate) fn as_sql_params<T: rusqlite::types::ToSql>(
     values: &[T],
 ) -> Vec<&dyn rusqlite::types::ToSql> {
