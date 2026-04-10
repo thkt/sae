@@ -29,6 +29,8 @@ pub struct SearchFilter<'a> {
     pub tags: Option<&'a [&'a str]>,
     pub category: Option<&'a str>,
     pub created_by: Option<&'a str>,
+    pub updated_after: Option<chrono::DateTime<chrono::Utc>>,
+    pub updated_before: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 pub fn fts_search(
@@ -59,6 +61,8 @@ pub fn fts_search(
     append_tags_filter(&mut sql, &mut params, filter.tags);
     append_eq_filter(&mut sql, &mut params, "p.category", filter.category);
     append_eq_filter(&mut sql, &mut params, "p.created_by", filter.created_by);
+    append_date_filter(&mut sql, &mut params, false, filter.updated_after);
+    append_date_filter(&mut sql, &mut params, true, filter.updated_before);
     sql.push_str(" ORDER BY f.rank LIMIT ?");
     params.push(Box::new(limit));
 
@@ -135,6 +139,8 @@ pub fn vec_search(
     append_tags_filter(&mut sql, &mut params, filter.tags);
     append_eq_filter(&mut sql, &mut params, "p.category", filter.category);
     append_eq_filter(&mut sql, &mut params, "p.created_by", filter.created_by);
+    append_date_filter(&mut sql, &mut params, false, filter.updated_after);
+    append_date_filter(&mut sql, &mut params, true, filter.updated_before);
 
     let mut stmt2 = conn.prepare(&sql)?;
     let meta: HashMap<i64, (u32, Option<String>, String)> = stmt2
@@ -322,6 +328,30 @@ fn append_eq_filter(
         sql.push_str(&format!(" AND {column} = ?"));
         params.push(Box::new(v.to_string()));
     }
+}
+
+fn append_date_filter(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
+    before: bool,
+    value: Option<chrono::DateTime<chrono::Utc>>,
+) {
+    let Some(dt) = value else { return };
+    // For `before`, advance one day and use `<` so the boundary day is fully
+    // included ("2025-01-15T23:59:59+09:00" < "2025-01-16" is TRUE).
+    let (op, date_str) = if before {
+        let next = dt
+            .date_naive()
+            .succ_opt()
+            .unwrap_or(dt.date_naive())
+            .format("%Y-%m-%d")
+            .to_string();
+        ("<", next)
+    } else {
+        (">=", dt.format("%Y-%m-%d").to_string())
+    };
+    sql.push_str(&format!(" AND p.updated_at {op} ?"));
+    params.push(Box::new(date_str));
 }
 
 fn apply_recency_boost(
@@ -1348,6 +1378,117 @@ mod tests {
             results.iter().all(|r| r.post_number == 1),
             "category=backend should only match post 1"
         );
+    }
+
+    fn test_post_dated(number: u32, updated_at: &str) -> storage::EsaPostRow {
+        let mut row = storage::test_post_row(number);
+        row.name = format!("ガイド {number}");
+        row.full_name = format!("dev/ガイド{number}");
+        row.body_md = "# ガイド\n設定方法を解説".to_string();
+        row.updated_at = updated_at.to_string();
+        row
+    }
+
+    fn setup_db_with_dated_posts(db: &Db) {
+        // post 1: 2025-01-10 (old)
+        // post 2: 2025-06-15 (new)
+        for (num, date) in [
+            (1u32, "2025-01-10T00:00:00+00:00"),
+            (2, "2025-06-15T00:00:00+00:00"),
+        ] {
+            let post = test_post_dated(num, date);
+            storage::upsert_post(db.conn(), &post).unwrap();
+            storage::rechunk_post(db.conn(), num, &post.body_md).unwrap();
+        }
+    }
+
+    fn date_utc(s: &str) -> chrono::DateTime<chrono::Utc> {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .unwrap()
+            .and_hms_opt(0, 0, 0)
+            .unwrap()
+            .and_utc()
+    }
+
+    // TC-056: updated_after filters out posts with updated_at before threshold
+    #[test]
+    fn hybrid_search_updated_after_excludes_old_posts() {
+        let db = Db::open_memory().unwrap();
+        setup_db_with_dated_posts(&db);
+
+        let filter = SearchFilter {
+            updated_after: Some(date_utc("2025-03-01")),
+            ..Default::default()
+        };
+        let results = hybrid_search(
+            db.conn(),
+            "ガイド",
+            None,
+            10,
+            chrono::Utc::now(),
+            &filter,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1, "only the newer post should be returned");
+        assert_eq!(results[0].post_number, 2);
+    }
+
+    // TC-057: updated_before filters out posts with updated_at after threshold
+    #[test]
+    fn hybrid_search_updated_before_excludes_new_posts() {
+        let db = Db::open_memory().unwrap();
+        setup_db_with_dated_posts(&db);
+
+        let filter = SearchFilter {
+            updated_before: Some(date_utc("2025-03-01")),
+            ..Default::default()
+        };
+        let results = hybrid_search(
+            db.conn(),
+            "ガイド",
+            None,
+            10,
+            chrono::Utc::now(),
+            &filter,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(results.len(), 1, "only the older post should be returned");
+        assert_eq!(results[0].post_number, 1);
+    }
+
+    // TC-058: updated_after and updated_before combined apply AND condition
+    #[test]
+    fn hybrid_search_date_range_returns_matching_posts_only() {
+        let db = Db::open_memory().unwrap();
+        setup_db_with_dated_posts(&db);
+
+        // Range that covers only post 1 (2025-01-10)
+        let filter = SearchFilter {
+            updated_after: Some(date_utc("2025-01-01")),
+            updated_before: Some(date_utc("2025-03-01")),
+            ..Default::default()
+        };
+        let results = hybrid_search(
+            db.conn(),
+            "ガイド",
+            None,
+            10,
+            chrono::Utc::now(),
+            &filter,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            results.len(),
+            1,
+            "range 2025-01-01..2025-03-01 should include only post 1"
+        );
+        assert_eq!(results[0].post_number, 1);
     }
 
     // TC-044: hybrid_search with MockReranker applies cross-encoder scores to results

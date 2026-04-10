@@ -19,8 +19,12 @@ pub(crate) fn run_search(
     query: &str,
     team: Option<&str>,
     limit: u32,
+    after: Option<&str>,
+    before: Option<&str>,
     json: bool,
 ) -> Result<String, SaeError> {
+    let updated_after = parse_date_arg(after, "after")?;
+    let updated_before = parse_date_arg(before, "before")?;
     let team = config.resolve_team(team)?;
     let db = require_db(config, team)?;
     let embedder = try_load_embedder();
@@ -66,13 +70,18 @@ pub(crate) fn run_search(
         .as_ref()
         .and_then(|r| r.as_ref())
         .map(|b| b.as_ref() as &dyn Rerank);
+    let filter = sae::storage::SearchFilter {
+        updated_after,
+        updated_before,
+        ..Default::default()
+    };
     let results = sae::storage::hybrid_search(
         db.conn(),
         query,
         query_embedding.as_deref(),
         limit,
         chrono::Utc::now(),
-        &sae::storage::SearchFilter::default(),
+        &filter,
         reranker_ref,
     )?;
     let semantic = query_embedding.is_some();
@@ -128,6 +137,21 @@ fn spawn_background_harvest(team: &str) {
     {
         tracing::debug!(error = %e, "background harvest spawn failed");
     }
+}
+
+fn parse_date_arg(
+    s: Option<&str>,
+    flag: &str,
+) -> Result<Option<chrono::DateTime<chrono::Utc>>, SaeError> {
+    let Some(s) = s else {
+        return Ok(None);
+    };
+    let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
+        SaeError::Input(format!(
+            "Invalid date '--{flag} {s}': expected YYYY-MM-DD (e.g. 2025-01-01)"
+        ))
+    })?;
+    Ok(Some(date.and_hms_opt(0, 0, 0).unwrap().and_utc()))
 }
 
 pub(crate) fn resolve_search_query(query: Option<String>) -> Result<String, SaeError> {
@@ -386,6 +410,36 @@ mod tests {
         assert!(
             msg.contains("Pass QUERY"),
             "error should include placeholder: {err}"
+        );
+    }
+
+    // TC-059: parse_date_arg returns None when no value provided
+    #[test]
+    fn parse_date_arg_returns_none_when_absent() {
+        assert!(parse_date_arg(None, "after").unwrap().is_none());
+    }
+
+    // TC-060: parse_date_arg parses valid YYYY-MM-DD into DateTime<Utc>
+    #[test]
+    fn parse_date_arg_parses_valid_date() {
+        let dt = parse_date_arg(Some("2025-06-30"), "after")
+            .unwrap()
+            .unwrap();
+        assert_eq!(dt.format("%Y-%m-%d").to_string(), "2025-06-30");
+    }
+
+    // TC-061: parse_date_arg returns Input error for non-ISO8601 date
+    #[test]
+    fn parse_date_arg_rejects_invalid_date() {
+        let err = parse_date_arg(Some("30/06/2025"), "after").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("Invalid date"),
+            "error should describe the problem: {msg}"
+        );
+        assert!(
+            msg.contains("YYYY-MM-DD"),
+            "error should show expected format: {msg}"
         );
     }
 }
