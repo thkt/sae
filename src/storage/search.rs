@@ -15,13 +15,18 @@ pub struct SearchResult {
     pub score: f64,
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct SearchFilter<'a> {
+    pub tags: Option<&'a [&'a str]>,
+    pub category: Option<&'a str>,
+    pub created_by: Option<&'a str>,
+}
+
 pub fn fts_search(
     conn: &Connection,
     query: &str,
     limit: u32,
-    tags: Option<&[&str]>,
-    category: Option<&str>,
-    created_by: Option<&str>,
+    filter: &SearchFilter<'_>,
 ) -> Result<Vec<FtsHit>, StorageError> {
     let normalized = normalize_punctuation(query);
     let matched = match rurico::storage::prepare_match_query(conn, &normalized) {
@@ -42,9 +47,9 @@ pub fn fts_search(
     );
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(match_query)];
 
-    append_tags_filter(&mut sql, &mut params, tags);
-    append_eq_filter(&mut sql, &mut params, "p.category", category);
-    append_eq_filter(&mut sql, &mut params, "p.created_by", created_by);
+    append_tags_filter(&mut sql, &mut params, filter.tags);
+    append_eq_filter(&mut sql, &mut params, "p.category", filter.category);
+    append_eq_filter(&mut sql, &mut params, "p.created_by", filter.created_by);
     sql.push_str(" ORDER BY f.rank LIMIT ?");
     params.push(Box::new(limit));
 
@@ -70,9 +75,7 @@ pub fn vec_search(
     conn: &Connection,
     query_embedding: &[f32],
     limit: u32,
-    tags: Option<&[&str]>,
-    category: Option<&str>,
-    created_by: Option<&str>,
+    filter: &SearchFilter<'_>,
 ) -> Result<Vec<VecHit>, StorageError> {
     let bytes: &[u8] = rurico::storage::f32_as_bytes(query_embedding);
     let oversample = limit.saturating_mul(VEC_MAXSIM_OVERSAMPLE);
@@ -120,9 +123,9 @@ pub fn vec_search(
         .iter()
         .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
         .collect();
-    append_tags_filter(&mut sql, &mut params, tags);
-    append_eq_filter(&mut sql, &mut params, "p.category", category);
-    append_eq_filter(&mut sql, &mut params, "p.created_by", created_by);
+    append_tags_filter(&mut sql, &mut params, filter.tags);
+    append_eq_filter(&mut sql, &mut params, "p.category", filter.category);
+    append_eq_filter(&mut sql, &mut params, "p.created_by", filter.created_by);
 
     let mut stmt2 = conn.prepare(&sql)?;
     let meta: HashMap<i64, (u32, Option<String>, String)> = stmt2
@@ -169,17 +172,15 @@ pub fn hybrid_search(
     query_embedding: Option<&[f32]>,
     limit: u32,
     now: chrono::DateTime<chrono::Utc>,
-    tags: Option<&[&str]>,
-    category: Option<&str>,
-    created_by: Option<&str>,
+    filter: &SearchFilter<'_>,
 ) -> Result<Vec<SearchResult>, StorageError> {
     let candidate_limit = limit * 3;
 
-    let fts_hits = fts_search(conn, query, candidate_limit, tags, category, created_by)?;
+    let fts_hits = fts_search(conn, query, candidate_limit, filter)?;
 
     let vec_hits = match query_embedding {
         Some(emb) if super::has_embeddings(conn) => {
-            match vec_search(conn, emb, candidate_limit, tags, category, created_by) {
+            match vec_search(conn, emb, candidate_limit, filter) {
                 Ok(hits) => hits,
                 Err(e) => {
                     eprintln!("  warning: vector search failed, falling back to text search only");
@@ -509,7 +510,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
 
-        let hits = fts_search(db.conn(), "ガイド", 10, None, None, None).unwrap();
+        let hits = fts_search(db.conn(), "ガイド", 10, &SearchFilter::default()).unwrap();
         assert!(!hits.is_empty());
         let post_nums: Vec<u32> = hits.iter().map(|h| h.post_number).collect();
         assert!(post_nums.contains(&3));
@@ -520,7 +521,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
 
-        let hits = fts_search(db.conn(), "認証", 10, None, None, None).unwrap();
+        let hits = fts_search(db.conn(), "認証", 10, &SearchFilter::default()).unwrap();
         assert!(!hits.is_empty());
         let post_nums: Vec<u32> = hits.iter().map(|h| h.post_number).collect();
         assert!(post_nums.contains(&1) || post_nums.contains(&2));
@@ -531,7 +532,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
 
-        let hits = fts_search(db.conn(), "設", 10, None, None, None).unwrap();
+        let hits = fts_search(db.conn(), "設", 10, &SearchFilter::default()).unwrap();
         assert!(!hits.is_empty());
     }
 
@@ -556,9 +557,7 @@ mod tests {
             None,
             10,
             chrono::Utc::now(),
-            None,
-            None,
-            None,
+            &SearchFilter::default(),
         )
         .unwrap();
         assert!(!results.is_empty());
@@ -578,9 +577,7 @@ mod tests {
             None,
             10,
             chrono::Utc::now(),
-            None,
-            None,
-            None,
+            &SearchFilter::default(),
         )
         .unwrap();
         assert!(results.is_empty());
@@ -647,7 +644,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
 
-        fts_search(db.conn(), "認証、フロー", 10, None, None, None).unwrap();
+        fts_search(db.conn(), "認証、フロー", 10, &SearchFilter::default()).unwrap();
     }
 
     #[test]
@@ -672,19 +669,19 @@ mod tests {
         }
 
         // C++ should match post 10 (+ is preserved, no rurico quoting issue)
-        let hits = fts_search(db.conn(), "C++", 10, None, None, None).unwrap();
+        let hits = fts_search(db.conn(), "C++", 10, &SearchFilter::default()).unwrap();
         assert!(!hits.is_empty(), "C++ should match");
         assert!(hits.iter().any(|h| h.post_number == 10));
 
         // rate-limit → "rate limit" (- stripped). Both ≥3 chars, no vocab
         // expansion needed, so no single-element parenthesization issue.
-        let hits = fts_search(db.conn(), "rate-limit", 10, None, None, None).unwrap();
+        let hits = fts_search(db.conn(), "rate-limit", 10, &SearchFilter::default()).unwrap();
         assert!(!hits.is_empty(), "rate-limit (split) should match");
         assert!(hits.iter().any(|h| h.post_number == 11));
 
         // std::io → "std io" (: stripped). "io" (2 chars) expands via vocab.
         // clean_for_trigram unwraps single-element parens for trigram compat.
-        let hits = fts_search(db.conn(), "std::io", 10, None, None, None).unwrap();
+        let hits = fts_search(db.conn(), "std::io", 10, &SearchFilter::default()).unwrap();
         assert!(!hits.is_empty(), "std::io (split) should match");
         assert!(hits.iter().any(|h| h.post_number == 10));
     }
@@ -728,8 +725,15 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2025-02-01T00:00:00+00:00")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let results =
-            hybrid_search(db.conn(), "認証の仕組み", None, 10, now, None, None, None).unwrap();
+        let results = hybrid_search(
+            db.conn(),
+            "認証の仕組み",
+            None,
+            10,
+            now,
+            &SearchFilter::default(),
+        )
+        .unwrap();
         assert!(results.len() >= 2, "both posts should match");
 
         let score_a = results.iter().find(|r| r.post_number == 1).unwrap().score;
@@ -755,8 +759,15 @@ mod tests {
         let now = chrono::DateTime::parse_from_rfc3339("2025-02-01T00:00:00+00:00")
             .unwrap()
             .with_timezone(&chrono::Utc);
-        let results =
-            hybrid_search(db.conn(), "認証の仕組み", None, 10, now, None, None, None).unwrap();
+        let results = hybrid_search(
+            db.conn(),
+            "認証の仕組み",
+            None,
+            10,
+            now,
+            &SearchFilter::default(),
+        )
+        .unwrap();
 
         assert!(!results.is_empty(), "post should still be returned");
         assert!(
@@ -774,7 +785,7 @@ mod tests {
         storage::upsert_post(db.conn(), &post).unwrap();
         storage::rechunk_post(db.conn(), 1, body).unwrap();
 
-        let hits = fts_search(db.conn(), "フローの説明", 10, None, None, None).unwrap();
+        let hits = fts_search(db.conn(), "フローの説明", 10, &SearchFilter::default()).unwrap();
         assert!(
             !hits.is_empty(),
             "[T-002] content-only term must still be found (regression)"
@@ -792,7 +803,7 @@ mod tests {
         let count = storage::rechunk_post(db.conn(), 1, body).unwrap();
         assert_eq!(count, 1, "[T-003] preamble should produce 1 chunk");
 
-        let hits = fts_search(db.conn(), "見出しなし", 10, None, None, None).unwrap();
+        let hits = fts_search(db.conn(), "見出しなし", 10, &SearchFilter::default()).unwrap();
         assert!(
             !hits.is_empty(),
             "[T-003] preamble chunk should be searchable by content"
@@ -812,7 +823,7 @@ mod tests {
         storage::upsert_post(db.conn(), &post).unwrap();
         storage::rechunk_post(db.conn(), 1, body).unwrap();
 
-        let hits = fts_search(db.conn(), "認証ガイド", 10, None, None, None).unwrap();
+        let hits = fts_search(db.conn(), "認証ガイド", 10, &SearchFilter::default()).unwrap();
         assert!(
             !hits.is_empty(),
             "[T-001] section_title-only term should be found via FTS"
@@ -836,19 +847,25 @@ mod tests {
         storage::rechunk_post(db.conn(), 1, &enriched).unwrap();
 
         // Post name
-        let hits = fts_search(db.conn(), "Daily振り返り", 10, None, None, None).unwrap();
+        let hits = fts_search(db.conn(), "Daily振り返り", 10, &SearchFilter::default()).unwrap();
         assert!(!hits.is_empty(), "post name should be searchable");
 
         // Author
-        let hits = fts_search(db.conn(), "thkt", 10, None, None, None).unwrap();
+        let hits = fts_search(db.conn(), "thkt", 10, &SearchFilter::default()).unwrap();
         assert!(!hits.is_empty(), "author should be searchable");
 
         // Category
-        let hits = fts_search(db.conn(), "日報", 10, None, None, None).unwrap();
+        let hits = fts_search(db.conn(), "日報", 10, &SearchFilter::default()).unwrap();
         assert!(!hits.is_empty(), "category/tag should be searchable");
 
         // Combined query (matching esa web search behavior)
-        let hits = fts_search(db.conn(), "Daily 振り返り thkt", 10, None, None, None).unwrap();
+        let hits = fts_search(
+            db.conn(),
+            "Daily 振り返り thkt",
+            10,
+            &SearchFilter::default(),
+        )
+        .unwrap();
         assert!(
             !hits.is_empty(),
             "combined name + author query should match"
@@ -924,9 +941,7 @@ mod tests {
             Some(&query_emb),
             10,
             chrono::Utc::now(),
-            None,
-            None,
-            None,
+            &SearchFilter::default(),
         )
         .unwrap();
         assert!(!results.is_empty());
@@ -970,9 +985,7 @@ mod tests {
             Some(&query_emb),
             10,
             chrono::Utc::now(),
-            None,
-            None,
-            None,
+            &SearchFilter::default(),
         )
         .unwrap();
         assert!(results.len() >= 2, "expected at least 2 results");
@@ -1032,9 +1045,7 @@ mod tests {
             Some(&query_emb),
             10,
             chrono::Utc::now(),
-            None,
-            None,
-            None,
+            &SearchFilter::default(),
         )
         .unwrap();
         assert!(
@@ -1098,7 +1109,7 @@ mod tests {
         let mut query = vec![0.0f32; EMBEDDING_DIMS];
         query[0] = 1.0;
 
-        let hits = vec_search(db.conn(), &query, 1, None, None, None).unwrap();
+        let hits = vec_search(db.conn(), &query, 1, &SearchFilter::default()).unwrap();
         assert_eq!(hits.len(), 1, "[TC-004] should return exactly one hit");
         assert!(
             hits[0].distance < 0.1,
@@ -1123,7 +1134,16 @@ mod tests {
         storage::upsert_post(db.conn(), &post2).unwrap();
         storage::rechunk_post(db.conn(), 2, &post2.body_md).unwrap();
 
-        let hits = fts_search(db.conn(), "認証", 10, None, Some("backend"), None).unwrap();
+        let hits = fts_search(
+            db.conn(),
+            "認証",
+            10,
+            &SearchFilter {
+                category: Some("backend"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(!hits.is_empty(), "category filter should return results");
         assert!(
             hits.iter().all(|h| h.post_number == 1),
@@ -1147,7 +1167,16 @@ mod tests {
         storage::upsert_post(db.conn(), &post2).unwrap();
         storage::rechunk_post(db.conn(), 2, &post2.body_md).unwrap();
 
-        let hits = fts_search(db.conn(), "認証", 10, None, None, Some("alice")).unwrap();
+        let hits = fts_search(
+            db.conn(),
+            "認証",
+            10,
+            &SearchFilter {
+                created_by: Some("alice"),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(!hits.is_empty(), "created_by filter should return results");
         assert!(
             hits.iter().all(|h| h.post_number == 1),
@@ -1171,7 +1200,16 @@ mod tests {
         storage::upsert_post(db.conn(), &post2).unwrap();
         storage::rechunk_post(db.conn(), 2, &post2.body_md).unwrap();
 
-        let hits = fts_search(db.conn(), "認証", 10, Some(&["security"]), None, None).unwrap();
+        let hits = fts_search(
+            db.conn(),
+            "認証",
+            10,
+            &SearchFilter {
+                tags: Some(&["security"]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(!hits.is_empty(), "tags filter should return results");
         assert!(
             hits.iter().all(|h| h.post_number == 1),
@@ -1184,7 +1222,7 @@ mod tests {
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
 
-        let hits = fts_search(db.conn(), "認証", 10, None, None, None).unwrap();
+        let hits = fts_search(db.conn(), "認証", 10, &SearchFilter::default()).unwrap();
         assert!(
             !hits.is_empty(),
             "no filters should return all matching posts"
@@ -1196,7 +1234,16 @@ mod tests {
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
 
-        let hits = fts_search(db.conn(), "認証", 10, Some(&[]), None, None).unwrap();
+        let hits = fts_search(
+            db.conn(),
+            "認証",
+            10,
+            &SearchFilter {
+                tags: Some(&[]),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         assert!(
             !hits.is_empty(),
             "empty tags slice should not filter anything"
@@ -1225,9 +1272,10 @@ mod tests {
             None,
             10,
             chrono::Utc::now(),
-            None,
-            Some("backend"),
-            None,
+            &SearchFilter {
+                category: Some("backend"),
+                ..Default::default()
+            },
         )
         .unwrap();
         assert!(!results.is_empty(), "category filter should return results");

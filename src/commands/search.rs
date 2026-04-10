@@ -59,9 +59,7 @@ pub(crate) fn run_search(
         query_embedding.as_deref(),
         limit,
         chrono::Utc::now(),
-        None,
-        None,
-        None,
+        &sae::storage::SearchFilter::default(),
     )?;
     let semantic = query_embedding.is_some();
     let output = crate::output::search(&results, query, json, semantic, embed_info, team)?;
