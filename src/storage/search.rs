@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use rurico::reranker::Rerank;
 use rusqlite::Connection;
 use tracing::warn;
 
@@ -180,8 +181,13 @@ pub fn hybrid_search(
     limit: u32,
     now: chrono::DateTime<chrono::Utc>,
     filter: &SearchFilter<'_>,
+    reranker: Option<&dyn Rerank>,
 ) -> Result<Vec<SearchResult>, StorageError> {
-    let candidate_limit = limit * 3;
+    let candidate_limit = if reranker.is_some() {
+        limit * 4
+    } else {
+        limit * 3
+    };
 
     let fts_hits = fts_search(conn, query, candidate_limit, filter)?;
 
@@ -207,10 +213,49 @@ pub fn hybrid_search(
     let candidate_numbers: Vec<u32> = merged.iter().map(|(pn, _)| *pn).collect();
     let post_meta = batch_fetch_post_meta(conn, &candidate_numbers)?;
 
-    let fts_map: HashMap<u32, &FtsHit> = fts_hits.iter().map(|h| (h.post_number, h)).collect();
-    let vec_map: HashMap<u32, &VecHit> = vec_hits.iter().map(|h| (h.post_number, h)).collect();
+    // P1: keep the first (highest-ranked) chunk per post so the reranker sees
+    // the most relevant content, not whichever chunk happened to be last.
+    let mut fts_map: HashMap<u32, &FtsHit> = HashMap::new();
+    for h in &fts_hits {
+        fts_map.entry(h.post_number).or_insert(h);
+    }
+    let mut vec_map: HashMap<u32, &VecHit> = HashMap::new();
+    for h in &vec_hits {
+        vec_map.entry(h.post_number).or_insert(h);
+    }
 
-    let scored = apply_recency_boost(merged, &post_meta, now);
+    // P2: apply recency boost in every path so it is never discarded.
+    // When the cross-encoder is active it re-scores first, then recency
+    // is added on top; the fallback and no-reranker paths behave as before.
+    let scored = if let Some(ranker) = reranker {
+        let pairs: Vec<(&str, &str)> = merged
+            .iter()
+            .map(|(pn, _)| {
+                let content = fts_map
+                    .get(pn)
+                    .map(|h| h.content.as_str())
+                    .or_else(|| vec_map.get(pn).map(|h| h.content.as_str()))
+                    .unwrap_or("");
+                (query, content)
+            })
+            .collect();
+        match ranker.score_batch(&pairs) {
+            Ok(scores) => {
+                let cross_scored: Vec<(u32, f64)> = merged
+                    .into_iter()
+                    .zip(scores)
+                    .map(|((pn, _), s)| (pn, s as f64))
+                    .collect();
+                apply_recency_boost(cross_scored, &post_meta, now)
+            }
+            Err(e) => {
+                warn!(%e, "cross-encoder reranking failed, keeping heuristic order");
+                apply_recency_boost(merged, &post_meta, now)
+            }
+        }
+    } else {
+        apply_recency_boost(merged, &post_meta, now)
+    };
 
     let results = scored
         .into_iter()
@@ -568,6 +613,7 @@ mod tests {
             10,
             chrono::Utc::now(),
             &SearchFilter::default(),
+            None,
         )
         .unwrap();
         assert!(!results.is_empty());
@@ -588,6 +634,7 @@ mod tests {
             10,
             chrono::Utc::now(),
             &SearchFilter::default(),
+            None,
         )
         .unwrap();
         assert!(results.is_empty());
@@ -742,6 +789,7 @@ mod tests {
             10,
             now,
             &SearchFilter::default(),
+            None,
         )
         .unwrap();
         assert!(results.len() >= 2, "both posts should match");
@@ -776,6 +824,7 @@ mod tests {
             10,
             now,
             &SearchFilter::default(),
+            None,
         )
         .unwrap();
 
@@ -954,6 +1003,7 @@ mod tests {
             10,
             chrono::Utc::now(),
             &SearchFilter::default(),
+            None,
         )
         .unwrap();
         assert!(!results.is_empty());
@@ -998,6 +1048,7 @@ mod tests {
             10,
             chrono::Utc::now(),
             &SearchFilter::default(),
+            None,
         )
         .unwrap();
         assert!(results.len() >= 2, "expected at least 2 results");
@@ -1058,6 +1109,7 @@ mod tests {
             10,
             chrono::Utc::now(),
             &SearchFilter::default(),
+            None,
         )
         .unwrap();
         assert!(
@@ -1288,6 +1340,7 @@ mod tests {
                 category: Some("backend"),
                 ..Default::default()
             },
+            None,
         )
         .unwrap();
         assert!(!results.is_empty(), "category filter should return results");
@@ -1295,5 +1348,34 @@ mod tests {
             results.iter().all(|r| r.post_number == 1),
             "category=backend should only match post 1"
         );
+    }
+
+    // TC-044: hybrid_search with MockReranker applies cross-encoder scores to results
+    #[test]
+    fn hybrid_search_reranker_applies_cross_encoder_scores() {
+        use rurico::reranker::MockReranker;
+
+        let db = Db::open_memory().unwrap();
+        setup_db_with_posts(&db);
+
+        let reranker = MockReranker::with_score(0.99);
+        let results = hybrid_search(
+            db.conn(),
+            "認証の仕組み",
+            None,
+            10,
+            chrono::Utc::now(),
+            &SearchFilter::default(),
+            Some(&reranker),
+        )
+        .unwrap();
+        assert!(!results.is_empty(), "reranker search should return results");
+        for r in &results {
+            assert!(
+                r.score >= 0.99,
+                "score should be cross-encoder (0.99) × recency boost (≥1.0); got {}",
+                r.score
+            );
+        }
     }
 }

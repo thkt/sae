@@ -1,8 +1,10 @@
 use std::io::{IsTerminal, Read};
 
-use rurico::embed::{ChunkedEmbedding, Embed, Embedder, ModelId};
+use rurico::embed::{ChunkedEmbedding, Embed, Embedder};
+use rurico::reranker::Rerank;
 use sae::config::Config;
 
+use super::reranker::{ModelLoad, try_load_embedder, try_load_reranker};
 use crate::{SaeError, require_db};
 
 macro_rules! warn_user {
@@ -22,15 +24,10 @@ pub(crate) fn run_search(
     let team = config.resolve_team(team)?;
     let db = require_db(config, team)?;
     let embedder = try_load_embedder();
-    match &embedder {
-        ModelLoad::Absent => eprintln!(
-            "Hint: run 'sae model download && sae embed <team>' to enable semantic search"
-        ),
-        ModelLoad::Failed(e) => {
-            warn_user!("embedding model not available ({e})"; error = %e, "embedding model not available");
-        }
-        ModelLoad::Ready(_) => {}
-    }
+    embedder.emit_load_hint(
+        "run 'sae model download && sae embed <team>' to enable semantic search",
+        "embedding model",
+    );
     let embed_info = if let ModelLoad::Ready(ref emb) = embedder {
         match auto_embed_pending(&db, emb) {
             Ok(info) => Some(info),
@@ -53,6 +50,22 @@ pub(crate) fn run_search(
     } else {
         None
     };
+    let rerank_enabled = std::env::var("SAE_RERANK").as_deref() == Ok("1");
+    let reranker: Option<ModelLoad<Box<dyn Rerank>>> = if rerank_enabled {
+        Some(try_load_reranker())
+    } else {
+        None
+    };
+    if let Some(ref r) = reranker {
+        r.emit_load_hint(
+            "reranker model not cached; unset SAE_RERANK=1 to skip reranking",
+            "reranker",
+        );
+    }
+    let reranker_ref: Option<&dyn Rerank> = reranker
+        .as_ref()
+        .and_then(|r| r.as_ref())
+        .map(|b| b.as_ref() as &dyn Rerank);
     let results = sae::storage::hybrid_search(
         db.conn(),
         query,
@@ -60,6 +73,7 @@ pub(crate) fn run_search(
         limit,
         chrono::Utc::now(),
         &sae::storage::SearchFilter::default(),
+        reranker_ref,
     )?;
     let semantic = query_embedding.is_some();
     let output = crate::output::search(&results, query, json, semantic, embed_info, team)?;
@@ -98,55 +112,6 @@ where
         "auto_embed_pending: embedded chunks during search"
     );
     Ok((result.processed, result.budget_exhausted))
-}
-
-pub(crate) enum ModelLoad {
-    Ready(Box<Embedder>),
-    Absent,
-    Failed(String),
-}
-
-pub(crate) fn try_load_embedder() -> ModelLoad {
-    try_load_embedder_with(|| rurico::embed::cached_artifacts(ModelId::default()))
-}
-
-fn try_load_embedder_with<E: std::fmt::Display>(
-    cache_check: impl FnOnce() -> Result<Option<rurico::embed::Artifacts>, E>,
-) -> ModelLoad {
-    use rurico::embed::ProbeStatus;
-
-    let paths = match cache_check() {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            tracing::debug!("embedding model not cached");
-            return ModelLoad::Absent;
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "embedding model cache check failed");
-            return ModelLoad::Failed(e.to_string());
-        }
-    };
-    match Embedder::probe(&paths) {
-        Ok(ProbeStatus::Available) => {}
-        Ok(ProbeStatus::BackendUnavailable) => {
-            tracing::debug!("MLX backend unavailable");
-            return ModelLoad::Failed("MLX backend is unavailable".to_string());
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "embedding model probe failed");
-            return ModelLoad::Failed(e.to_string());
-        }
-    }
-    match Embedder::new(&paths) {
-        Ok(e) => {
-            tracing::debug!("embedding model loaded");
-            ModelLoad::Ready(Box::new(e))
-        }
-        Err(e) => {
-            tracing::debug!(error = %e, "embedding model load failed");
-            ModelLoad::Failed(e.to_string())
-        }
-    }
 }
 
 fn spawn_background_harvest(team: &str) {
@@ -346,6 +311,7 @@ mod tests {
     // TC-010: try_load_embedder_with returns Absent when model is not cached
     #[test]
     fn try_load_embedder_with_returns_absent_when_no_model() {
+        use crate::commands::reranker::try_load_embedder_with;
         let result = try_load_embedder_with(|| Ok::<_, &str>(None));
         assert!(matches!(result, ModelLoad::Absent));
     }
@@ -353,6 +319,7 @@ mod tests {
     // TC-010: try_load_embedder_with returns Failed on cache check error
     #[test]
     fn try_load_embedder_with_returns_failed_on_cache_error() {
+        use crate::commands::reranker::try_load_embedder_with;
         let result =
             try_load_embedder_with(|| Err::<Option<rurico::embed::Artifacts>, _>("cache error"));
         assert!(matches!(result, ModelLoad::Failed(_)));
