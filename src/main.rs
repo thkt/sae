@@ -303,6 +303,8 @@ async fn run(cli: Cli, config: Config) -> Result<String, SaeError> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    rurico::model_probe::handle_probe_if_needed();
+
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(
