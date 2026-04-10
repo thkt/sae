@@ -44,7 +44,7 @@ fn existing_embedded_ids(
     chunk_ids: &[i64],
 ) -> Result<HashSet<i64>, StorageError> {
     let sql = format!(
-        "SELECT DISTINCT chunk_id FROM embedded_chunk_ids WHERE chunk_id IN ({})",
+        "SELECT chunk_id FROM embedded_chunk_ids WHERE chunk_id IN ({})",
         super::in_placeholders(chunk_ids.len())
     );
     let mut stmt = conn.prepare(&sql)?;

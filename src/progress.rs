@@ -38,6 +38,7 @@ impl Spinner {
                 }
             }))
         } else {
+            eprintln!("{msg}");
             None
         };
 
@@ -61,6 +62,8 @@ impl Spinner {
         drop(self);
         if is_tty {
             eprintln!("\x1b[32m✓\x1b[0m {msg}");
+        } else {
+            eprintln!("{msg}");
         }
     }
 

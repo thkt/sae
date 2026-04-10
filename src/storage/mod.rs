@@ -4,7 +4,7 @@ pub mod types;
 pub use embed::{
     add_chunked_embeddings, count_unembedded_chunks, get_unembedded_chunks, has_embeddings,
 };
-pub use search::{SearchResult, hybrid_search};
+pub use search::{SearchFilter, SearchResult, hybrid_search};
 pub use types::*;
 
 use std::path::Path;
@@ -21,6 +21,12 @@ pub(crate) fn in_placeholders(len: usize) -> String {
         .map(|i| format!("?{i}"))
         .collect::<Vec<_>>()
         .join(", ")
+}
+
+// Use when multiple IN clauses share a parameter list: unnamed `?` avoids
+// index collisions that numbered `?N` would cause when params are appended incrementally.
+pub(crate) fn anon_placeholders(n: usize) -> String {
+    vec!["?"; n].join(", ")
 }
 
 pub(crate) fn as_sql_params<T: rusqlite::types::ToSql>(

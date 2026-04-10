@@ -5,7 +5,6 @@ use sae::config::Config;
 
 use crate::{SaeError, require_db};
 
-/// Emit a user-visible warning to stderr and a structured log entry.
 macro_rules! warn_user {
     ($user_msg:literal; $($log:tt)+) => {{
         eprintln!("Warning: {}", format_args!($user_msg));
@@ -60,6 +59,7 @@ pub(crate) fn run_search(
         query_embedding.as_deref(),
         limit,
         chrono::Utc::now(),
+        &sae::storage::SearchFilter::default(),
     )?;
     let semantic = query_embedding.is_some();
     let output = crate::output::search(&results, query, json, semantic, embed_info, team)?;
@@ -343,16 +343,16 @@ mod tests {
         );
     }
 
-    // TC-010: try_load_embedder_with returns None when model is not cached
+    // TC-010: try_load_embedder_with returns Absent when model is not cached
     #[test]
-    fn try_load_embedder_with_returns_none_when_no_model() {
+    fn try_load_embedder_with_returns_absent_when_no_model() {
         let result = try_load_embedder_with(|| Ok::<_, &str>(None));
         assert!(matches!(result, ModelLoad::Absent));
     }
 
-    // TC-010: try_load_embedder_with returns None on cache check error
+    // TC-010: try_load_embedder_with returns Failed on cache check error
     #[test]
-    fn try_load_embedder_with_returns_none_on_cache_error() {
+    fn try_load_embedder_with_returns_failed_on_cache_error() {
         let result =
             try_load_embedder_with(|| Err::<Option<rurico::embed::Artifacts>, _>("cache error"));
         assert!(matches!(result, ModelLoad::Failed(_)));
