@@ -28,9 +28,7 @@ pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<Strin
         Ok(ProbeStatus::Available) => {}
         Ok(ProbeStatus::BackendUnavailable) => {
             spinner.cancel();
-            return Err(SaeError::Other(
-                "MLX backend is unavailable".to_string(),
-            ));
+            return Err(SaeError::Other("MLX backend is unavailable".to_string()));
         }
         Err(e) => {
             spinner.cancel();
