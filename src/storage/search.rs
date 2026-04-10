@@ -5,6 +5,13 @@ use tracing::warn;
 
 use super::StorageError;
 
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MatchSource {
+    Semantic,
+    Fts,
+}
+
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct SearchResult {
     pub post_number: u32,
@@ -12,7 +19,8 @@ pub struct SearchResult {
     pub post_url: String,
     pub section_title: Option<String>,
     pub snippet: String,
-    pub score: f64,
+    pub score: f32,
+    pub match_source: MatchSource,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -132,15 +140,14 @@ pub fn vec_search(
         .query_map(rusqlite::params_from_iter(params.iter()), |row| {
             Ok((
                 row.get::<_, i64>(0)?,
-                row.get::<_, u32>(1)?,
-                row.get::<_, Option<String>>(2)?,
-                row.get::<_, String>(3)?,
+                (
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ),
             ))
         })?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .map(|(id, pn, st, c)| (id, (pn, st, c)))
-        .collect();
+        .collect::<Result<HashMap<_, _>, _>>()?;
 
     let mut hits: Vec<VecHit> = best
         .into_iter()
@@ -217,14 +224,11 @@ pub fn hybrid_search(
                     url: String::new(),
                     updated_at: String::new(),
                 });
+            let vec_hit = vec_map.get(&post_number).copied();
             let (section_title, snippet) = fts_map
                 .get(&post_number)
                 .map(|h| (h.section_title.clone(), h.content.clone()))
-                .or_else(|| {
-                    vec_map
-                        .get(&post_number)
-                        .map(|h| (h.section_title.clone(), h.content.clone()))
-                })
+                .or_else(|| vec_hit.map(|h| (h.section_title.clone(), h.content.clone())))
                 .unwrap_or_default();
             SearchResult {
                 post_number,
@@ -232,7 +236,13 @@ pub fn hybrid_search(
                 post_url: meta.url,
                 section_title,
                 snippet: truncate_snippet(&snippet, 200),
-                score,
+                score: score as f32,
+                // Semantic takes priority when a post matched both sources.
+                match_source: if vec_hit.is_some() {
+                    MatchSource::Semantic
+                } else {
+                    MatchSource::Fts
+                },
             }
         })
         .collect();
@@ -881,14 +891,16 @@ mod tests {
             post_url: "https://example.esa.io/posts/42".to_string(),
             section_title: Some("Section".to_string()),
             snippet: "snippet text".to_string(),
-            score: 0.85,
+            score: 0.75,
+            match_source: MatchSource::Fts,
         };
         let json_str =
             serde_json::to_string(&result).expect("[T-035] SearchResult should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["post_number"], 42);
         assert_eq!(v["post_name"], "Test Post");
-        assert_eq!(v["score"], 0.85);
+        assert_eq!(v["score"], 0.75);
+        assert_eq!(v["match_source"], "fts");
         assert_eq!(v["post_url"], "https://example.esa.io/posts/42");
         assert_eq!(v["section_title"], "Section");
         assert_eq!(v["snippet"], "snippet text");
