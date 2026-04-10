@@ -1,4 +1,4 @@
-use rurico::embed::{Embedder, ModelId, ProbeStatus};
+use rurico::embed::{EmbedInitError, Embedder, ModelId, ProbeStatus};
 use sae::config::Config;
 
 use crate::{SaeError, require_db, resolve_client};
@@ -32,6 +32,11 @@ pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<Strin
         }
         Err(e) => {
             spinner.cancel();
+            if matches!(e, EmbedInitError::ModelCorrupt { .. })
+                && let Err(del_err) = paths.delete_files()
+            {
+                tracing::warn!(error = %del_err, "failed to delete corrupt model files");
+            }
             return Err(SaeError::Other(format!("Model probe failed: {e}")));
         }
     }
@@ -86,6 +91,11 @@ pub(crate) fn run_model_download(json: bool) -> Result<String, SaeError> {
         }
         Err(e) => {
             spinner.cancel();
+            if matches!(e, EmbedInitError::ModelCorrupt { .. })
+                && let Err(del_err) = paths.delete_files()
+            {
+                tracing::warn!(error = %del_err, "failed to delete corrupt model files");
+            }
             return Err(SaeError::Other(format!("Model probe failed: {e}")));
         }
     }
