@@ -113,6 +113,8 @@ pub(crate) fn try_load_embedder() -> ModelLoad {
 fn try_load_embedder_with<E: std::fmt::Display>(
     cache_check: impl FnOnce() -> Result<Option<rurico::embed::Artifacts>, E>,
 ) -> ModelLoad {
+    use rurico::embed::ProbeStatus;
+
     let paths = match cache_check() {
         Ok(Some(p)) => p,
         Ok(None) => {
@@ -124,6 +126,17 @@ fn try_load_embedder_with<E: std::fmt::Display>(
             return ModelLoad::Failed(e.to_string());
         }
     };
+    match Embedder::probe(&paths) {
+        Ok(ProbeStatus::Available) => {}
+        Ok(ProbeStatus::BackendUnavailable) => {
+            tracing::debug!("MLX backend unavailable");
+            return ModelLoad::Failed("MLX backend is unavailable".to_string());
+        }
+        Err(e) => {
+            tracing::debug!(error = %e, "embedding model probe failed");
+            return ModelLoad::Failed(e.to_string());
+        }
+    }
     match Embedder::new(&paths) {
         Ok(e) => {
             tracing::debug!("embedding model loaded");
