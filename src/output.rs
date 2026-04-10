@@ -362,6 +362,7 @@ mod tests {
             section_title: None,
             snippet: String::new(),
             score: 0.5,
+            match_source: sae::storage::MatchSource::Fts,
         }];
         let out = search(&results, "q", false, false, None, "").unwrap();
         assert!(out.contains("semantic search unavailable"));
@@ -377,6 +378,7 @@ mod tests {
             section_title: None,
             snippet: String::new(),
             score: 0.5,
+            match_source: sae::storage::MatchSource::Fts,
         }];
         let out = search(&results, "q", false, true, None, "").unwrap();
         assert!(!out.contains("semantic search unavailable"));
