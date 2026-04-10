@@ -103,31 +103,34 @@ pub(crate) fn run_model_download(json: bool) -> Result<String, SaeError> {
 
 pub(crate) fn require_embed_model() -> Result<rurico::embed::Artifacts, SaeError> {
     let auto_download = std::env::var("SAE_AUTO_DOWNLOAD_MODEL").as_deref() == Ok("1");
-    require_embed_model_with(auto_download, || {
-        rurico::embed::cached_artifacts(ModelId::default())
-    })
+    require_embed_model_with(
+        auto_download,
+        || rurico::embed::cached_artifacts(ModelId::default()),
+        || rurico::embed::download_model(ModelId::default()),
+    )
 }
 
-fn require_embed_model_with<E: std::fmt::Display>(
+fn require_embed_model_with<CE: std::fmt::Display, DE: std::fmt::Display>(
     auto_download: bool,
-    cache_check: impl FnOnce() -> Result<Option<rurico::embed::Artifacts>, E>,
+    cache_check: impl FnOnce() -> Result<Option<rurico::embed::Artifacts>, CE>,
+    download_fn: impl FnOnce() -> Result<rurico::embed::Artifacts, DE>,
 ) -> Result<rurico::embed::Artifacts, SaeError> {
-    if auto_download {
-        let spinner =
-            crate::progress::Spinner::new("Downloading model (SAE_AUTO_DOWNLOAD_MODEL=1)...");
-        return match rurico::embed::download_model(ModelId::default()) {
-            Ok(paths) => {
-                spinner.finish("Model downloaded");
-                Ok(paths)
-            }
-            Err(e) => {
-                spinner.cancel();
-                Err(SaeError::Other(format!("Failed to download model: {e}")))
-            }
-        };
-    }
     match cache_check() {
         Ok(Some(p)) => Ok(p),
+        Ok(None) if auto_download => {
+            let spinner =
+                crate::progress::Spinner::new("Downloading model (SAE_AUTO_DOWNLOAD_MODEL=1)...");
+            match download_fn() {
+                Ok(paths) => {
+                    spinner.finish("Model downloaded");
+                    Ok(paths)
+                }
+                Err(e) => {
+                    spinner.cancel();
+                    Err(SaeError::Other(format!("Failed to download model: {e}")))
+                }
+            }
+        }
         Ok(None) => Err(SaeError::Input(
             "Model not found. Run 'sae model download' first.".to_string(),
         )),
@@ -139,10 +142,14 @@ fn require_embed_model_with<E: std::fmt::Display>(
 mod tests {
     use super::*;
 
-    // T-007: model absent → "Model not found" error (deterministic via DI)
+    // T-007: model absent → "Model not found" error
     #[test]
     fn require_embed_model_err_when_absent() {
-        let result = require_embed_model_with(false, || Ok::<_, &str>(None));
+        let result = require_embed_model_with(
+            false,
+            || Ok::<_, &str>(None),
+            || Err::<rurico::embed::Artifacts, _>("should not be called"),
+        );
         assert!(result.is_err(), "should fail when model is not cached");
         assert!(
             result.unwrap_err().to_string().contains("Model not found"),
@@ -153,9 +160,11 @@ mod tests {
     // T-007: cache check failure → wrapped error
     #[test]
     fn require_embed_model_err_on_cache_failure() {
-        let result = require_embed_model_with(false, || {
-            Err::<Option<rurico::embed::Artifacts>, _>("cache broken")
-        });
+        let result = require_embed_model_with(
+            false,
+            || Err::<Option<rurico::embed::Artifacts>, _>("cache broken"),
+            || Err::<rurico::embed::Artifacts, _>("should not be called"),
+        );
         assert!(result.is_err());
         assert!(
             result
@@ -166,18 +175,29 @@ mod tests {
         );
     }
 
-    // T-007: auto_download=true skips cache_check
+    // T-007: auto_download=true + cache miss → download_fn invoked and error wrapped
     #[test]
-    fn require_embed_model_auto_download_skips_cache() {
-        let called = std::cell::Cell::new(false);
-        // download_model will fail (no network), but cache_check must NOT be invoked
-        let _ = require_embed_model_with(true, || {
-            called.set(true);
-            Ok::<_, &str>(None)
-        });
+    fn require_embed_model_auto_download_err_on_download_failure() {
+        let download_called = std::cell::Cell::new(false);
+        let result = require_embed_model_with(
+            true,
+            || Ok::<_, &str>(None),
+            || {
+                download_called.set(true);
+                Err::<rurico::embed::Artifacts, _>("network error")
+            },
+        );
         assert!(
-            !called.get(),
-            "cache_check should not be called when auto_download=true"
+            download_called.get(),
+            "download_fn should be called when cache misses and auto_download=true"
+        );
+        assert!(result.is_err());
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("Failed to download model"),
+            "error should indicate download failure"
         );
     }
 }
