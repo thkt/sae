@@ -41,6 +41,8 @@ Examples:
     #[command(after_help = "\
 Examples:
   sae search \"認証\" --team myteam --limit 5
+  sae search \"認証\" --after 2025-01-01
+  sae search \"認証\" --after 2025-01-01 --before 2025-06-30
   echo \"認証\" | sae search
   sae search -")]
     Search {
@@ -52,6 +54,12 @@ Examples:
         /// Max results (1-100)
         #[arg(long, default_value = "10")]
         limit: u32,
+        /// Filter: updated on or after this date (YYYY-MM-DD)
+        #[arg(long, value_name = "DATE")]
+        after: Option<String>,
+        /// Filter: updated on or before this date (YYYY-MM-DD)
+        #[arg(long, value_name = "DATE")]
+        before: Option<String>,
     },
     /// Get a post by number
     #[command(after_help = "\
@@ -247,9 +255,23 @@ async fn run(cli: Cli, config: Config) -> Result<String, SaeError> {
         Command::Harvest { team, full } => {
             commands::data::run_harvest(&config, &team, full, json).await?
         }
-        Command::Search { query, team, limit } => {
+        Command::Search {
+            query,
+            team,
+            limit,
+            after,
+            before,
+        } => {
             let query = commands::search::resolve_search_query(query)?;
-            commands::search::run_search(&config, &query, team.as_deref(), limit, json)?
+            commands::search::run_search(
+                &config,
+                &query,
+                team.as_deref(),
+                limit,
+                after.as_deref(),
+                before.as_deref(),
+                json,
+            )?
         }
         Command::Get {
             number,
