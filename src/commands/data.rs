@@ -1,4 +1,4 @@
-use rurico::embed::{Embedder, ModelId};
+use rurico::embed::{Embedder, ModelId, ProbeStatus};
 use sae::config::Config;
 
 use crate::{SaeError, require_db, resolve_client};
@@ -24,6 +24,17 @@ pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<Strin
 
     let paths = require_embed_model()?;
     let spinner = crate::progress::Spinner::new("Loading model...");
+    match Embedder::probe(&paths) {
+        Ok(ProbeStatus::Available) => {}
+        Ok(ProbeStatus::BackendUnavailable) => {
+            spinner.cancel();
+            return Err(SaeError::Other("MLX backend is unavailable".to_string()));
+        }
+        Err(e) => {
+            spinner.cancel();
+            return Err(SaeError::Other(format!("Model probe failed: {e}")));
+        }
+    }
     let embedder =
         Embedder::new(&paths).map_err(|e| SaeError::Other(format!("Failed to load model: {e}")))?;
     spinner.finish("Model ready");
@@ -65,6 +76,19 @@ pub(crate) fn run_model_download(json: bool) -> Result<String, SaeError> {
             return Err(SaeError::Other(format!("Failed to download model: {e}")));
         }
     };
+    match Embedder::probe(&paths) {
+        Ok(ProbeStatus::Available) => {}
+        Ok(ProbeStatus::BackendUnavailable) => {
+            spinner.cancel();
+            return Err(SaeError::Other(
+                "Model downloaded but MLX backend is unavailable".to_string(),
+            ));
+        }
+        Err(e) => {
+            spinner.cancel();
+            return Err(SaeError::Other(format!("Model probe failed: {e}")));
+        }
+    }
     match Embedder::new(&paths) {
         Ok(_) => {
             spinner.finish("Model ready");
