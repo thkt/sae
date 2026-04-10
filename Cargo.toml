@@ -17,7 +17,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
-rurico = { git = "https://github.com/thkt/rurico", rev = "5569a30" }
+rurico = { git = "https://github.com/thkt/rurico", rev = "03275f7" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 strsim = "0.11"
 
@@ -26,7 +26,7 @@ strsim = "0.11"
 wiremock = "0.6"
 tempfile = "3"
 serial_test = "3"
-rurico = { git = "https://github.com/thkt/rurico", rev = "5569a30", features = ["test-support"] }
+rurico = { git = "https://github.com/thkt/rurico", rev = "03275f7", features = ["test-support"] }
 
 [profile.release]
 opt-level = 3
