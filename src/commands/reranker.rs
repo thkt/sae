@@ -27,7 +27,7 @@ mod tests {
 
     // T-107: EMBEDDER OnceLock initializes once; both calls return same cached reference
     #[test]
-    fn t107_embedder_onclock_returns_same_reference_on_repeated_calls() {
+    fn embedder_once_lock_returns_same_reference_on_repeated_calls() {
         let r1 = try_load_embedder();
         let r2 = try_load_embedder();
         assert!(
