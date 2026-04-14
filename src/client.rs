@@ -614,7 +614,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert!(
             v["body_md"].is_null(),
-            "[T-036] body_md should be null when None"
+            "body_md should be null when None"
         );
         assert_eq!(v["number"], 42);
         assert_eq!(v["name"], "Test Post");
@@ -628,25 +628,26 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(
             v["body_md"], "# Hello\nWorld",
-            "[T-043] body_md should be the string value"
+            "body_md should be the string value"
         );
     }
 
     // T-048: EsaPost → JSON serialization contract (name, number, url, wip, tags).
     // Shared by create/update/archive/ship --json code paths.
+    // T-187: esa_post_json_has_name_number_url
     #[test]
     fn esa_post_json_has_name_number_url() {
         let post = test_esa_post(Some("body".to_string()));
         let json_str = serde_json::to_string(&post).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(v["number"], 42, "[T-048] number field");
-        assert_eq!(v["name"], "Test Post", "[T-048] name field");
+        assert_eq!(v["number"], 42, "number field");
+        assert_eq!(v["name"], "Test Post", "name field");
         assert_eq!(
             v["url"], "https://example.esa.io/posts/42",
-            "[T-048] url field"
+            "url field"
         );
-        assert_eq!(v["wip"], false, "[T-048] wip field");
-        assert_eq!(v["tags"][0], "rust", "[T-048] tags field");
+        assert_eq!(v["wip"], false, "wip field");
+        assert_eq!(v["tags"][0], "rust", "tags field");
     }
 
     // T-108: create_post sends correct request body

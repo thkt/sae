@@ -878,7 +878,7 @@ mod tests {
         let hits = fts_search(db.conn(), "フローの説明", 10, &SearchFilter::default()).unwrap();
         assert!(
             !hits.is_empty(),
-            "[T-151] content-only term must still be found (regression)"
+            "content-only term must still be found (regression)"
         );
         assert_eq!(hits[0].post_number, 1);
     }
@@ -891,16 +891,16 @@ mod tests {
         let post = test_post(1, "Preamble", body);
         storage::upsert_post(db.conn(), &post).unwrap();
         let count = storage::rechunk_post(db.conn(), 1, body).unwrap();
-        assert_eq!(count, 1, "[T-152] preamble should produce 1 chunk");
+        assert_eq!(count, 1, "preamble should produce 1 chunk");
 
         let hits = fts_search(db.conn(), "見出しなし", 10, &SearchFilter::default()).unwrap();
         assert!(
             !hits.is_empty(),
-            "[T-152] preamble chunk should be searchable by content"
+            "preamble chunk should be searchable by content"
         );
         assert!(
             hits[0].section_title.is_none(),
-            "[T-152] preamble chunk should have no section_title"
+            "preamble chunk should have no section_title"
         );
     }
 
@@ -916,7 +916,7 @@ mod tests {
         let hits = fts_search(db.conn(), "認証ガイド", 10, &SearchFilter::default()).unwrap();
         assert!(
             !hits.is_empty(),
-            "[T-150] section_title-only term should be found via FTS"
+            "section_title-only term should be found via FTS"
         );
         assert_eq!(hits[0].post_number, 1);
         assert_eq!(hits[0].section_title.as_deref(), Some("認証ガイド"));
@@ -976,7 +976,7 @@ mod tests {
             match_source: MatchSource::Fts,
         };
         let json_str =
-            serde_json::to_string(&result).expect("[T-035] SearchResult should serialize");
+            serde_json::to_string(&result).expect("SearchResult should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["post_number"], 42);
         assert_eq!(v["post_name"], "Test Post");
@@ -1211,10 +1211,10 @@ mod tests {
         query[0] = 1.0;
 
         let hits = vec_search(db.conn(), &query, 1, &SearchFilter::default()).unwrap();
-        assert_eq!(hits.len(), 1, "[T-155] should return exactly one hit");
+        assert_eq!(hits.len(), 1, "should return exactly one hit");
         assert!(
             hits[0].distance < 0.1,
-            "[T-155] MaxSim must select sub_idx=1 (closer sub-embedding), got distance={}",
+            "MaxSim must select sub_idx=1 (closer sub-embedding), got distance={}",
             hits[0].distance
         );
     }

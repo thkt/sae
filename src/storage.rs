@@ -803,7 +803,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             fts_count, chunks_count,
-            "[T-144] fts_chunks count ({fts_count}) must equal chunks count ({chunks_count})"
+            "fts_chunks count ({fts_count}) must equal chunks count ({chunks_count})"
         );
     }
 
@@ -924,12 +924,12 @@ mod tests {
         let result = migrate_fts_v4(&conn);
         assert!(
             result.is_err(),
-            "[T-145] migrate_fts_v4 should fail when chunks table is missing"
+            "migrate_fts_v4 should fail when chunks table is missing"
         );
 
         // rollback 確認: version は 3 のまま
         let version = get_schema_version(&conn).unwrap();
-        assert_eq!(version, 3, "[T-145] schema_version should remain 3");
+        assert_eq!(version, 3, "schema_version should remain 3");
 
         // rollback 確認: 旧 FTS data が生存（実検索 MATCH）
         let post: u32 = conn
@@ -939,7 +939,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(post, 1, "[T-145] old FTS data must survive after rollback");
+        assert_eq!(post, 1, "old FTS data must survive after rollback");
     }
 
     // T-143: temp file DB + 旧スキーマ → Db::open で migration (FR-005)
@@ -1023,7 +1023,7 @@ mod tests {
         let version = get_schema_version(db.conn()).unwrap();
         assert_eq!(
             version, 5,
-            "[T-143] schema_version should be 5 after full migration"
+            "schema_version should be 5 after full migration"
         );
 
         // section_title の語で検索可能
@@ -1037,7 +1037,7 @@ mod tests {
             .unwrap();
         assert!(
             hits > 0,
-            "[T-143] section_title term should match after migration"
+            "section_title term should match after migration"
         );
 
         // fts_chunks_vocab が機能
@@ -1047,7 +1047,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert!(vocab > 0, "[T-143] fts_chunks_vocab should be populated");
+        assert!(vocab > 0, "fts_chunks_vocab should be populated");
     }
 
     // T-010: v4 スキーマ → Db::open で v5 のみ migration (FTS 再構築なし)
@@ -1091,7 +1091,7 @@ mod tests {
         let version = get_schema_version(db.conn()).unwrap();
         assert_eq!(
             version, 5,
-            "[T-010] schema_version should be 5 after v4→v5 migration"
+            "schema_version should be 5 after v4→v5 migration"
         );
 
         // FTS データが保持されている（再構築されていない）
@@ -1103,7 +1103,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(hits > 0, "[T-010] FTS data should survive v4→v5 migration");
+        assert!(hits > 0, "FTS data should survive v4→v5 migration");
 
         // vec_chunks テーブルが存在する
         let tbl_count: u32 = db
@@ -1117,7 +1117,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             tbl_count, 1,
-            "[T-010] vec_chunks table should exist after v5 migration"
+            "vec_chunks table should exist after v5 migration"
         );
     }
 
@@ -1138,7 +1138,7 @@ mod tests {
         migrate(&conn, 0).unwrap();
 
         let version = get_schema_version(&conn).unwrap();
-        assert_eq!(version, 5, "[T-011] migrate(0) should reach v5");
+        assert_eq!(version, 5, "migrate(0) should reach v5");
     }
 
     // T-147: WAL recovery — is_recoverable_open_error recognizes DatabaseCorrupt
@@ -1191,12 +1191,12 @@ mod tests {
             .unwrap();
         }
         match Db::open(&path) {
-            Ok(_) => panic!("[T-146] expected Db::open to fail"),
+            Ok(_) => panic!("expected Db::open to fail"),
             Err(StorageError::Open(msg)) => assert!(
                 msg.contains("corrupt schema version"),
-                "[T-146] unexpected error message: {msg}"
+                "unexpected error message: {msg}"
             ),
-            Err(e) => panic!("[T-146] expected StorageError::Open, got {e:?}"),
+            Err(e) => panic!("expected StorageError::Open, got {e:?}"),
         }
     }
 
@@ -1211,18 +1211,18 @@ mod tests {
             set_schema_version(&conn, 99).unwrap();
         }
         match Db::open(&path) {
-            Ok(_) => panic!("[T-148] expected Db::open to fail"),
+            Ok(_) => panic!("expected Db::open to fail"),
             Err(StorageError::Open(msg)) => {
                 assert!(
                     msg.contains("newer than supported"),
-                    "[T-148] unexpected error message: {msg}"
+                    "unexpected error message: {msg}"
                 );
                 assert!(
                     msg.contains("99"),
-                    "[T-148] message should include the invalid version: {msg}"
+                    "message should include the invalid version: {msg}"
                 );
             }
-            Err(e) => panic!("[T-148] expected StorageError::Open, got {e:?}"),
+            Err(e) => panic!("expected StorageError::Open, got {e:?}"),
         }
     }
 }

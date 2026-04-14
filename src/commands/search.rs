@@ -4,10 +4,10 @@ use rurico::embed::{ChunkedEmbedding, Embed};
 use rurico::reranker::Rerank;
 use sae::config::Config;
 
-use amici::model::ModelLoad;
-use amici::model::embedder::degraded_reason_user_note;
 use super::reranker::{try_load_embedder, try_load_reranker};
 use crate::{SaeError, require_db};
+use amici::model::ModelLoad;
+use amici::model::embedder::degraded_reason_user_note;
 
 macro_rules! warn_user {
     ($user_msg:literal; $($log:tt)+) => {{
@@ -30,10 +30,10 @@ pub(crate) fn run_search(
     let team = config.resolve_team(team)?;
     let db = require_db(config, team)?;
     let embedder = try_load_embedder();
-    if let Err(reason) = embedder {
-        if let Some(note) = degraded_reason_user_note(*reason) {
-            eprintln!("Warning: {note}");
-        }
+    if let Err(reason) = embedder
+        && let Some(note) = degraded_reason_user_note(*reason)
+    {
+        eprintln!("Warning: {note}");
     }
     let embed_info = if let Ok(emb) = embedder {
         match auto_embed_pending(&db, emb.as_ref()) {
@@ -96,7 +96,10 @@ pub(crate) fn run_search(
     Ok(output)
 }
 
-fn auto_embed_pending(db: &sae::storage::Db, embedder: &dyn Embed) -> Result<(u32, bool), SaeError> {
+fn auto_embed_pending(
+    db: &sae::storage::Db,
+    embedder: &dyn Embed,
+) -> Result<(u32, bool), SaeError> {
     const EMBED_BUDGET: u32 = 128;
     auto_embed_pending_with(db, EMBED_BUDGET, |texts| {
         embedder

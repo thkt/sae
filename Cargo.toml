@@ -8,11 +8,11 @@ description = "esa semantic search CLI"
 test-support = ["rurico/test-support"]
 
 [dependencies]
-amici = { git = "https://github.com/thkt/amici", rev = "814a852" }
+amici = { git = "https://github.com/thkt/amici", rev = "3dec559" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 clap = { version = "4.6", features = ["derive"] }
 reqwest = { version = "0.13", features = ["json"] }
-rurico = { git = "https://github.com/thkt/rurico", rev = "03275f7" }
+rurico = { git = "https://github.com/thkt/rurico", rev = "216f25f" }
 rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -22,13 +22,10 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [dev-dependencies]
-rurico = { git = "https://github.com/thkt/rurico", rev = "03275f7", features = ["test-support"] }
+rurico = { git = "https://github.com/thkt/rurico", rev = "216f25f", features = ["test-support"] }
 serial_test = "3"
 tempfile = "3"
 wiremock = "0.6"
-
-[patch."https://github.com/thkt/amici"]
-amici = { path = "../amici" }
 
 [profile.release]
 opt-level = 3

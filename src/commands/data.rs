@@ -36,8 +36,13 @@ pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<Strin
         }
         Err(reason) => {
             spinner.cancel();
-            let detail = embed_err.take().map(|e| format!(": {e}")).unwrap_or_default();
-            return Err(SaeError::Other(format!("Model probe failed: {reason:?}{detail}")));
+            let detail = embed_err
+                .take()
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default();
+            return Err(SaeError::Other(format!(
+                "Model probe failed: {reason:?}{detail}"
+            )));
         }
     };
     spinner.finish("Model ready");
@@ -97,8 +102,13 @@ pub(crate) fn run_model_download(json: bool) -> Result<String, SaeError> {
         }
         Err(reason) => {
             spinner.cancel();
-            let detail = load_err.take().map(|e| format!(": {e}")).unwrap_or_default();
-            Err(SaeError::Other(format!("Model probe failed: {reason:?}{detail}")))
+            let detail = load_err
+                .take()
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default();
+            Err(SaeError::Other(format!(
+                "Model probe failed: {reason:?}{detail}"
+            )))
         }
     }
 }

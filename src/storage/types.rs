@@ -137,14 +137,14 @@ mod tests {
             error: None,
             db_path: None,
         };
-        let json_str = serde_json::to_string(&status).expect("[T-045] TeamStatus should serialize");
+        let json_str = serde_json::to_string(&status).expect("TeamStatus should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["team"], "myteam");
         assert_eq!(v["status"], "synced");
         assert_eq!(v["posts"], 42);
         assert!(
             v["sync_state"].is_object(),
-            "[T-045] sync_state should be an object"
+            "sync_state should be an object"
         );
     }
 
@@ -172,9 +172,9 @@ mod tests {
             },
         ];
         let json_str =
-            serde_json::to_string(&statuses).expect("[T-180] TeamStatus array should serialize");
+            serde_json::to_string(&statuses).expect("TeamStatus array should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert!(v.is_array(), "[T-180] should be a JSON array");
+        assert!(v.is_array(), "should be a JSON array");
         assert_eq!(v.as_array().unwrap().len(), 2);
         assert_eq!(v[0]["team"], "team-a");
         assert_eq!(v[1]["status"], "not_synced");
@@ -192,7 +192,7 @@ mod tests {
             error: Some("config missing".to_string()),
             db_path: None,
         };
-        let json_str = serde_json::to_string(&status).expect("[T-162] should serialize");
+        let json_str = serde_json::to_string(&status).expect("should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["status"], "error");
         assert_eq!(v["error"], "config missing");
@@ -208,7 +208,7 @@ mod tests {
             last_page: Some(3),
             updated_at: "2025-01-01 00:00:00".to_string(),
         };
-        let json_str = serde_json::to_string(&state).expect("[T-181] SyncState should serialize");
+        let json_str = serde_json::to_string(&state).expect("SyncState should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["total_count"], 100);
         assert_eq!(v["local_count"], 50);
@@ -222,7 +222,7 @@ mod tests {
             chunks_embedded: 150,
         };
         let json_str =
-            serde_json::to_string(&result).expect("[T-161] EmbedResult should serialize");
+            serde_json::to_string(&result).expect("EmbedResult should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["chunks_embedded"], 150);
     }

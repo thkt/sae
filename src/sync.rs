@@ -488,7 +488,7 @@ mod tests {
             gap_detected: true,
         };
         let json_str =
-            serde_json::to_string(&result).expect("[T-044] HarvestResult should serialize");
+            serde_json::to_string(&result).expect("HarvestResult should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["posts_fetched"], 10);
         assert_eq!(v["posts_stored"], 8);

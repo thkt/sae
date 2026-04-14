@@ -186,7 +186,7 @@ mod tests {
         let result = resolve_body(None, Some("/nonexistent/path.md"));
         assert!(
             result.is_err(),
-            "[T-112] nonexistent file should return error"
+            "nonexistent file should return error"
         );
     }
 
@@ -197,7 +197,7 @@ mod tests {
         assert_eq!(
             result.as_deref(),
             Some("本文\n"),
-            "[T-113] body from stdin should preserve trailing newline"
+            "body from stdin should preserve trailing newline"
         );
     }
 
@@ -208,7 +208,7 @@ mod tests {
         assert_eq!(
             result.as_deref(),
             Some(""),
-            "[T-114] empty stdin yields empty body string"
+            "empty stdin yields empty body string"
         );
     }
 
@@ -223,7 +223,7 @@ mod tests {
         assert_eq!(
             result.as_deref(),
             Some("# Hello\nBody from file"),
-            "[T-039] body should contain file contents"
+            "body should contain file contents"
         );
     }
 
@@ -235,7 +235,7 @@ mod tests {
         assert_eq!(
             result.as_deref(),
             Some("# Hello\nBody from stdin\n"),
-            "[T-040] body should contain stdin contents as-is"
+            "body should contain stdin contents as-is"
         );
     }
 }
