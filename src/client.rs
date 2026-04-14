@@ -612,10 +612,7 @@ mod tests {
         let post = test_esa_post(None);
         let json_str = serde_json::to_string(&post).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert!(
-            v["body_md"].is_null(),
-            "body_md should be null when None"
-        );
+        assert!(v["body_md"].is_null(), "body_md should be null when None");
         assert_eq!(v["number"], 42);
         assert_eq!(v["name"], "Test Post");
     }
@@ -642,10 +639,7 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["number"], 42, "number field");
         assert_eq!(v["name"], "Test Post", "name field");
-        assert_eq!(
-            v["url"], "https://example.esa.io/posts/42",
-            "url field"
-        );
+        assert_eq!(v["url"], "https://example.esa.io/posts/42", "url field");
         assert_eq!(v["wip"], false, "wip field");
         assert_eq!(v["tags"][0], "rust", "tags field");
     }

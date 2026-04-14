@@ -1035,10 +1035,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(
-            hits > 0,
-            "section_title term should match after migration"
-        );
+        assert!(hits > 0, "section_title term should match after migration");
 
         // fts_chunks_vocab が機能
         let vocab: u32 = db

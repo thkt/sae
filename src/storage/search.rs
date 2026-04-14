@@ -975,8 +975,7 @@ mod tests {
             score: 0.75,
             match_source: MatchSource::Fts,
         };
-        let json_str =
-            serde_json::to_string(&result).expect("SearchResult should serialize");
+        let json_str = serde_json::to_string(&result).expect("SearchResult should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["post_number"], 42);
         assert_eq!(v["post_name"], "Test Post");

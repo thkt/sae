@@ -574,11 +574,7 @@ mod tests {
                 with_body,
             } => {
                 assert_eq!(number, 42, "post number should be 42");
-                assert_eq!(
-                    team.as_deref(),
-                    Some("myteam"),
-                    "team should be myteam"
-                );
+                assert_eq!(team.as_deref(), Some("myteam"), "team should be myteam");
                 assert!(with_body, "with_body should be true");
             }
             other => panic!("expected Get, got {other:?}"),
@@ -592,11 +588,7 @@ mod tests {
         match cli.command {
             Command::Update { args } => {
                 assert_eq!(args.number, 42, "post number should be 42");
-                assert_eq!(
-                    args.name.as_deref(),
-                    Some("New Title"),
-                    "name should match"
-                );
+                assert_eq!(args.name.as_deref(), Some("New Title"), "name should match");
             }
             other => panic!("expected Update, got {other:?}"),
         }
@@ -650,11 +642,7 @@ mod tests {
         let cli = parse_cli_args(["sae", "status", "--team", "myteam"]).unwrap();
         match cli.command {
             Command::Status { team } => {
-                assert_eq!(
-                    team.as_deref(),
-                    Some("myteam"),
-                    "team should be myteam"
-                );
+                assert_eq!(team.as_deref(), Some("myteam"), "team should be myteam");
             }
             other => panic!("expected Status, got {other:?}"),
         }

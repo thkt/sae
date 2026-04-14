@@ -184,10 +184,7 @@ mod tests {
     #[test]
     fn resolve_body_nonexistent_file_is_error() {
         let result = resolve_body(None, Some("/nonexistent/path.md"));
-        assert!(
-            result.is_err(),
-            "nonexistent file should return error"
-        );
+        assert!(result.is_err(), "nonexistent file should return error");
     }
 
     // T-113: resolve_body_with_reader(`-`) reads from stdin

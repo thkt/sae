@@ -171,8 +171,7 @@ mod tests {
                 db_path: None,
             },
         ];
-        let json_str =
-            serde_json::to_string(&statuses).expect("TeamStatus array should serialize");
+        let json_str = serde_json::to_string(&statuses).expect("TeamStatus array should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert!(v.is_array(), "should be a JSON array");
         assert_eq!(v.as_array().unwrap().len(), 2);
@@ -221,8 +220,7 @@ mod tests {
         let result = EmbedResult {
             chunks_embedded: 150,
         };
-        let json_str =
-            serde_json::to_string(&result).expect("EmbedResult should serialize");
+        let json_str = serde_json::to_string(&result).expect("EmbedResult should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["chunks_embedded"], 150);
     }
