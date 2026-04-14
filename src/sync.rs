@@ -424,6 +424,7 @@ mod tests {
         assert_eq!(state.local_count, 1);
     }
 
+    // T-211: resolve_start returns page 1 and no query for a first-time sync
     #[test]
     fn resolve_start_first_sync() {
         let (page, q) = resolve_start(false, &None);
@@ -431,6 +432,7 @@ mod tests {
         assert!(q.is_none());
     }
 
+    // T-212: resolve_start returns updated: query when prior sync state exists
     #[test]
     fn resolve_start_incremental() {
         let state = Some(storage::SyncState {
@@ -445,6 +447,7 @@ mod tests {
         assert_eq!(q.as_deref(), Some("updated:>2025-01-01T00:00:00+09:00"));
     }
 
+    // T-213: resolve_start resumes from last_page when a checkpoint exists
     #[test]
     fn resolve_start_resume_checkpoint() {
         let state = Some(storage::SyncState {
@@ -459,6 +462,7 @@ mod tests {
         assert_eq!(q.as_deref(), Some("updated:>2025-01-01T00:00:00+09:00"));
     }
 
+    // T-214: resolve_start ignores saved state when full sync is requested
     #[test]
     fn resolve_start_full_ignores_state() {
         let state = Some(storage::SyncState {
@@ -493,24 +497,26 @@ mod tests {
         assert_eq!(v["gap_detected"], true);
     }
 
-    // TC-002: is_pagination_limit
+    // T-163: is_pagination_limit
     #[test]
     fn is_pagination_limit_detects_comma_format() {
         assert!(is_pagination_limit("exceeds 10,000 items"));
     }
 
+    // T-215: is_pagination_limit detects error message without comma in number
     #[test]
     fn is_pagination_limit_detects_plain_format() {
         assert!(is_pagination_limit("exceeds 10000 items"));
     }
 
+    // T-216: is_pagination_limit returns false for messages with non-10000 numbers
     #[test]
     fn is_pagination_limit_rejects_other_numbers() {
         assert!(!is_pagination_limit("1000 items"));
         assert!(!is_pagination_limit(""));
     }
 
-    // TC-005: post_to_row with body_md: None → empty string
+    // T-164: post_to_row with body_md: None → empty string
     #[test]
     fn post_to_row_none_body_becomes_empty() {
         let post = EsaPost {
@@ -538,11 +544,13 @@ mod tests {
         assert_eq!(row.tags, vec!["rust".to_string()]);
     }
 
+    // T-217: build_window_query returns None when both base and boundary are absent
     #[test]
     fn build_window_query_none_none() {
         assert!(build_window_query(None, None).is_none());
     }
 
+    // T-218: build_window_query returns base query unchanged when boundary is absent
     #[test]
     fn build_window_query_base_only() {
         assert_eq!(
@@ -551,6 +559,7 @@ mod tests {
         );
     }
 
+    // T-219: build_window_query returns upper-bound clause when only boundary is set
     #[test]
     fn build_window_query_boundary_only() {
         assert_eq!(
@@ -559,6 +568,7 @@ mod tests {
         );
     }
 
+    // T-220: build_window_query combines base and boundary into a window query
     #[test]
     fn build_window_query_both() {
         assert_eq!(
@@ -567,6 +577,7 @@ mod tests {
         );
     }
 
+    // T-221: HarvestResult Display omits gap message when gap_detected is false
     #[test]
     fn harvest_result_display_no_gap() {
         let r = HarvestResult {
@@ -581,6 +592,7 @@ mod tests {
         assert!(!s.contains("gap"));
     }
 
+    // T-222: HarvestResult Display includes missing count when gap_detected is true
     #[test]
     fn harvest_result_display_with_gap() {
         let r = HarvestResult {

@@ -13,12 +13,16 @@ pub(crate) fn try_load_embedder() -> &'static Result<Arc<dyn Embed>, DegradedRea
         try_load_embedder_with(
             || rurico::embed::cached_artifacts(ModelId::default()),
             |e| tracing::warn!(error = %e, "failed to delete corrupt embedder model files"),
+            |_| {},
         )
     })
 }
 
 pub(crate) fn try_load_reranker() -> ModelLoad<Box<dyn Rerank>> {
-    try_load_reranker_with(|| rurico::reranker::cached_artifacts(RerankerModelId::default()))
+    try_load_reranker_with(
+        || rurico::reranker::cached_artifacts(RerankerModelId::default()),
+        |e| tracing::warn!(error = %e, "failed to delete corrupt reranker model files"),
+    )
 }
 
 #[cfg(test)]

@@ -401,6 +401,7 @@ mod tests {
         }
     }
 
+    // T-200: --body-file "-" parses correctly with body_file set to "-"
     #[test]
     fn body_file_dash_parses_as_stdin() {
         let cli =
@@ -465,6 +466,7 @@ mod tests {
         }
     }
 
+    // T-201: create subcommand help text includes stdin pipe example
     #[test]
     fn create_help_includes_stdin_example() {
         let after_help = subcommand_after_help("create");
@@ -474,6 +476,7 @@ mod tests {
         );
     }
 
+    // T-202: search subcommand help text includes stdin pipe examples
     #[test]
     fn search_help_includes_stdin_examples() {
         let after_help = subcommand_after_help("search");
@@ -497,7 +500,7 @@ mod tests {
         }
     }
 
-    // T-002/T-003: `sae model` → clap error (not rewritten to search shorthand)
+    // T-002: `sae model` → clap error (not rewritten to search shorthand)
     #[test]
     fn model_without_subcommand_is_clap_error() {
         let result = parse_cli_args(["sae", "model"]);
@@ -532,7 +535,7 @@ mod tests {
         }
     }
 
-    // TC-012: multi-positional args without valid search expansion → clap error
+    // T-127: multi-positional args without valid search expansion → clap error
     #[test]
     fn multi_positional_args_not_shorthand() {
         let result = parse_cli_args(["sae", "foo", "bar"]);
@@ -657,7 +660,7 @@ mod tests {
         }
     }
 
-    // TC-014: non-search subcommand names are not rewritten as search shorthand
+    // T-128: non-search subcommand names are not rewritten as search shorthand
     #[test]
     fn all_subcommands_not_shorthand() {
         // `search` itself parses as Command::Search via the normal path — excluded.
@@ -670,7 +673,7 @@ mod tests {
                     result.as_ref().map(|c| &c.command),
                     Ok(Command::Search { .. })
                 ),
-                "[TC-014] subcommand '{cmd}' should not be rewritten as Search shorthand"
+                "[T-128] subcommand '{cmd}' should not be rewritten as Search shorthand"
             );
         }
     }

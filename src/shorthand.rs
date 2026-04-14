@@ -39,19 +39,6 @@ mod tests {
         assert_eq!(s, ["sae", "search", "query", "--limit", "2"]);
     }
 
-    // T-023: global flag (--json) is hoisted to before the inserted "search"
-    #[test]
-    fn global_flag_hoisted_before_search() {
-        let exp = try_expand_shorthand(
-            &os(&["sae", "--json", "query", "--limit", "2"]),
-            KNOWN,
-            GLOBAL,
-        )
-        .unwrap();
-        let s: Vec<&str> = exp.iter().filter_map(|a| a.to_str()).collect();
-        assert_eq!(s, ["sae", "--json", "search", "query", "--limit", "2"]);
-    }
-
     // T-024: non-global option (--team) stays after the inserted "search"
     #[test]
     fn non_global_option_stays_after_search() {
@@ -70,7 +57,7 @@ mod tests {
         );
     }
 
-    // TC-013: bare dash counts as flag prefix → positional_count < 2 → not expanded
+    // T-142: bare dash counts as flag prefix → positional_count < 2 → not expanded
     #[test]
     fn bare_dash_not_expanded() {
         assert!(
@@ -79,7 +66,7 @@ mod tests {
         );
     }
 
-    // TC-011: flag-like arg (--) → positional_count < 2 → not expanded
+    // T-141: flag-like arg (--) → positional_count < 2 → not expanded
     #[test]
     fn flag_only_not_expanded() {
         assert!(

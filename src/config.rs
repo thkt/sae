@@ -149,6 +149,7 @@ pub enum ConfigError {
 mod tests {
     use super::*;
 
+    // T-268: Config::default has empty teams, no default_team, and embed_budget=50
     #[test]
     fn default_config() {
         let config = Config::default();
@@ -157,6 +158,7 @@ mod tests {
         assert_eq!(config.embed_budget, 50);
     }
 
+    // T-269: resolve_team returns the team name when it is in the allowlist
     #[test]
     fn resolve_explicit_team_in_allowlist() {
         let config = Config {
@@ -166,12 +168,14 @@ mod tests {
         assert_eq!(config.resolve_team(Some("alpha")).unwrap(), "alpha");
     }
 
+    // T-270: resolve_team accepts any team name when allowlist is empty
     #[test]
     fn resolve_explicit_team_empty_allowlist() {
         let config = Config::default();
         assert_eq!(config.resolve_team(Some("any")).unwrap(), "any");
     }
 
+    // T-271: resolve_team returns default_team when no team argument is given
     #[test]
     fn resolve_default_team() {
         let config = Config {
@@ -182,6 +186,7 @@ mod tests {
         assert_eq!(config.resolve_team(None).unwrap(), "beta");
     }
 
+    // T-272: resolve_team picks the sole team when there is one team and no default
     #[test]
     fn resolve_single_team_no_default() {
         let config = Config {
@@ -191,6 +196,7 @@ mod tests {
         assert_eq!(config.resolve_team(None).unwrap(), "only");
     }
 
+    // T-273: resolve_team returns UnknownTeam error for a team not in the allowlist
     #[test]
     fn resolve_unknown_team_returns_error() {
         let config = Config {
@@ -201,6 +207,7 @@ mod tests {
         assert!(matches!(err, ConfigError::UnknownTeam(_)));
     }
 
+    // T-274: resolve_team returns NoTeamSpecified error when multiple teams and no default
     #[test]
     fn resolve_no_team_no_default() {
         let config = Config {
@@ -211,6 +218,7 @@ mod tests {
         assert!(matches!(err, ConfigError::NoTeamSpecified));
     }
 
+    // T-275: validate returns error when a team entry is an empty string
     #[test]
     fn validate_rejects_empty_team_name() {
         let config = Config {
@@ -220,6 +228,7 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
+    // T-276: validate returns error when default_team is not listed in teams
     #[test]
     fn validate_rejects_default_not_in_teams() {
         let config = Config {
@@ -230,6 +239,7 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
+    // T-277: data_dir uses XDG_DATA_HOME when that environment variable is set
     #[test]
     fn data_dir_respects_xdg() {
         let dir = data_dir_with(|key| match key {
@@ -240,6 +250,7 @@ mod tests {
         assert_eq!(dir, PathBuf::from("/tmp/test-xdg/sae"));
     }
 
+    // T-278: data_dir falls back to ~/.local/share/sae when XDG_DATA_HOME is unset
     #[test]
     fn data_dir_falls_back_to_home() {
         let dir = data_dir_with(|key| match key {
@@ -250,6 +261,7 @@ mod tests {
         assert_eq!(dir, PathBuf::from("/home/testuser/.local/share/sae"));
     }
 
+    // T-279: validate_team_name accepts lowercase alphanumeric names with hyphens
     #[test]
     fn validate_team_name_valid() {
         assert!(validate_team_name("gaji").is_ok());
@@ -258,6 +270,7 @@ mod tests {
         assert!(validate_team_name("a").is_ok());
     }
 
+    // T-280: validate_team_name rejects names containing path traversal sequences
     #[test]
     fn validate_team_name_rejects_path_traversal() {
         assert!(validate_team_name("../etc").is_err());
@@ -265,6 +278,7 @@ mod tests {
         assert!(validate_team_name("./team").is_err());
     }
 
+    // T-281: validate_team_name rejects empty, uppercase, spaces, and special chars
     #[test]
     fn validate_team_name_rejects_special_chars() {
         assert!(validate_team_name("").is_err());
@@ -275,6 +289,7 @@ mod tests {
         assert!(validate_team_name("dot.name").is_err());
     }
 
+    // T-282: resolve_team returns InvalidValue error for a team name with ".."
     #[test]
     fn resolve_team_rejects_invalid_name() {
         let config = Config::default();
@@ -282,6 +297,7 @@ mod tests {
         assert!(matches!(err, ConfigError::InvalidValue(_)));
     }
 
+    // T-283: team_db_path returns a path ending with "<team>.db"
     #[test]
     fn team_db_path_format() {
         let config = Config {

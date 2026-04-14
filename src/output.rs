@@ -251,14 +251,14 @@ mod tests {
         }
     }
 
-    // TC-007: status human-readable empty list → empty string
+    // T-129: status human-readable empty list → empty string
     #[test]
     fn status_human_empty_returns_empty_string() {
         let out = status(&[], false).unwrap();
         assert!(out.is_empty(), "empty list should produce empty output");
     }
 
-    // TC-007: status human-readable synced team → expected lines
+    // T-130: status human-readable synced team → expected lines
     #[test]
     fn status_human_synced_contains_expected_lines() {
         let out = status(&[make_synced("team-a", 10)], false).unwrap();
@@ -267,7 +267,7 @@ mod tests {
         assert!(out.contains("Last sync: 2025-01-01 00:00:00"));
     }
 
-    // TC-007: status human-readable not-synced team → expected lines
+    // T-131: status human-readable not-synced team → expected lines
     #[test]
     fn status_human_not_synced_contains_expected_lines() {
         let out = status(&[make_not_synced("team-b")], false).unwrap();
@@ -275,7 +275,7 @@ mod tests {
         assert!(out.contains("Not yet synced"));
     }
 
-    // TC-007: embed json → chunks_embedded field
+    // T-132: embed json → chunks_embedded field
     #[test]
     fn embed_json_contains_chunks_embedded() {
         let result = sae::storage::EmbedResult {
@@ -286,7 +286,7 @@ mod tests {
         assert_eq!(v["chunks_embedded"], 42);
     }
 
-    // TC-007: embed human-readable with done=0 → "Nothing to embed"
+    // T-133: embed human-readable with done=0 → "Nothing to embed"
     #[test]
     fn embed_human_zero_done_returns_nothing_to_embed() {
         let result = sae::storage::EmbedResult { chunks_embedded: 0 };
@@ -294,7 +294,7 @@ mod tests {
         assert_eq!(out, "Nothing to embed");
     }
 
-    // TC-007: embed human-readable chunks > 0 → "Embedded N chunks"
+    // T-134: embed human-readable chunks > 0 → "Embedded N chunks"
     #[test]
     fn embed_human_nonzero_returns_embedded_count() {
         let result = sae::storage::EmbedResult { chunks_embedded: 5 };
@@ -302,7 +302,7 @@ mod tests {
         assert_eq!(out, "Embedded 5 chunks");
     }
 
-    // TC-007: status error variant — error field displayed
+    // T-135: status error variant — error field displayed
     #[test]
     fn status_error_variant_serializes_message() {
         let statuses = vec![make_error("broken", "db missing")];
@@ -312,7 +312,7 @@ mod tests {
         assert_eq!(v[0]["error"], "db missing");
     }
 
-    // TC-007: status with checkpoint (interrupted sync) — last_page serialized
+    // T-136: status with checkpoint (interrupted sync) — last_page serialized
     #[test]
     fn status_synced_with_checkpoint_serializes_last_page() {
         let ts = TeamStatus {
@@ -335,7 +335,7 @@ mod tests {
         assert_eq!(v["sync_state"]["last_page"], 3);
     }
 
-    // TC-007: search json includes search_mode hybrid
+    // T-137: search json includes search_mode hybrid
     #[test]
     fn search_json_hybrid_includes_search_mode() {
         let out = search(&[], "test", true, true, None, "").unwrap();
@@ -344,7 +344,7 @@ mod tests {
         assert!(v["results"].is_array());
     }
 
-    // TC-007: search json includes search_mode fts
+    // T-138: search json includes search_mode fts
     #[test]
     fn search_json_fts_includes_search_mode() {
         let out = search(&[], "test", true, false, None, "").unwrap();
@@ -352,7 +352,7 @@ mod tests {
         assert_eq!(v["search_mode"], "fts");
     }
 
-    // TC-007: search human fts fallback shows notice
+    // T-139: search human fts fallback shows notice
     #[test]
     fn search_human_fts_fallback_shows_notice() {
         let results = vec![SearchResult {
@@ -368,7 +368,7 @@ mod tests {
         assert!(out.contains("semantic search unavailable"));
     }
 
-    // TC-007: search human hybrid does not show fallback notice
+    // T-140: search human hybrid does not show fallback notice
     #[test]
     fn search_human_hybrid_no_fallback_notice() {
         let results = vec![SearchResult {
