@@ -78,12 +78,14 @@ pub(crate) async fn run_ship(
 mod tests {
     use super::*;
 
+    // T-190: archive_category returns "Archived" when post has no category
     #[test]
     fn archive_no_category() {
         assert_eq!(archive_category(None), Some("Archived".into()));
         assert_eq!(archive_category(Some("")), Some("Archived".into()));
     }
 
+    // T-191: archive_category prefixes existing category with "Archived/"
     #[test]
     fn archive_with_category() {
         assert_eq!(
@@ -92,12 +94,14 @@ mod tests {
         );
     }
 
+    // T-192: archive_category returns None when post is already archived
     #[test]
     fn archive_already_archived() {
         assert_eq!(archive_category(Some("Archived")), None);
         assert_eq!(archive_category(Some("Archived/dev")), None);
     }
 
+    // T-193: archive_category treats "ArchivedData" as not archived (prefix only)
     #[test]
     fn archive_not_prefix_match() {
         assert_eq!(

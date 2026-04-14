@@ -1,12 +1,9 @@
 //! Structural audit tests for the sae codebase.
 //!
 //! These tests validate source-level properties (line counts, grep matches,
-//! module structure) that correspond to the audit spec T-001, T-003, T-004,
-//! T-007, T-008.
-//!
-//! They read source files at test time and assert on their textual content.
-//! This approach lets `cargo test` catch structural regressions without
-//! requiring external CI scripts.
+//! module structure) and read source files at test time to assert on their
+//! textual content. This approach lets `cargo test` catch structural
+//! regressions without requiring external CI scripts.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -100,26 +97,24 @@ fn count_in_function(source: &str, fn_name: &str, needle: &str) -> usize {
     count
 }
 
-// ---------------------------------------------------------------------------
-// T-001: Line count thresholds after extraction
-// ---------------------------------------------------------------------------
-
+// T-165: main.rs stays under 400 non-test lines after extraction
 #[test]
-fn t_001_main_rs_under_400_non_test_lines() {
+fn main_rs_under_400_non_test_lines() {
     let path = src_dir().join("main.rs");
     let lines = count_non_test_lines(&path);
     assert!(
         lines < 400,
-        "[T-001] main.rs has {lines} non-test lines, expected < 400"
+        "[T-165] main.rs has {lines} non-test lines, expected < 400"
     );
 }
 
+// T-166: each command file stays under 200 non-test lines
 #[test]
-fn t_001_each_command_file_under_200_non_test_lines() {
+fn each_command_file_under_200_non_test_lines() {
     let commands_dir = src_dir().join("commands");
     assert!(
         commands_dir.is_dir(),
-        "[T-001] src/commands/ directory does not exist"
+        "[T-166] src/commands/ directory does not exist"
     );
 
     let expected_files = ["search.rs", "post.rs", "archive.rs", "data.rs", "status.rs"];
@@ -127,57 +122,52 @@ fn t_001_each_command_file_under_200_non_test_lines() {
         let path = commands_dir.join(filename);
         assert!(
             path.exists(),
-            "[T-001] src/commands/{filename} does not exist"
+            "[T-166] src/commands/{filename} does not exist"
         );
         let lines = count_non_test_lines(&path);
         assert!(
             lines < 200,
-            "[T-001] commands/{filename} has {lines} non-test lines, expected < 200"
+            "[T-166] commands/{filename} has {lines} non-test lines, expected < 200"
         );
     }
 }
 
-// ---------------------------------------------------------------------------
-// T-003: eprintln! replaced with tracing::info! in run_embed
-// ---------------------------------------------------------------------------
-
+// T-167: run_embed uses tracing instead of eprintln! (zero eprintln! calls)
 #[test]
-fn t_003_run_embed_no_eprintln() {
+fn run_embed_no_eprintln() {
     let path = src_dir().join("commands").join("data.rs");
     assert!(
         path.exists(),
-        "[T-003] src/commands/data.rs does not exist (run_embed should live there)"
+        "[T-167] src/commands/data.rs does not exist (run_embed should live there)"
     );
     let source = fs::read_to_string(&path).unwrap();
     let count = count_in_function(&source, "run_embed", "eprintln!");
     assert_eq!(
         count, 0,
-        "[T-003] run_embed should contain 0 eprintln! calls, found {count}"
+        "[T-167] run_embed should contain 0 eprintln! calls, found {count}"
     );
 }
 
+// T-168: run_embed emits exactly one tracing::info! call
 #[test]
-fn t_003_run_embed_has_1_tracing_info() {
+fn run_embed_has_1_tracing_info() {
     let path = src_dir().join("commands").join("data.rs");
-    assert!(path.exists(), "[T-003] src/commands/data.rs does not exist");
+    assert!(path.exists(), "[T-168] src/commands/data.rs does not exist");
     let source = fs::read_to_string(&path).unwrap();
     let count = count_in_function(&source, "run_embed", "tracing::info!");
     assert_eq!(
         count, 1,
-        "[T-003] run_embed should contain 1 tracing::info! call, found {count}"
+        "[T-168] run_embed should contain 1 tracing::info! call, found {count}"
     );
 }
 
-// ---------------------------------------------------------------------------
-// T-004: embed_query warn! includes %query structured field
-// ---------------------------------------------------------------------------
-
+// T-169: embed_query warn! includes %query structured field
 #[test]
-fn t_004_embed_query_warn_includes_query_field() {
+fn embed_query_warn_includes_query_field() {
     let path = src_dir().join("commands").join("search.rs");
     assert!(
         path.exists(),
-        "[T-004] src/commands/search.rs does not exist"
+        "[T-169] src/commands/search.rs does not exist"
     );
     let source = fs::read_to_string(&path).unwrap();
 
@@ -197,22 +187,19 @@ fn t_004_embed_query_warn_includes_query_field() {
         let count = count_in_function(&source, "run_search", "%query");
         assert!(
             count >= 1,
-            "[T-004] run_search should contain at least 1 occurrence of '%query' \
+            "[T-169] run_search should contain at least 1 occurrence of '%query' \
              in a warn! call for embed_query failure, found {count}"
         );
     }
 }
 
-// ---------------------------------------------------------------------------
-// T-007: Each commands/*.rs has #[cfg(test)] module with at least 1 test
-// ---------------------------------------------------------------------------
-
+// T-170: each commands/*.rs has #[cfg(test)] module with at least 1 test
 #[test]
-fn t_007_each_command_file_has_test_module() {
+fn each_command_file_has_test_module() {
     let commands_dir = src_dir().join("commands");
     assert!(
         commands_dir.is_dir(),
-        "[T-007] src/commands/ directory does not exist"
+        "[T-170] src/commands/ directory does not exist"
     );
 
     let expected_files = ["search.rs", "post.rs", "archive.rs", "data.rs", "status.rs"];
@@ -220,26 +207,23 @@ fn t_007_each_command_file_has_test_module() {
         let path = commands_dir.join(filename);
         assert!(
             path.exists(),
-            "[T-007] src/commands/{filename} does not exist"
+            "[T-170] src/commands/{filename} does not exist"
         );
         let source = fs::read_to_string(&path).unwrap();
         assert!(
             source.contains("#[cfg(test)]"),
-            "[T-007] commands/{filename} should contain #[cfg(test)] module"
+            "[T-170] commands/{filename} should contain #[cfg(test)] module"
         );
         assert!(
             source.contains("#[test]"),
-            "[T-007] commands/{filename} should contain at least one #[test] function"
+            "[T-170] commands/{filename} should contain at least one #[test] function"
         );
     }
 }
 
-// ---------------------------------------------------------------------------
-// T-008: vec_search warn! includes %query and candidate_limit
-// ---------------------------------------------------------------------------
-
+// T-171: vec_search warn! includes %query structured field
 #[test]
-fn t_008_vec_search_warn_includes_query_field() {
+fn vec_search_warn_includes_query_field() {
     let path = src_dir().join("storage").join("search.rs");
     let source = fs::read_to_string(&path).unwrap();
 
@@ -247,18 +231,19 @@ fn t_008_vec_search_warn_includes_query_field() {
     let count = count_in_function(&source, "hybrid_search", "%query");
     assert!(
         count >= 1,
-        "[T-008] hybrid_search should contain '%query' in vec_search warn!, found {count}"
+        "[T-171] hybrid_search should contain '%query' in vec_search warn!, found {count}"
     );
 }
 
+// T-172: vec_search warn! includes candidate_limit structured field
 #[test]
-fn t_008_vec_search_warn_includes_candidate_limit() {
+fn vec_search_warn_includes_candidate_limit() {
     let path = src_dir().join("storage").join("search.rs");
     let source = fs::read_to_string(&path).unwrap();
 
     let count = count_in_function(&source, "hybrid_search", "candidate_limit");
     assert!(
         count >= 1,
-        "[T-008] hybrid_search should contain 'candidate_limit' in vec_search warn!, found {count}"
+        "[T-172] hybrid_search should contain 'candidate_limit' in vec_search warn!, found {count}"
     );
 }

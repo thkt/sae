@@ -166,49 +166,46 @@ mod tests {
     use std::io::Cursor;
     use tempfile::tempdir;
 
-    // TC-008: resolve_body(Some, None) → inline body
+    // T-110: resolve_body(Some, None) → inline body
     #[test]
     fn resolve_body_inline_text() {
         let result = resolve_body(Some("inline text"), None).unwrap();
         assert_eq!(result.as_deref(), Some("inline text"));
     }
 
-    // TC-008: resolve_body(None, None) → no body
+    // T-111: resolve_body(None, None) → no body
     #[test]
     fn resolve_body_none_returns_none() {
         let result = resolve_body(None, None).unwrap();
         assert_eq!(result, None);
     }
 
-    // TC-009: resolve_body with nonexistent file → error
+    // T-112: resolve_body with nonexistent file → error
     #[test]
     fn resolve_body_nonexistent_file_is_error() {
         let result = resolve_body(None, Some("/nonexistent/path.md"));
-        assert!(
-            result.is_err(),
-            "[TC-009] nonexistent file should return error"
-        );
+        assert!(result.is_err(), "nonexistent file should return error");
     }
 
-    // TC-010: resolve_body_with_reader(`-`) reads from stdin
+    // T-113: resolve_body_with_reader(`-`) reads from stdin
     #[test]
     fn resolve_body_with_reader_reads_stdin_when_dash() {
         let result = resolve_body_with_reader(None, Some("-"), &mut Cursor::new("本文\n")).unwrap();
         assert_eq!(
             result.as_deref(),
             Some("本文\n"),
-            "[TC-010] body from stdin should preserve trailing newline"
+            "body from stdin should preserve trailing newline"
         );
     }
 
-    // TC-010b: resolve_body_with_reader(`-`) with empty stdin → Some("")
+    // T-114: resolve_body_with_reader(`-`) with empty stdin → Some("")
     #[test]
     fn resolve_body_with_reader_empty_stdin_returns_empty_body() {
         let result = resolve_body_with_reader(None, Some("-"), &mut Cursor::new("")).unwrap();
         assert_eq!(
             result.as_deref(),
             Some(""),
-            "[TC-010b] empty stdin yields empty body string"
+            "empty stdin yields empty body string"
         );
     }
 
@@ -223,7 +220,7 @@ mod tests {
         assert_eq!(
             result.as_deref(),
             Some("# Hello\nBody from file"),
-            "[T-039] body should contain file contents"
+            "body should contain file contents"
         );
     }
 
@@ -235,7 +232,7 @@ mod tests {
         assert_eq!(
             result.as_deref(),
             Some("# Hello\nBody from stdin\n"),
-            "[T-040] body should contain stdin contents as-is"
+            "body should contain stdin contents as-is"
         );
     }
 }

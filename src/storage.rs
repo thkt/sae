@@ -16,27 +16,7 @@ use rurico::embed::EMBEDDING_DIMS;
 
 const SCHEMA_VERSION: u32 = 5;
 
-pub(crate) fn in_placeholders(len: usize) -> String {
-    (1..=len)
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-// Use when multiple IN clauses share a parameter list: unnamed `?` avoids
-// index collisions that numbered `?N` would cause when params are appended incrementally.
-pub(crate) fn anon_placeholders(n: usize) -> String {
-    vec!["?"; n].join(", ")
-}
-
-pub(crate) fn as_sql_params<T: rusqlite::types::ToSql>(
-    values: &[T],
-) -> Vec<&dyn rusqlite::types::ToSql> {
-    values
-        .iter()
-        .map(|v| v as &dyn rusqlite::types::ToSql)
-        .collect()
-}
+pub(crate) use amici::storage::{anon_placeholders, as_sql_params, in_placeholders};
 
 const DDL_FTS: &str = "\
     CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(\
@@ -501,6 +481,7 @@ pub fn test_post_row(number: u32) -> EsaPostRow {
 mod tests {
     use super::*;
 
+    // T-252: Db::open_memory initializes with the current schema version
     #[test]
     fn open_and_init_schema() {
         let db = Db::open_memory().unwrap();
@@ -508,6 +489,7 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
     }
 
+    // T-253: upsert_post inserts a post and count_posts reflects the change
     #[test]
     fn upsert_and_count() {
         let db = Db::open_memory().unwrap();
@@ -523,6 +505,7 @@ mod tests {
         assert_eq!(name, post.name);
     }
 
+    // T-254: upsert_post overwrites an existing post with the same number
     #[test]
     fn upsert_replaces_on_conflict() {
         let db = Db::open_memory().unwrap();
@@ -543,12 +526,14 @@ mod tests {
         assert_eq!(name, "Updated");
     }
 
+    // T-255: get_sync_state returns None on a fresh database
     #[test]
     fn sync_state_none_initially() {
         let db = Db::open_memory().unwrap();
         assert!(get_sync_state(db.conn()).unwrap().is_none());
     }
 
+    // T-256: save_sync_state and get_sync_state round-trip all fields correctly
     #[test]
     fn sync_state_roundtrip() {
         let db = Db::open_memory().unwrap();
@@ -576,14 +561,14 @@ mod tests {
         assert_eq!(state.updated_at, "2025-01-01 00:00:00");
     }
 
-    // TC-050: sync_harvested_within returns false when no sync state
+    // T-149: sync_harvested_within returns false when no sync state
     #[test]
     fn sync_harvested_within_false_when_no_state() {
         let db = Db::open_memory().unwrap();
         assert!(!sync_harvested_within(db.conn(), 300));
     }
 
-    // TC-050: sync_harvested_within returns true when harvest was recent
+    // T-149: sync_harvested_within returns true when harvest was recent
     #[test]
     fn sync_harvested_within_true_when_recent() {
         let db = Db::open_memory().unwrap();
@@ -605,7 +590,7 @@ mod tests {
         assert!(sync_harvested_within(db.conn(), 300));
     }
 
-    // TC-050: sync_harvested_within returns false when harvest was older than TTL
+    // T-149: sync_harvested_within returns false when harvest was older than TTL
     #[test]
     fn sync_harvested_within_false_when_stale() {
         let db = Db::open_memory().unwrap();
@@ -624,6 +609,7 @@ mod tests {
         assert!(!sync_harvested_within(db.conn(), 300));
     }
 
+    // T-257: save_sync_state with last_page=None clears a previous checkpoint
     #[test]
     fn sync_state_clears_checkpoint() {
         let db = Db::open_memory().unwrap();
@@ -661,6 +647,7 @@ mod tests {
         );
     }
 
+    // T-258: Db::open creates a database file on disk at the specified path
     #[test]
     fn open_file_db() {
         let dir = tempfile::tempdir().unwrap();
@@ -674,6 +661,7 @@ mod tests {
         assert_eq!(count_posts(db.conn()).unwrap(), 1);
     }
 
+    // T-259: upsert_post inside a transaction batches inserts correctly
     #[test]
     fn transaction_upsert_batch() {
         let db = Db::open_memory().unwrap();
@@ -692,6 +680,7 @@ mod tests {
         assert_eq!(name, test_post_row(10).name);
     }
 
+    // T-260: rechunk_post creates chunk rows and FTS entries for each section
     #[test]
     fn rechunk_creates_chunks_and_fts() {
         let db = Db::open_memory().unwrap();
@@ -714,6 +703,7 @@ mod tests {
         assert_eq!(hits, 1);
     }
 
+    // T-261: rechunk_post replaces old chunks and removes stale FTS entries
     #[test]
     fn rechunk_replaces_old_chunks() {
         let db = Db::open_memory().unwrap();
@@ -736,6 +726,7 @@ mod tests {
         assert_eq!(hits, 0);
     }
 
+    // T-262: rechunk_post removes orphaned vector embeddings from previous chunks
     #[test]
     fn rechunk_cleans_orphaned_vec_chunks() {
         let db = Db::open_memory().unwrap();
@@ -769,6 +760,7 @@ mod tests {
         assert_eq!(orphans, 0, "rechunk should clean orphaned embeddings");
     }
 
+    // T-263: FTS trigram index matches a 3-character Japanese substring
     #[test]
     fn fts_trigram_japanese() {
         let db = Db::open_memory().unwrap();
@@ -787,7 +779,7 @@ mod tests {
         assert_eq!(hits, 1);
     }
 
-    // T-005: rechunk 後 fts_chunks 件数 = chunks 件数 (FR-002)
+    // T-144: rechunk 後 fts_chunks 件数 = chunks 件数 (FR-002)
     #[test]
     fn rechunk_fts_count_matches_chunks_count() {
         let db = Db::open_memory().unwrap();
@@ -811,10 +803,11 @@ mod tests {
             .unwrap();
         assert_eq!(
             fts_count, chunks_count,
-            "[T-005] fts_chunks count ({fts_count}) must equal chunks count ({chunks_count})"
+            "fts_chunks count ({fts_count}) must equal chunks count ({chunks_count})"
         );
     }
 
+    // T-264: enrich_body prepends name, author, category, and tags to body
     #[test]
     fn enrich_body_includes_all_metadata() {
         let mut row = test_post_row(1);
@@ -830,6 +823,7 @@ mod tests {
         );
     }
 
+    // T-265: enrich_body omits category and tags line when both are absent
     #[test]
     fn enrich_body_no_category_no_tags() {
         let mut row = test_post_row(1);
@@ -840,6 +834,7 @@ mod tests {
         assert_eq!(enriched, "Untitled\nalice\n\ntext");
     }
 
+    // T-266: enrich_body includes category but no tags when tags are empty
     #[test]
     fn enrich_body_category_only() {
         let mut row = test_post_row(1);
@@ -849,6 +844,7 @@ mod tests {
         assert_eq!(enriched, "Post\nalice dev\n\nbody");
     }
 
+    // T-267: enrich_body includes tags but no category when category is None
     #[test]
     fn enrich_body_tags_only() {
         let mut row = test_post_row(1);
@@ -881,7 +877,7 @@ mod tests {
         assert_eq!(title, "見出し");
     }
 
-    // T-007: migrate_fts_v4 失敗時 rollback 確認 (FR-005)
+    // T-145: migrate_fts_v4 失敗時 rollback 確認 (FR-005)
     #[test]
     fn migrate_fts_v4_rollback_on_failure() {
         ensure_sqlite_vec().unwrap();
@@ -928,12 +924,12 @@ mod tests {
         let result = migrate_fts_v4(&conn);
         assert!(
             result.is_err(),
-            "[T-007] migrate_fts_v4 should fail when chunks table is missing"
+            "migrate_fts_v4 should fail when chunks table is missing"
         );
 
         // rollback 確認: version は 3 のまま
         let version = get_schema_version(&conn).unwrap();
-        assert_eq!(version, 3, "[T-007] schema_version should remain 3");
+        assert_eq!(version, 3, "schema_version should remain 3");
 
         // rollback 確認: 旧 FTS data が生存（実検索 MATCH）
         let post: u32 = conn
@@ -943,10 +939,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(post, 1, "[T-007] old FTS data must survive after rollback");
+        assert_eq!(post, 1, "old FTS data must survive after rollback");
     }
 
-    // T-004: temp file DB + 旧スキーマ → Db::open で migration (FR-005)
+    // T-143: temp file DB + 旧スキーマ → Db::open で migration (FR-005)
     #[test]
     fn migration_from_old_schema_rebuilds_fts_with_section_title() {
         let dir = tempfile::tempdir().unwrap();
@@ -1027,7 +1023,7 @@ mod tests {
         let version = get_schema_version(db.conn()).unwrap();
         assert_eq!(
             version, 5,
-            "[T-004] schema_version should be 5 after full migration"
+            "schema_version should be 5 after full migration"
         );
 
         // section_title の語で検索可能
@@ -1039,10 +1035,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(
-            hits > 0,
-            "[T-004] section_title term should match after migration"
-        );
+        assert!(hits > 0, "section_title term should match after migration");
 
         // fts_chunks_vocab が機能
         let vocab: u32 = db
@@ -1051,7 +1044,7 @@ mod tests {
                 row.get(0)
             })
             .unwrap();
-        assert!(vocab > 0, "[T-004] fts_chunks_vocab should be populated");
+        assert!(vocab > 0, "fts_chunks_vocab should be populated");
     }
 
     // T-010: v4 スキーマ → Db::open で v5 のみ migration (FTS 再構築なし)
@@ -1095,7 +1088,7 @@ mod tests {
         let version = get_schema_version(db.conn()).unwrap();
         assert_eq!(
             version, 5,
-            "[T-010] schema_version should be 5 after v4→v5 migration"
+            "schema_version should be 5 after v4→v5 migration"
         );
 
         // FTS データが保持されている（再構築されていない）
@@ -1107,7 +1100,7 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert!(hits > 0, "[T-010] FTS data should survive v4→v5 migration");
+        assert!(hits > 0, "FTS data should survive v4→v5 migration");
 
         // vec_chunks テーブルが存在する
         let tbl_count: u32 = db
@@ -1121,7 +1114,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             tbl_count, 1,
-            "[T-010] vec_chunks table should exist after v5 migration"
+            "vec_chunks table should exist after v5 migration"
         );
     }
 
@@ -1142,10 +1135,10 @@ mod tests {
         migrate(&conn, 0).unwrap();
 
         let version = get_schema_version(&conn).unwrap();
-        assert_eq!(version, 5, "[T-011] migrate(0) should reach v5");
+        assert_eq!(version, 5, "migrate(0) should reach v5");
     }
 
-    // TC-005: WAL recovery — is_recoverable_open_error recognizes DatabaseCorrupt
+    // T-147: WAL recovery — is_recoverable_open_error recognizes DatabaseCorrupt
     #[test]
     fn is_recoverable_for_database_corrupt() {
         use rusqlite::ffi::ErrorCode;
@@ -1159,7 +1152,7 @@ mod tests {
         assert!(is_recoverable_open_error(&err));
     }
 
-    // TC-005: WAL recovery — is_recoverable_open_error recognizes CannotOpen
+    // T-147: WAL recovery — is_recoverable_open_error recognizes CannotOpen
     #[test]
     fn is_recoverable_for_cannot_open() {
         use rusqlite::ffi::ErrorCode;
@@ -1173,14 +1166,14 @@ mod tests {
         assert!(is_recoverable_open_error(&err));
     }
 
-    // TC-005: WAL recovery — non-SqliteFailure error is not recoverable
+    // T-147: WAL recovery — non-SqliteFailure error is not recoverable
     #[test]
     fn is_not_recoverable_for_non_sqlite_failure() {
         let err = rusqlite::Error::QueryReturnedNoRows;
         assert!(!is_recoverable_open_error(&err));
     }
 
-    // TC-002: init_schema rejects a non-numeric (corrupt) schema version string
+    // T-146: init_schema rejects a non-numeric (corrupt) schema version string
     #[test]
     fn init_schema_rejects_corrupt_version() {
         let dir = tempfile::tempdir().unwrap();
@@ -1195,16 +1188,16 @@ mod tests {
             .unwrap();
         }
         match Db::open(&path) {
-            Ok(_) => panic!("[TC-002] expected Db::open to fail"),
+            Ok(_) => panic!("expected Db::open to fail"),
             Err(StorageError::Open(msg)) => assert!(
                 msg.contains("corrupt schema version"),
-                "[TC-002] unexpected error message: {msg}"
+                "unexpected error message: {msg}"
             ),
-            Err(e) => panic!("[TC-002] expected StorageError::Open, got {e:?}"),
+            Err(e) => panic!("expected StorageError::Open, got {e:?}"),
         }
     }
 
-    // TC-008: init_schema rejects a schema version number higher than SCHEMA_VERSION
+    // T-148: init_schema rejects a schema version number higher than SCHEMA_VERSION
     #[test]
     fn init_schema_rejects_future_version() {
         let dir = tempfile::tempdir().unwrap();
@@ -1215,18 +1208,18 @@ mod tests {
             set_schema_version(&conn, 99).unwrap();
         }
         match Db::open(&path) {
-            Ok(_) => panic!("[TC-008] expected Db::open to fail"),
+            Ok(_) => panic!("expected Db::open to fail"),
             Err(StorageError::Open(msg)) => {
                 assert!(
                     msg.contains("newer than supported"),
-                    "[TC-008] unexpected error message: {msg}"
+                    "unexpected error message: {msg}"
                 );
                 assert!(
                     msg.contains("99"),
-                    "[TC-008] message should include the invalid version: {msg}"
+                    "message should include the invalid version: {msg}"
                 );
             }
-            Err(e) => panic!("[TC-008] expected StorageError::Open, got {e:?}"),
+            Err(e) => panic!("expected StorageError::Open, got {e:?}"),
         }
     }
 }

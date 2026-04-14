@@ -1,11 +1,13 @@
 use std::io::{IsTerminal, Read};
 
-use rurico::embed::{ChunkedEmbedding, Embed, Embedder};
+use rurico::embed::{ChunkedEmbedding, Embed};
 use rurico::reranker::Rerank;
 use sae::config::Config;
 
-use super::reranker::{ModelLoad, try_load_embedder, try_load_reranker};
+use super::reranker::{try_load_embedder, try_load_reranker};
 use crate::{SaeError, require_db};
+use amici::model::ModelLoad;
+use amici::model::embedder::degraded_reason_user_note;
 
 macro_rules! warn_user {
     ($user_msg:literal; $($log:tt)+) => {{
@@ -28,12 +30,13 @@ pub(crate) fn run_search(
     let team = config.resolve_team(team)?;
     let db = require_db(config, team)?;
     let embedder = try_load_embedder();
-    embedder.emit_load_hint(
-        "run 'sae model download && sae embed <team>' to enable semantic search",
-        "embedding model",
-    );
-    let embed_info = if let ModelLoad::Ready(ref emb) = embedder {
-        match auto_embed_pending(&db, emb) {
+    if let Err(reason) = embedder
+        && let Some(note) = degraded_reason_user_note(*reason)
+    {
+        eprintln!("Warning: {note}");
+    }
+    let embed_info = if let Ok(emb) = embedder {
+        match auto_embed_pending(&db, emb.as_ref()) {
             Ok(info) => Some(info),
             Err(e) => {
                 warn_user!("auto-embed failed ({e}), continuing with existing embeddings"; error = %e, "auto_embed_pending failed, continuing search");
@@ -43,7 +46,7 @@ pub(crate) fn run_search(
     } else {
         None
     };
-    let query_embedding = if let ModelLoad::Ready(ref e) = embedder {
+    let query_embedding = if let Ok(e) = embedder {
         match e.embed_query(query) {
             Ok(v) => Some(v),
             Err(e) => {
@@ -93,7 +96,10 @@ pub(crate) fn run_search(
     Ok(output)
 }
 
-fn auto_embed_pending(db: &sae::storage::Db, embedder: &Embedder) -> Result<(u32, bool), SaeError> {
+fn auto_embed_pending(
+    db: &sae::storage::Db,
+    embedder: &dyn Embed,
+) -> Result<(u32, bool), SaeError> {
     const EMBED_BUDGET: u32 = 128;
     auto_embed_pending_with(db, EMBED_BUDGET, |texts| {
         embedder
@@ -213,7 +219,7 @@ mod tests {
         }
     }
 
-    // TC-037: auto_embed_pending_with skips embed_fn when no unembedded chunks
+    // T-115: auto_embed_pending_with skips embed_fn when no unembedded chunks
     #[test]
     fn auto_embed_skips_when_no_unembedded_chunks() {
         let db = sae::storage::Db::open_memory().unwrap();
@@ -229,7 +235,7 @@ mod tests {
         );
     }
 
-    // TC-038: auto_embed_pending_with embeds chunks within budget
+    // T-116: auto_embed_pending_with embeds chunks within budget
     #[test]
     fn auto_embed_embeds_pending_chunks() {
         use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
@@ -253,7 +259,7 @@ mod tests {
         assert_eq!(sae::storage::count_unembedded_chunks(db.conn()).unwrap(), 0);
     }
 
-    // TC-039: auto_embed_pending_with respects budget and leaves excess chunks unembedded
+    // T-117: auto_embed_pending_with respects budget and leaves excess chunks unembedded
     #[test]
     fn auto_embed_respects_budget() {
         use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
@@ -287,7 +293,7 @@ mod tests {
         );
     }
 
-    // TC-040: auto_embed_pending_with propagates embed_fn error without side effects
+    // T-118: auto_embed_pending_with propagates embed_fn error without side effects
     #[test]
     fn auto_embed_propagates_embed_error() {
         let db = sae::storage::Db::open_memory().unwrap();
@@ -308,7 +314,7 @@ mod tests {
         );
     }
 
-    // TC-041: auto_embed_pending_with rejects embedding count mismatch
+    // T-119: auto_embed_pending_with rejects embedding count mismatch
     #[test]
     fn auto_embed_rejects_count_mismatch() {
         let db = sae::storage::Db::open_memory().unwrap();
@@ -332,23 +338,6 @@ mod tests {
         );
     }
 
-    // TC-010: try_load_embedder_with returns Absent when model is not cached
-    #[test]
-    fn try_load_embedder_with_returns_absent_when_no_model() {
-        use crate::commands::reranker::try_load_embedder_with;
-        let result = try_load_embedder_with(|| Ok::<_, &str>(None));
-        assert!(matches!(result, ModelLoad::Absent));
-    }
-
-    // TC-010: try_load_embedder_with returns Failed on cache check error
-    #[test]
-    fn try_load_embedder_with_returns_failed_on_cache_error() {
-        use crate::commands::reranker::try_load_embedder_with;
-        let result =
-            try_load_embedder_with(|| Err::<Option<rurico::embed::Artifacts>, _>("cache error"));
-        assert!(matches!(result, ModelLoad::Failed(_)));
-    }
-
     fn resolve_search(
         value: Option<&str>,
         stdin: &str,
@@ -363,16 +352,19 @@ mod tests {
         )
     }
 
+    // T-194: resolve_value reads query from piped stdin when no argument given
     #[test]
     fn resolve_value_reads_piped_stdin_when_missing() {
         assert_eq!(resolve_search(None, "認証\n", false).unwrap(), "認証");
     }
 
+    // T-195: resolve_value reads query from stdin when "-" is passed as argument
     #[test]
     fn resolve_value_reads_stdin_when_dash_is_passed() {
         assert_eq!(resolve_search(Some("-"), "認証\n", true).unwrap(), "認証");
     }
 
+    // T-196: resolve_value returns the provided argument value directly
     #[test]
     fn resolve_value_returns_value_when_present() {
         assert_eq!(
@@ -381,6 +373,7 @@ mod tests {
         );
     }
 
+    // T-197: resolve_value errors when "-" is passed but stdin is empty
     #[test]
     fn resolve_value_rejects_dash_with_empty_stdin() {
         let err = resolve_search(Some("-"), "", true).unwrap_err();
@@ -390,6 +383,7 @@ mod tests {
         );
     }
 
+    // T-198: resolve_value errors when piped stdin contains only whitespace
     #[test]
     fn resolve_value_rejects_whitespace_only_piped_stdin() {
         let err = resolve_search(None, "  \n  \t  ", false).unwrap_err();
@@ -399,6 +393,7 @@ mod tests {
         );
     }
 
+    // T-199: resolve_value errors with usage hint when argument missing on terminal
     #[test]
     fn resolve_value_rejects_missing_on_terminal() {
         let err = resolve_search(None, "", true).unwrap_err();
@@ -413,13 +408,13 @@ mod tests {
         );
     }
 
-    // TC-059: parse_date_arg returns None when no value provided
+    // T-120: parse_date_arg returns None when no value provided
     #[test]
     fn parse_date_arg_returns_none_when_absent() {
         assert!(parse_date_arg(None, "after").unwrap().is_none());
     }
 
-    // TC-060: parse_date_arg parses valid YYYY-MM-DD into DateTime<Utc>
+    // T-121: parse_date_arg parses valid YYYY-MM-DD into DateTime<Utc>
     #[test]
     fn parse_date_arg_parses_valid_date() {
         let dt = parse_date_arg(Some("2025-06-30"), "after")
@@ -428,7 +423,7 @@ mod tests {
         assert_eq!(dt.format("%Y-%m-%d").to_string(), "2025-06-30");
     }
 
-    // TC-061: parse_date_arg returns Input error for non-ISO8601 date
+    // T-122: parse_date_arg returns Input error for non-ISO8601 date
     #[test]
     fn parse_date_arg_rejects_invalid_date() {
         let err = parse_date_arg(Some("30/06/2025"), "after").unwrap_err();

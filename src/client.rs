@@ -503,12 +503,14 @@ mod tests {
         assert_eq!(post.name, "Getting Started");
     }
 
+    // T-203: EsaClient::from_env returns TokenNotSet when ESA_ACCESS_TOKEN is absent
     #[test]
     fn from_env_missing_token() {
         let err = EsaClient::from_env_with(|_| Err(std::env::VarError::NotPresent)).unwrap_err();
         assert!(matches!(err, ClientError::TokenNotSet));
     }
 
+    // T-204: EsaClient::from_env returns TokenNotSet when ESA_ACCESS_TOKEN is empty
     #[test]
     fn from_env_empty_token() {
         let err = EsaClient::from_env_with(|key| match key {
@@ -519,6 +521,7 @@ mod tests {
         assert!(matches!(err, ClientError::TokenNotSet));
     }
 
+    // T-205: EsaClient Debug output redacts the token value
     #[test]
     fn debug_redacts_token() {
         let client = EsaClient::new("secret-token-123".into());
@@ -527,16 +530,19 @@ mod tests {
         assert!(!debug.contains("secret-token-123"));
     }
 
+    // T-206: retry_wait returns Retry-After header duration on 429
     #[test]
     fn retry_wait_429_uses_header() {
         assert_eq!(retry_wait(429, Some("3"), 0), Some(Duration::from_secs(3)));
     }
 
+    // T-207: retry_wait returns default 5s on 429 when Retry-After header is absent
     #[test]
     fn retry_wait_429_defaults() {
         assert_eq!(retry_wait(429, None, 0), Some(Duration::from_secs(5)));
     }
 
+    // T-208: retry_wait applies exponential backoff for 5xx errors
     #[test]
     fn retry_wait_500_backoff() {
         assert_eq!(retry_wait(500, None, 0), Some(Duration::from_millis(500)));
@@ -544,12 +550,14 @@ mod tests {
         assert_eq!(retry_wait(503, None, 2), Some(Duration::from_millis(2000)));
     }
 
+    // T-209: retry_wait returns None for non-retryable status codes (4xx)
     #[test]
     fn retry_wait_non_retryable() {
         assert!(retry_wait(400, None, 0).is_none());
         assert!(retry_wait(404, None, 0).is_none());
     }
 
+    // T-210: retry_wait falls back to default 5s when Retry-After header is non-numeric
     #[test]
     fn retry_wait_429_non_numeric_header_defaults() {
         assert_eq!(
@@ -604,10 +612,7 @@ mod tests {
         let post = test_esa_post(None);
         let json_str = serde_json::to_string(&post).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert!(
-            v["body_md"].is_null(),
-            "[T-036] body_md should be null when None"
-        );
+        assert!(v["body_md"].is_null(), "body_md should be null when None");
         assert_eq!(v["number"], 42);
         assert_eq!(v["name"], "Test Post");
     }
@@ -620,31 +625,26 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(
             v["body_md"], "# Hello\nWorld",
-            "[T-043] body_md should be the string value"
+            "body_md should be the string value"
         );
     }
 
-    // T-048: create --json → EsaPost JSON (name, number, url)
-    // T-050: update --json → EsaPost JSON
-    // T-051: archive --json → EsaPost JSON
-    // T-052: ship --json → EsaPost JSON
-    // All share the same serialization contract: EsaPost → JSON with name, number, url.
+    // T-048: EsaPost → JSON serialization contract (name, number, url, wip, tags).
+    // Shared by create/update/archive/ship --json code paths.
+    // T-187: esa_post_json_has_name_number_url
     #[test]
     fn esa_post_json_has_name_number_url() {
         let post = test_esa_post(Some("body".to_string()));
         let json_str = serde_json::to_string(&post).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(v["number"], 42, "[T-048] number field");
-        assert_eq!(v["name"], "Test Post", "[T-048] name field");
-        assert_eq!(
-            v["url"], "https://example.esa.io/posts/42",
-            "[T-048] url field"
-        );
-        assert_eq!(v["wip"], false, "[T-048] wip field");
-        assert_eq!(v["tags"][0], "rust", "[T-048] tags field");
+        assert_eq!(v["number"], 42, "number field");
+        assert_eq!(v["name"], "Test Post", "name field");
+        assert_eq!(v["url"], "https://example.esa.io/posts/42", "url field");
+        assert_eq!(v["wip"], false, "wip field");
+        assert_eq!(v["tags"][0], "rust", "tags field");
     }
 
-    // TC-007: create_post sends correct request body
+    // T-108: create_post sends correct request body
     #[tokio::test]
     async fn create_post_sends_correct_payload() {
         let server = MockServer::start().await;
@@ -679,7 +679,7 @@ mod tests {
             .unwrap();
     }
 
-    // TC-007: create_post omits None fields via skip_serializing_if
+    // T-109: create_post omits None fields via skip_serializing_if
     #[tokio::test]
     async fn create_post_omits_none_fields() {
         let server = MockServer::start().await;

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use amici::storage::append_eq_filter;
 use rurico::reranker::Rerank;
 use rusqlite::Connection;
 use tracing::warn;
@@ -318,18 +319,6 @@ fn append_tags_filter(
     }
 }
 
-fn append_eq_filter(
-    sql: &mut String,
-    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
-    column: &str,
-    value: Option<&str>,
-) {
-    if let Some(v) = value {
-        sql.push_str(&format!(" AND {column} = ?"));
-        params.push(Box::new(v.to_string()));
-    }
-}
-
 fn append_date_filter(
     sql: &mut String,
     params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
@@ -590,6 +579,7 @@ mod tests {
         }
     }
 
+    // T-228: fts_search matches a 3-character trigram term
     #[test]
     fn fts_trigram_match_3chars() {
         let db = Db::open_memory().unwrap();
@@ -601,6 +591,7 @@ mod tests {
         assert!(post_nums.contains(&3));
     }
 
+    // T-229: fts_search expands a short (< 3 char) query via vocab table
     #[test]
     fn fts_vocab_expansion_short_term() {
         let db = Db::open_memory().unwrap();
@@ -612,6 +603,7 @@ mod tests {
         assert!(post_nums.contains(&1) || post_nums.contains(&2));
     }
 
+    // T-230: fts_search expands a single-character query via vocab table
     #[test]
     fn fts_single_char_expansion() {
         let db = Db::open_memory().unwrap();
@@ -621,6 +613,7 @@ mod tests {
         assert!(!hits.is_empty());
     }
 
+    // T-231: rrf_merge ranks the result appearing in both sources first
     #[test]
     fn rrf_merge_combines_sources() {
         let fts: Vec<(u32, f64)> = vec![(1, 0.0), (2, 0.0)];
@@ -631,6 +624,7 @@ mod tests {
         assert_eq!(merged.len(), 3);
     }
 
+    // T-232: hybrid_search returns results via FTS when no embeddings are present
     #[test]
     fn hybrid_search_fts_only() {
         let db = Db::open_memory().unwrap();
@@ -652,6 +646,7 @@ mod tests {
         assert!(!results[0].post_url.is_empty());
     }
 
+    // T-233: hybrid_search returns empty results for an empty query string
     #[test]
     fn empty_query_returns_empty() {
         let db = Db::open_memory().unwrap();
@@ -670,6 +665,7 @@ mod tests {
         assert!(results.is_empty());
     }
 
+    // T-234: normalize_punctuation strips general punct but preserves technical symbols
     #[test]
     fn normalize_punctuation_strips_general_keeps_technical() {
         // General punctuation → space
@@ -693,6 +689,7 @@ mod tests {
         assert_eq!(normalize_punctuation("rate-limit"), "rate limit");
     }
 
+    // T-235: clean_for_trigram distributes OR groups and removes sub-trigram terms
     #[test]
     fn clean_for_trigram_adapts_query() {
         // Control chars removed + sub-trigram dropped + distributed
@@ -726,6 +723,7 @@ mod tests {
         );
     }
 
+    // T-236: fts_search does not error when query contains punctuation characters
     #[test]
     fn fts_search_with_punctuation_does_not_error() {
         let db = Db::open_memory().unwrap();
@@ -734,6 +732,7 @@ mod tests {
         fts_search(db.conn(), "認証、フロー", 10, &SearchFilter::default()).unwrap();
     }
 
+    // T-237: fts_search finds C++, rate-limit, and std::io after normalization
     #[test]
     fn fts_search_technical_terms_e2e() {
         let db = Db::open_memory().unwrap();
@@ -773,6 +772,7 @@ mod tests {
         assert!(hits.iter().any(|h| h.post_number == 10));
     }
 
+    // T-238: batch_fetch_post_meta returns metadata for each requested post number
     #[test]
     fn batch_fetch_post_meta_works() {
         let db = Db::open_memory().unwrap();
@@ -785,6 +785,7 @@ mod tests {
         assert!(!meta.get(&1).unwrap().updated_at.is_empty());
     }
 
+    // T-239: batch_fetch_post_meta returns empty map for an empty input slice
     #[test]
     fn batch_fetch_empty() {
         let db = Db::open_memory().unwrap();
@@ -792,7 +793,7 @@ mod tests {
         assert!(meta.is_empty());
     }
 
-    // T-024: recent post scores higher than old post
+    // T-153: recent post scores higher than old post
     #[test]
     fn hybrid_search_recency_boost_recent_post_scores_higher() {
         let db = Db::open_memory().unwrap();
@@ -833,7 +834,7 @@ mod tests {
         );
     }
 
-    // T-025: unparseable updated_at does not panic, decay=0.0 applied
+    // T-154: unparseable updated_at does not panic, decay=0.0 applied
     #[test]
     fn hybrid_search_unparseable_updated_at_no_panic() {
         let db = Db::open_memory().unwrap();
@@ -865,7 +866,7 @@ mod tests {
         );
     }
 
-    // T-002: content のみの語で fts_search ヒット — regression (FR-003)
+    // T-151: content のみの語で fts_search ヒット — regression (FR-003)
     #[test]
     fn fts_search_matches_content_only_term_regression() {
         let db = Db::open_memory().unwrap();
@@ -877,12 +878,12 @@ mod tests {
         let hits = fts_search(db.conn(), "フローの説明", 10, &SearchFilter::default()).unwrap();
         assert!(
             !hits.is_empty(),
-            "[T-002] content-only term must still be found (regression)"
+            "content-only term must still be found (regression)"
         );
         assert_eq!(hits[0].post_number, 1);
     }
 
-    // T-003: heading なし preamble chunk で rechunk + fts_search エラーなし (FR-004)
+    // T-152: heading なし preamble chunk で rechunk + fts_search エラーなし (FR-004)
     #[test]
     fn fts_search_preamble_chunk_no_heading_no_error() {
         let db = Db::open_memory().unwrap();
@@ -890,20 +891,20 @@ mod tests {
         let post = test_post(1, "Preamble", body);
         storage::upsert_post(db.conn(), &post).unwrap();
         let count = storage::rechunk_post(db.conn(), 1, body).unwrap();
-        assert_eq!(count, 1, "[T-003] preamble should produce 1 chunk");
+        assert_eq!(count, 1, "preamble should produce 1 chunk");
 
         let hits = fts_search(db.conn(), "見出しなし", 10, &SearchFilter::default()).unwrap();
         assert!(
             !hits.is_empty(),
-            "[T-003] preamble chunk should be searchable by content"
+            "preamble chunk should be searchable by content"
         );
         assert!(
             hits[0].section_title.is_none(),
-            "[T-003] preamble chunk should have no section_title"
+            "preamble chunk should have no section_title"
         );
     }
 
-    // T-001: section_title のみの語で fts_search ヒット (FR-003)
+    // T-150: section_title のみの語で fts_search ヒット (FR-003)
     #[test]
     fn fts_search_matches_section_title_only_term() {
         let db = Db::open_memory().unwrap();
@@ -915,12 +916,13 @@ mod tests {
         let hits = fts_search(db.conn(), "認証ガイド", 10, &SearchFilter::default()).unwrap();
         assert!(
             !hits.is_empty(),
-            "[T-001] section_title-only term should be found via FTS"
+            "section_title-only term should be found via FTS"
         );
         assert_eq!(hits[0].post_number, 1);
         assert_eq!(hits[0].section_title.as_deref(), Some("認証ガイド"));
     }
 
+    // T-240: fts_search finds posts by name, author, category, and tag metadata
     #[test]
     fn fts_search_matches_enriched_metadata() {
         let db = Db::open_memory().unwrap();
@@ -973,8 +975,7 @@ mod tests {
             score: 0.75,
             match_source: MatchSource::Fts,
         };
-        let json_str =
-            serde_json::to_string(&result).expect("[T-035] SearchResult should serialize");
+        let json_str = serde_json::to_string(&result).expect("SearchResult should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["post_number"], 42);
         assert_eq!(v["post_name"], "Test Post");
@@ -985,17 +986,19 @@ mod tests {
         assert_eq!(v["snippet"], "snippet text");
     }
 
-    // TC-006: truncate_snippet
+    // T-156: truncate_snippet
     #[test]
     fn truncate_snippet_short_unchanged() {
         assert_eq!(truncate_snippet("abc", 5), "abc");
     }
 
+    // T-241: truncate_snippet appends "..." when snippet exceeds char limit
     #[test]
     fn truncate_snippet_over_limit_truncated() {
         assert_eq!(truncate_snippet("abcdef", 3), "abc...");
     }
 
+    // T-242: truncate_snippet truncates at character boundary for multi-byte chars
     #[test]
     fn truncate_snippet_multibyte_boundary() {
         let s = "あいうえお";
@@ -1003,6 +1006,7 @@ mod tests {
         assert_eq!(result, "あいう...");
     }
 
+    // T-243: hybrid_search uses vector search when embeddings are present
     #[test]
     fn hybrid_search_with_embeddings() {
         use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
@@ -1042,6 +1046,7 @@ mod tests {
     }
 
     /// Distinct embeddings produce different vec_search distances and ranking.
+    // T-244: vec_search ranks the chunk with the closer embedding first
     #[test]
     fn vec_search_ranks_closer_embedding_first() {
         use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
@@ -1094,6 +1099,7 @@ mod tests {
     }
 
     /// MaxSim dedup: multiple sub-embeddings per chunk, best distance wins.
+    // T-245: vec_search deduplicates chunks and keeps only the best sub-embedding
     #[test]
     fn maxsim_dedup_selects_best_sub_embedding() {
         use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
@@ -1167,7 +1173,7 @@ mod tests {
         }
     }
 
-    // TC-004: MaxSim selects the sub-embedding with the lower distance (closer to query)
+    // T-155: MaxSim selects the sub-embedding with the lower distance (closer to query)
     #[test]
     fn vec_search_maxsim_picks_closer_sub_embedding() {
         use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
@@ -1204,14 +1210,15 @@ mod tests {
         query[0] = 1.0;
 
         let hits = vec_search(db.conn(), &query, 1, &SearchFilter::default()).unwrap();
-        assert_eq!(hits.len(), 1, "[TC-004] should return exactly one hit");
+        assert_eq!(hits.len(), 1, "should return exactly one hit");
         assert!(
             hits[0].distance < 0.1,
-            "[TC-004] MaxSim must select sub_idx=1 (closer sub-embedding), got distance={}",
+            "MaxSim must select sub_idx=1 (closer sub-embedding), got distance={}",
             hits[0].distance
         );
     }
 
+    // T-246: fts_search with category filter returns only posts in that category
     #[test]
     fn fts_filter_category_narrows_results() {
         let db = Db::open_memory().unwrap();
@@ -1245,6 +1252,7 @@ mod tests {
         );
     }
 
+    // T-247: fts_search with created_by filter returns only posts by that author
     #[test]
     fn fts_filter_created_by_narrows_results() {
         let db = Db::open_memory().unwrap();
@@ -1278,6 +1286,7 @@ mod tests {
         );
     }
 
+    // T-248: fts_search with tags filter returns only posts containing that tag
     #[test]
     fn fts_filter_tags_narrows_results() {
         let db = Db::open_memory().unwrap();
@@ -1311,6 +1320,7 @@ mod tests {
         );
     }
 
+    // T-249: fts_search with no filters returns all matching posts
     #[test]
     fn fts_filter_all_none_returns_all_matching() {
         let db = Db::open_memory().unwrap();
@@ -1323,6 +1333,7 @@ mod tests {
         );
     }
 
+    // T-250: fts_search with empty tags slice does not filter results
     #[test]
     fn fts_filter_empty_tags_returns_all_matching() {
         let db = Db::open_memory().unwrap();
@@ -1344,6 +1355,7 @@ mod tests {
         );
     }
 
+    // T-251: hybrid_search with category filter returns only posts in that category
     #[test]
     fn hybrid_search_filter_category_narrows_results() {
         let db = Db::open_memory().unwrap();
@@ -1410,7 +1422,7 @@ mod tests {
             .and_utc()
     }
 
-    // TC-056: updated_after filters out posts with updated_at before threshold
+    // T-158: updated_after filters out posts with updated_at before threshold
     #[test]
     fn hybrid_search_updated_after_excludes_old_posts() {
         let db = Db::open_memory().unwrap();
@@ -1435,7 +1447,7 @@ mod tests {
         assert_eq!(results[0].post_number, 2);
     }
 
-    // TC-057: updated_before filters out posts with updated_at after threshold
+    // T-159: updated_before filters out posts with updated_at after threshold
     #[test]
     fn hybrid_search_updated_before_excludes_new_posts() {
         let db = Db::open_memory().unwrap();
@@ -1460,7 +1472,7 @@ mod tests {
         assert_eq!(results[0].post_number, 1);
     }
 
-    // TC-058: updated_after and updated_before combined apply AND condition
+    // T-160: updated_after and updated_before combined apply AND condition
     #[test]
     fn hybrid_search_date_range_returns_matching_posts_only() {
         let db = Db::open_memory().unwrap();
@@ -1491,7 +1503,7 @@ mod tests {
         assert_eq!(results[0].post_number, 1);
     }
 
-    // TC-044: hybrid_search with MockReranker applies cross-encoder scores to results
+    // T-157: hybrid_search with MockReranker applies cross-encoder scores to results
     #[test]
     fn hybrid_search_reranker_applies_cross_encoder_scores() {
         use rurico::reranker::MockReranker;

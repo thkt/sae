@@ -1,4 +1,5 @@
-use rurico::embed::{EmbedInitError, Embedder, ModelId, ProbeStatus};
+use amici::model::embedder::{DegradedReason, try_load_embedder_with};
+use rurico::embed::ModelId;
 use sae::config::Config;
 
 use crate::{SaeError, require_db, resolve_client};
@@ -17,31 +18,33 @@ pub(crate) async fn run_harvest(
 }
 
 pub(crate) fn run_embed(config: &Config, team: &str, json: bool) -> Result<String, SaeError> {
-    use rurico::embed::Embed;
-
     let team = config.resolve_team(Some(team))?;
     let db = require_db(config, team)?;
 
     let paths = require_embed_model()?;
     let spinner = crate::progress::Spinner::new("Loading model...");
-    match Embedder::probe(&paths) {
-        Ok(ProbeStatus::Available) => {}
-        Ok(ProbeStatus::BackendUnavailable) => {
+    let embed_err: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+    let embedder = match try_load_embedder_with(
+        || Ok::<_, std::convert::Infallible>(Some(paths)),
+        |e| tracing::warn!(error = %e, "failed to delete corrupt model files"),
+        |e| embed_err.set(Some(e.to_string())),
+    ) {
+        Ok(embedder) => embedder,
+        Err(DegradedReason::BackendUnavailable) => {
             spinner.cancel();
             return Err(SaeError::Other("MLX backend is unavailable".to_string()));
         }
-        Err(e) => {
+        Err(reason) => {
             spinner.cancel();
-            if matches!(e, EmbedInitError::ModelCorrupt { .. })
-                && let Err(del_err) = paths.delete_files()
-            {
-                tracing::warn!(error = %del_err, "failed to delete corrupt model files");
-            }
-            return Err(SaeError::Other(format!("Model probe failed: {e}")));
+            let detail = embed_err
+                .take()
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default();
+            return Err(SaeError::Other(format!(
+                "Model probe failed: {reason:?}{detail}"
+            )));
         }
-    }
-    let embedder =
-        Embedder::new(&paths).map_err(|e| SaeError::Other(format!("Failed to load model: {e}")))?;
+    };
     spinner.finish("Model ready");
 
     const BATCH_SIZE: u32 = 128;
@@ -81,32 +84,31 @@ pub(crate) fn run_model_download(json: bool) -> Result<String, SaeError> {
             return Err(SaeError::Other(format!("Failed to download model: {e}")));
         }
     };
-    match Embedder::probe(&paths) {
-        Ok(ProbeStatus::Available) => {}
-        Ok(ProbeStatus::BackendUnavailable) => {
-            spinner.cancel();
-            return Err(SaeError::Other(
-                "Model downloaded but MLX backend is unavailable".to_string(),
-            ));
-        }
-        Err(e) => {
-            spinner.cancel();
-            if matches!(e, EmbedInitError::ModelCorrupt { .. })
-                && let Err(del_err) = paths.delete_files()
-            {
-                tracing::warn!(error = %del_err, "failed to delete corrupt model files");
-            }
-            return Err(SaeError::Other(format!("Model probe failed: {e}")));
-        }
-    }
-    match Embedder::new(&paths) {
+    let load_err: std::cell::Cell<Option<String>> = std::cell::Cell::new(None);
+    match try_load_embedder_with(
+        || Ok::<_, std::convert::Infallible>(Some(paths)),
+        |e| tracing::warn!(error = %e, "failed to delete corrupt model files"),
+        |e| load_err.set(Some(e.to_string())),
+    ) {
         Ok(_) => {
             spinner.finish("Model ready");
             crate::output::model_download(json)
         }
-        Err(e) => {
+        Err(DegradedReason::BackendUnavailable) => {
             spinner.cancel();
-            Err(SaeError::Other(format!("Failed to verify model: {e}")))
+            Err(SaeError::Other(
+                "Model downloaded but MLX backend is unavailable".to_string(),
+            ))
+        }
+        Err(reason) => {
+            spinner.cancel();
+            let detail = load_err
+                .take()
+                .map(|e| format!(": {e}"))
+                .unwrap_or_default();
+            Err(SaeError::Other(format!(
+                "Model probe failed: {reason:?}{detail}"
+            )))
         }
     }
 }

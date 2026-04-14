@@ -69,7 +69,7 @@ mod tests {
         }
     }
 
-    // T-007: at least 1 test co-located with status handlers
+    // T-124: at least 1 test co-located with status handlers
     #[test]
     fn team_status_error_constructs_correctly() {
         let ts = TeamStatus::error("myteam", "db error");
@@ -79,7 +79,7 @@ mod tests {
         assert_eq!(ts.posts, 0);
     }
 
-    // TC-011: query_team_status with sync state present → TeamStatus::Synced
+    // T-125: query_team_status with sync state present → TeamStatus::Synced
     #[test]
     fn query_team_status_returns_synced_when_state_present() {
         let dir = tempfile::tempdir().unwrap();
@@ -105,7 +105,7 @@ mod tests {
         assert!(ts.sync_state.is_some());
     }
 
-    // TC-011: query_team_status with no sync state → TeamStatus::NotSynced
+    // T-126: query_team_status with no sync state → TeamStatus::NotSynced
     #[test]
     fn query_team_status_returns_not_synced_when_no_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -117,7 +117,7 @@ mod tests {
         assert!(ts.sync_state.is_none());
     }
 
-    // TC-009: posts exist but sync_state absent → NotSynced (bug: was reporting Synced)
+    // T-123: posts exist but sync_state absent → NotSynced (bug: was reporting Synced)
     #[test]
     fn query_team_status_returns_not_synced_when_posts_exist_but_no_sync_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -133,7 +133,7 @@ mod tests {
         assert!(ts.sync_state.is_none());
     }
 
-    // RC-004: unembedded chunks after interrupted embed → pending_embed > 0
+    // T-176: unembedded chunks after interrupted embed → pending_embed > 0
     #[test]
     fn query_team_status_reports_pending_embed_when_chunks_unembedded() {
         let dir = tempfile::tempdir().unwrap();
@@ -161,7 +161,7 @@ mod tests {
         assert!(ts.pending_embed > 0, "should report unembedded chunks");
     }
 
-    // RC-004: no unembedded chunks → pending_embed == 0
+    // T-177: no unembedded chunks → pending_embed == 0
     #[test]
     fn query_team_status_reports_zero_pending_embed_when_no_chunks() {
         let dir = tempfile::tempdir().unwrap();

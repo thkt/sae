@@ -127,6 +127,7 @@ fn parse_heading(line: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    // T-176: empty_body_returns_empty
     #[test]
     fn empty_body_returns_empty() {
         assert!(chunk_markdown("").is_empty());
@@ -134,6 +135,7 @@ mod tests {
         assert!(chunk_markdown("\n\n").is_empty());
     }
 
+    // T-177: no_headings_returns_full_chunk
     #[test]
     fn no_headings_returns_full_chunk() {
         let chunks = chunk_markdown("Just some text\nwithout headings");
@@ -142,6 +144,7 @@ mod tests {
         assert!(chunks[0].section_title.is_none());
     }
 
+    // T-178: three_headings_three_chunks
     #[test]
     fn three_headings_three_chunks() {
         let md = "# Introduction\nHello world\n# Details\nSome details\n# Conclusion\nGoodbye";
@@ -153,6 +156,7 @@ mod tests {
         assert!(chunks.iter().all(|c| c.chunk_type == ChunkType::Section));
     }
 
+    // T-179: preamble_before_first_heading
     #[test]
     fn preamble_before_first_heading() {
         let md = "Some preamble\n\n# First Section\nContent";
@@ -163,6 +167,7 @@ mod tests {
         assert_eq!(chunks[1].section_title.as_deref(), Some("First Section"));
     }
 
+    // T-180: respects_code_fences
     #[test]
     fn respects_code_fences() {
         let md = "# Real Heading\nContent\n```\n# Not A Heading\n```\n# Another Heading\nMore";
@@ -173,6 +178,7 @@ mod tests {
         assert_eq!(chunks[1].section_title.as_deref(), Some("Another Heading"));
     }
 
+    // T-181: nested_headings
     #[test]
     fn nested_headings() {
         let md = "# H1\nText1\n## H2\nText2\n### H3\nText3";
@@ -182,18 +188,21 @@ mod tests {
         assert!(chunks[0].content.contains("Text1"));
     }
 
+    // T-182: heading_only_returns_empty
     #[test]
     fn heading_only_returns_empty() {
         let chunks = chunk_markdown("# Title Only");
         assert!(chunks.is_empty());
     }
 
+    // T-183: headings_only_no_body_returns_empty
     #[test]
     fn headings_only_no_body_returns_empty() {
         let chunks = chunk_markdown("# H1\n## H2\n### H3");
         assert!(chunks.is_empty());
     }
 
+    // T-184: heading_with_trailing_hashes
     #[test]
     fn heading_with_trailing_hashes() {
         let md = "# Title ##\nContent";
@@ -201,6 +210,7 @@ mod tests {
         assert_eq!(chunks[0].section_title.as_deref(), Some("Title"));
     }
 
+    // T-185: rejects_invalid_headings
     #[test]
     fn rejects_invalid_headings() {
         assert!(parse_heading("#NoSpace").is_none());
@@ -275,6 +285,7 @@ mod tests {
         assert_eq!(chunks.len(), 1, "exactly at threshold should not split");
     }
 
+    // T-186: tilde_fences
     #[test]
     fn tilde_fences() {
         let md = "# Before\nText\n~~~\n# Inside Fence\n~~~\n# After\nMore";

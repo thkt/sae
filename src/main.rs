@@ -381,10 +381,10 @@ mod tests {
     #[test]
     fn shorthand_without_flags_has_json_false() {
         let cli = parse_cli_args(["sae", "query"]).unwrap();
-        assert!(!cli.json, "[T-049] json should default to false");
+        assert!(!cli.json, "json should default to false");
         match cli.command {
             Command::Search { query, .. } => assert_eq!(query.as_deref(), Some("query")),
-            other => panic!("[T-049] expected Search, got {other:?}"),
+            other => panic!("expected Search, got {other:?}"),
         }
     }
 
@@ -394,13 +394,14 @@ mod tests {
         let cli = parse_cli_args(["sae", "create", "--name", "Test Post", "--dry-run"]).unwrap();
         match cli.command {
             Command::Create { args } => {
-                assert_eq!(args.name, "Test Post", "[T-038] name should match");
-                assert!(args.dry_run, "[T-038] dry_run should be true");
+                assert_eq!(args.name, "Test Post", "name should match");
+                assert!(args.dry_run, "dry_run should be true");
             }
-            other => panic!("[T-038] expected Create, got {other:?}"),
+            other => panic!("expected Create, got {other:?}"),
         }
     }
 
+    // T-200: --body-file "-" parses correctly with body_file set to "-"
     #[test]
     fn body_file_dash_parses_as_stdin() {
         let cli =
@@ -410,10 +411,10 @@ mod tests {
                 assert_eq!(
                     args.body_file.as_deref(),
                     Some("-"),
-                    "[T-040] body_file should be \"-\" for stdin"
+                    "body_file should be \"-\" for stdin"
                 );
             }
-            other => panic!("[T-040] expected Create, got {other:?}"),
+            other => panic!("expected Create, got {other:?}"),
         }
     }
 
@@ -432,7 +433,7 @@ mod tests {
         ]);
         assert!(
             result.is_err(),
-            "[T-041] --body and --body-file together should be a clap error"
+            "--body and --body-file together should be a clap error"
         );
     }
 
@@ -444,10 +445,10 @@ mod tests {
             Command::Archive {
                 number, dry_run, ..
             } => {
-                assert_eq!(number, 42, "[T-046] post number should be 42");
-                assert!(dry_run, "[T-046] dry_run should be true");
+                assert_eq!(number, 42, "post number should be 42");
+                assert!(dry_run, "dry_run should be true");
             }
-            other => panic!("[T-046] expected Archive, got {other:?}"),
+            other => panic!("expected Archive, got {other:?}"),
         }
     }
 
@@ -459,28 +460,30 @@ mod tests {
             let after_help = subcommand_after_help(sub.get_name());
             assert!(
                 after_help.contains("Examples"),
-                "[T-042] subcommand '{}' should have Examples in after_help",
+                "subcommand '{}' should have Examples in after_help",
                 sub.get_name()
             );
         }
     }
 
+    // T-201: create subcommand help text includes stdin pipe example
     #[test]
     fn create_help_includes_stdin_example() {
         let after_help = subcommand_after_help("create");
         assert!(
             after_help.contains("cat body.md | sae create --name \"Title\" --body-file -"),
-            "[T-042] create help should include stdin example"
+            "create help should include stdin example"
         );
     }
 
+    // T-202: search subcommand help text includes stdin pipe examples
     #[test]
     fn search_help_includes_stdin_examples() {
         let after_help = subcommand_after_help("search");
         for snippet in ["echo \"認証\" | sae search", "sae search -"] {
             assert!(
                 after_help.contains(snippet),
-                "[T-042] search help should include stdin example '{snippet}'"
+                "search help should include stdin example '{snippet}'"
             );
         }
     }
@@ -493,17 +496,17 @@ mod tests {
             Command::Model { command } => match command {
                 ModelCommand::Download => {} // pass
             },
-            other => panic!("[T-001] expected Model {{ Download }}, got {other:?}"),
+            other => panic!("expected Model {{ Download }}, got {other:?}"),
         }
     }
 
-    // T-002/T-003: `sae model` → clap error (not rewritten to search shorthand)
+    // T-002: `sae model` → clap error (not rewritten to search shorthand)
     #[test]
     fn model_without_subcommand_is_clap_error() {
         let result = parse_cli_args(["sae", "model"]);
         assert!(
             result.is_err(),
-            "[T-002] model without subcommand should be clap error, not search shorthand"
+            "model without subcommand should be clap error, not search shorthand"
         );
     }
 
@@ -511,12 +514,12 @@ mod tests {
     #[test]
     fn model_download_with_json_flag() {
         let cli = parse_cli_args(["sae", "--json", "model", "download"]).unwrap();
-        assert!(cli.json, "[T-004] global json flag should be true");
+        assert!(cli.json, "global json flag should be true");
         match cli.command {
             Command::Model { command } => match command {
                 ModelCommand::Download => {} // pass
             },
-            other => panic!("[T-004] expected Model {{ Download }}, got {other:?}"),
+            other => panic!("expected Model {{ Download }}, got {other:?}"),
         }
     }
 
@@ -526,13 +529,13 @@ mod tests {
         let cli = parse_cli_args(["sae", "embed", "myteam"]).unwrap();
         match cli.command {
             Command::Embed { team } => {
-                assert_eq!(team, "myteam", "[T-005] team should be myteam");
+                assert_eq!(team, "myteam", "team should be myteam");
             }
-            other => panic!("[T-005] expected Embed, got {other:?}"),
+            other => panic!("expected Embed, got {other:?}"),
         }
     }
 
-    // TC-012: multi-positional args without valid search expansion → clap error
+    // T-127: multi-positional args without valid search expansion → clap error
     #[test]
     fn multi_positional_args_not_shorthand() {
         let result = parse_cli_args(["sae", "foo", "bar"]);
@@ -552,11 +555,11 @@ mod tests {
                 team,
                 with_body,
             } => {
-                assert_eq!(number, 42, "[T-050] post number should be 42");
-                assert_eq!(team, None, "[T-050] team should be None");
-                assert!(!with_body, "[T-050] with_body should default to false");
+                assert_eq!(number, 42, "post number should be 42");
+                assert_eq!(team, None, "team should be None");
+                assert!(!with_body, "with_body should default to false");
             }
-            other => panic!("[T-050] expected Get, got {other:?}"),
+            other => panic!("expected Get, got {other:?}"),
         }
     }
 
@@ -570,15 +573,11 @@ mod tests {
                 team,
                 with_body,
             } => {
-                assert_eq!(number, 42, "[T-051] post number should be 42");
-                assert_eq!(
-                    team.as_deref(),
-                    Some("myteam"),
-                    "[T-051] team should be myteam"
-                );
-                assert!(with_body, "[T-051] with_body should be true");
+                assert_eq!(number, 42, "post number should be 42");
+                assert_eq!(team.as_deref(), Some("myteam"), "team should be myteam");
+                assert!(with_body, "with_body should be true");
             }
-            other => panic!("[T-051] expected Get, got {other:?}"),
+            other => panic!("expected Get, got {other:?}"),
         }
     }
 
@@ -588,14 +587,10 @@ mod tests {
         let cli = parse_cli_args(["sae", "update", "42", "--name", "New Title"]).unwrap();
         match cli.command {
             Command::Update { args } => {
-                assert_eq!(args.number, 42, "[T-052] post number should be 42");
-                assert_eq!(
-                    args.name.as_deref(),
-                    Some("New Title"),
-                    "[T-052] name should match"
-                );
+                assert_eq!(args.number, 42, "post number should be 42");
+                assert_eq!(args.name.as_deref(), Some("New Title"), "name should match");
             }
-            other => panic!("[T-052] expected Update, got {other:?}"),
+            other => panic!("expected Update, got {other:?}"),
         }
     }
 
@@ -607,10 +602,10 @@ mod tests {
             Command::Ship {
                 number, dry_run, ..
             } => {
-                assert_eq!(number, 42, "[T-053] post number should be 42");
-                assert!(!dry_run, "[T-053] dry_run should default to false");
+                assert_eq!(number, 42, "post number should be 42");
+                assert!(!dry_run, "dry_run should default to false");
             }
-            other => panic!("[T-053] expected Ship, got {other:?}"),
+            other => panic!("expected Ship, got {other:?}"),
         }
     }
 
@@ -622,10 +617,10 @@ mod tests {
             Command::Ship {
                 number, dry_run, ..
             } => {
-                assert_eq!(number, 42, "[T-054] post number should be 42");
-                assert!(dry_run, "[T-054] dry_run should be true");
+                assert_eq!(number, 42, "post number should be 42");
+                assert!(dry_run, "dry_run should be true");
             }
-            other => panic!("[T-054] expected Ship, got {other:?}"),
+            other => panic!("expected Ship, got {other:?}"),
         }
     }
 
@@ -635,9 +630,9 @@ mod tests {
         let cli = parse_cli_args(["sae", "status"]).unwrap();
         match cli.command {
             Command::Status { team } => {
-                assert_eq!(team, None, "[T-055] team should be None");
+                assert_eq!(team, None, "team should be None");
             }
-            other => panic!("[T-055] expected Status, got {other:?}"),
+            other => panic!("expected Status, got {other:?}"),
         }
     }
 
@@ -647,17 +642,13 @@ mod tests {
         let cli = parse_cli_args(["sae", "status", "--team", "myteam"]).unwrap();
         match cli.command {
             Command::Status { team } => {
-                assert_eq!(
-                    team.as_deref(),
-                    Some("myteam"),
-                    "[T-056] team should be myteam"
-                );
+                assert_eq!(team.as_deref(), Some("myteam"), "team should be myteam");
             }
-            other => panic!("[T-056] expected Status, got {other:?}"),
+            other => panic!("expected Status, got {other:?}"),
         }
     }
 
-    // TC-014: non-search subcommand names are not rewritten as search shorthand
+    // T-128: non-search subcommand names are not rewritten as search shorthand
     #[test]
     fn all_subcommands_not_shorthand() {
         // `search` itself parses as Command::Search via the normal path — excluded.
@@ -670,7 +661,7 @@ mod tests {
                     result.as_ref().map(|c| &c.command),
                     Ok(Command::Search { .. })
                 ),
-                "[TC-014] subcommand '{cmd}' should not be rewritten as Search shorthand"
+                "subcommand '{cmd}' should not be rewritten as Search shorthand"
             );
         }
     }

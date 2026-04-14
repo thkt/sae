@@ -113,6 +113,7 @@ mod tests {
         }
     }
 
+    // T-223: add_chunked_embeddings stores embedding and clears unembedded queue
     #[test]
     fn add_and_query_embeddings() {
         let db = Db::open_memory().unwrap();
@@ -133,6 +134,7 @@ mod tests {
         assert!(has_embeddings(db.conn()));
     }
 
+    // T-224: add_chunked_embeddings skips chunks that are already embedded
     #[test]
     fn skip_already_embedded() {
         let db = Db::open_memory().unwrap();
@@ -149,6 +151,7 @@ mod tests {
         assert_eq!(added, 0);
     }
 
+    // T-225: add_chunked_embeddings stores multiple sub-embeddings per chunk
     #[test]
     fn multi_chunk_stores_all_sub_embeddings() {
         let db = Db::open_memory().unwrap();
@@ -168,12 +171,14 @@ mod tests {
         assert!(has_embeddings(db.conn()));
     }
 
+    // T-226: count_unembedded_chunks returns zero on a fresh empty database
     #[test]
     fn count_unembedded_returns_zero_on_empty_db() {
         let db = Db::open_memory().unwrap();
         assert_eq!(count_unembedded_chunks(db.conn()).unwrap(), 0);
     }
 
+    // T-227: count_unembedded_chunks decrements after embedding is added
     #[test]
     fn count_unembedded_returns_correct_count_before_and_after_embed() {
         let db = Db::open_memory().unwrap();
