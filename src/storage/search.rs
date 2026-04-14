@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 
+use amici::storage::append_eq_filter;
 use rurico::reranker::Rerank;
 use rusqlite::Connection;
 use tracing::warn;
@@ -315,18 +316,6 @@ fn append_tags_filter(
         for &tag in tags {
             params.push(Box::new(tag.to_string()));
         }
-    }
-}
-
-fn append_eq_filter(
-    sql: &mut String,
-    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
-    column: &str,
-    value: Option<&str>,
-) {
-    if let Some(v) = value {
-        sql.push_str(&format!(" AND {column} = ?"));
-        params.push(Box::new(v.to_string()));
     }
 }
 

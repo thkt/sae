@@ -32,6 +32,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "amici"
+version = "0.1.0"
+source = "git+https://github.com/thkt/amici?rev=76b4b35#76b4b357e889f005d69d3e0973427cf087e6342e"
+dependencies = [
+ "rurico",
+ "rusqlite",
+]
+
+[[package]]
 name = "android_system_properties"
 version = "0.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2398,6 +2407,7 @@ checksum = "9774ba4a74de5f7b1c1451ed6cd5285a32eddb5cccb8cc655a4e50009e06477f"
 name = "sae"
 version = "0.1.0"
 dependencies = [
+ "amici",
  "chrono",
  "clap",
  "reqwest 0.13.2",
@@ -2406,7 +2416,6 @@ dependencies = [
  "serde",
  "serde_json",
  "serial_test",
- "strsim",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

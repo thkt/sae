@@ -1,10 +1,12 @@
 use std::io::{IsTerminal, Read};
 
-use rurico::embed::{ChunkedEmbedding, Embed, Embedder};
+use rurico::embed::{ChunkedEmbedding, Embed};
 use rurico::reranker::Rerank;
 use sae::config::Config;
 
-use super::reranker::{ModelLoad, try_load_embedder, try_load_reranker};
+use amici::model::ModelLoad;
+use amici::model::embedder::DegradedReason;
+use super::reranker::{try_load_embedder, try_load_reranker};
 use crate::{SaeError, require_db};
 
 macro_rules! warn_user {
@@ -28,12 +30,21 @@ pub(crate) fn run_search(
     let team = config.resolve_team(team)?;
     let db = require_db(config, team)?;
     let embedder = try_load_embedder();
-    embedder.emit_load_hint(
-        "run 'sae model download && sae embed <team>' to enable semantic search",
-        "embedding model",
-    );
-    let embed_info = if let ModelLoad::Ready(ref emb) = embedder {
-        match auto_embed_pending(&db, emb) {
+    // Embedder: per-variant DegradedReason. Reranker: emit_load_hint. Intentionally asymmetric (different API shapes).
+    match embedder {
+        Err(DegradedReason::NotInstalled) => {
+            eprintln!(
+                "Hint: run 'sae model download && sae embed <team>' to enable semantic search"
+            );
+        }
+        Err(DegradedReason::Disabled) => {}
+        Err(DegradedReason::BackendUnavailable | DegradedReason::ProbeFailed) => {
+            eprintln!("Warning: embedding model not available")
+        }
+        Ok(_) => {}
+    }
+    let embed_info = if let Ok(emb) = embedder {
+        match auto_embed_pending(&db, emb.as_ref()) {
             Ok(info) => Some(info),
             Err(e) => {
                 warn_user!("auto-embed failed ({e}), continuing with existing embeddings"; error = %e, "auto_embed_pending failed, continuing search");
@@ -43,7 +54,7 @@ pub(crate) fn run_search(
     } else {
         None
     };
-    let query_embedding = if let ModelLoad::Ready(ref e) = embedder {
+    let query_embedding = if let Ok(e) = embedder {
         match e.embed_query(query) {
             Ok(v) => Some(v),
             Err(e) => {
@@ -93,7 +104,7 @@ pub(crate) fn run_search(
     Ok(output)
 }
 
-fn auto_embed_pending(db: &sae::storage::Db, embedder: &Embedder) -> Result<(u32, bool), SaeError> {
+fn auto_embed_pending(db: &sae::storage::Db, embedder: &dyn Embed) -> Result<(u32, bool), SaeError> {
     const EMBED_BUDGET: u32 = 128;
     auto_embed_pending_with(db, EMBED_BUDGET, |texts| {
         embedder
@@ -330,23 +341,6 @@ mod tests {
             1,
             "mismatched embed must not change unembedded count"
         );
-    }
-
-    // TC-010: try_load_embedder_with returns Absent when model is not cached
-    #[test]
-    fn try_load_embedder_with_returns_absent_when_no_model() {
-        use crate::commands::reranker::try_load_embedder_with;
-        let result = try_load_embedder_with(|| Ok::<_, &str>(None));
-        assert!(matches!(result, ModelLoad::Absent));
-    }
-
-    // TC-010: try_load_embedder_with returns Failed on cache check error
-    #[test]
-    fn try_load_embedder_with_returns_failed_on_cache_error() {
-        use crate::commands::reranker::try_load_embedder_with;
-        let result =
-            try_load_embedder_with(|| Err::<Option<rurico::embed::Artifacts>, _>("cache error"));
-        assert!(matches!(result, ModelLoad::Failed(_)));
     }
 
     fn resolve_search(

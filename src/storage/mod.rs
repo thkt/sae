@@ -16,27 +16,7 @@ use rurico::embed::EMBEDDING_DIMS;
 
 const SCHEMA_VERSION: u32 = 5;
 
-pub(crate) fn in_placeholders(len: usize) -> String {
-    (1..=len)
-        .map(|i| format!("?{i}"))
-        .collect::<Vec<_>>()
-        .join(", ")
-}
-
-// Use when multiple IN clauses share a parameter list: unnamed `?` avoids
-// index collisions that numbered `?N` would cause when params are appended incrementally.
-pub(crate) fn anon_placeholders(n: usize) -> String {
-    vec!["?"; n].join(", ")
-}
-
-pub(crate) fn as_sql_params<T: rusqlite::types::ToSql>(
-    values: &[T],
-) -> Vec<&dyn rusqlite::types::ToSql> {
-    values
-        .iter()
-        .map(|v| v as &dyn rusqlite::types::ToSql)
-        .collect()
-}
+pub(crate) use amici::storage::{anon_placeholders, as_sql_params, in_placeholders};
 
 const DDL_FTS: &str = "\
     CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(\

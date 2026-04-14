@@ -19,7 +19,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
 rurico = { git = "https://github.com/thkt/rurico", rev = "03275f7" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
-strsim = "0.11"
+amici = { git = "https://github.com/thkt/amici", rev = "76b4b35" }
 
 
 [dev-dependencies]
