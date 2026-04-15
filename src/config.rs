@@ -1,5 +1,9 @@
-use serde::Deserialize;
+use std::env;
+use std::fs;
+use std::io;
 use std::path::PathBuf;
+
+use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
@@ -26,7 +30,7 @@ impl Config {
             return Ok(Self::default());
         }
         let content =
-            std::fs::read_to_string(&path).map_err(|e| ConfigError::ReadFailed(path.clone(), e))?;
+            fs::read_to_string(&path).map_err(|e| ConfigError::ReadFailed(path.clone(), e))?;
         let config: Self =
             serde_json::from_str(&content).map_err(|e| ConfigError::ParseFailed(path, e))?;
         config.validate()?;
@@ -55,7 +59,7 @@ impl Config {
         if let Some(t) = team {
             validate_team_name(t)?;
             if !self.teams.is_empty() && !self.teams.iter().any(|s| s == t) {
-                return Err(ConfigError::UnknownTeam(t.to_string()));
+                return Err(ConfigError::UnknownTeam(t.to_owned()));
             }
             return Ok(t);
         }
@@ -74,11 +78,11 @@ impl Config {
 }
 
 pub(crate) fn data_dir() -> Result<PathBuf, ConfigError> {
-    data_dir_with(|k| std::env::var(k))
+    data_dir_with(|k| env::var(k))
 }
 
 fn data_dir_with(
-    get_var: impl Fn(&str) -> Result<String, std::env::VarError>,
+    get_var: impl Fn(&str) -> Result<String, env::VarError>,
 ) -> Result<PathBuf, ConfigError> {
     let base = get_var("XDG_DATA_HOME").map(PathBuf::from).or_else(|_| {
         get_var("HOME")
@@ -89,7 +93,7 @@ fn data_dir_with(
 }
 
 fn config_dir() -> Result<PathBuf, ConfigError> {
-    let base = std::env::var("XDG_CONFIG_HOME")
+    let base = env::var("XDG_CONFIG_HOME")
         .map(PathBuf::from)
         .or_else(|_| dirs_fallback_config_home())?;
     Ok(base.join("sae"))
@@ -119,7 +123,7 @@ pub fn validate_team_name(name: &str) -> Result<(), ConfigError> {
 }
 
 fn home_dir() -> Result<PathBuf, ConfigError> {
-    std::env::var("HOME")
+    env::var("HOME")
         .map(PathBuf::from)
         .map_err(|_| ConfigError::HomeDirNotFound)
 }
@@ -133,7 +137,7 @@ pub enum ConfigError {
     NoTeamSpecified,
 
     #[error("Failed to read config at {0}: {1}")]
-    ReadFailed(PathBuf, std::io::Error),
+    ReadFailed(PathBuf, io::Error),
 
     #[error("Failed to parse config at {0}: {1}")]
     ParseFailed(PathBuf, serde_json::Error),
@@ -148,8 +152,9 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::env::VarError;
 
-    // T-268: Config::default has empty teams, no default_team, and embed_budget=50
+    // T-218: Config::default has empty teams, no default_team, and embed_budget=50
     #[test]
     fn default_config() {
         let config = Config::default();
@@ -158,7 +163,7 @@ mod tests {
         assert_eq!(config.embed_budget, 50);
     }
 
-    // T-269: resolve_team returns the team name when it is in the allowlist
+    // T-219: resolve_team returns the team name when it is in the allowlist
     #[test]
     fn resolve_explicit_team_in_allowlist() {
         let config = Config {
@@ -168,14 +173,14 @@ mod tests {
         assert_eq!(config.resolve_team(Some("alpha")).unwrap(), "alpha");
     }
 
-    // T-270: resolve_team accepts any team name when allowlist is empty
+    // T-220: resolve_team accepts any team name when allowlist is empty
     #[test]
     fn resolve_explicit_team_empty_allowlist() {
         let config = Config::default();
         assert_eq!(config.resolve_team(Some("any")).unwrap(), "any");
     }
 
-    // T-271: resolve_team returns default_team when no team argument is given
+    // T-221: resolve_team returns default_team when no team argument is given
     #[test]
     fn resolve_default_team() {
         let config = Config {
@@ -186,7 +191,7 @@ mod tests {
         assert_eq!(config.resolve_team(None).unwrap(), "beta");
     }
 
-    // T-272: resolve_team picks the sole team when there is one team and no default
+    // T-222: resolve_team picks the sole team when there is one team and no default
     #[test]
     fn resolve_single_team_no_default() {
         let config = Config {
@@ -196,7 +201,7 @@ mod tests {
         assert_eq!(config.resolve_team(None).unwrap(), "only");
     }
 
-    // T-273: resolve_team returns UnknownTeam error for a team not in the allowlist
+    // T-223: resolve_team returns UnknownTeam error for a team not in the allowlist
     #[test]
     fn resolve_unknown_team_returns_error() {
         let config = Config {
@@ -207,7 +212,7 @@ mod tests {
         assert!(matches!(err, ConfigError::UnknownTeam(_)));
     }
 
-    // T-274: resolve_team returns NoTeamSpecified error when multiple teams and no default
+    // T-224: resolve_team returns NoTeamSpecified error when multiple teams and no default
     #[test]
     fn resolve_no_team_no_default() {
         let config = Config {
@@ -218,7 +223,7 @@ mod tests {
         assert!(matches!(err, ConfigError::NoTeamSpecified));
     }
 
-    // T-275: validate returns error when a team entry is an empty string
+    // T-225: validate returns error when a team entry is an empty string
     #[test]
     fn validate_rejects_empty_team_name() {
         let config = Config {
@@ -228,7 +233,7 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
-    // T-276: validate returns error when default_team is not listed in teams
+    // T-226: validate returns error when default_team is not listed in teams
     #[test]
     fn validate_rejects_default_not_in_teams() {
         let config = Config {
@@ -239,29 +244,29 @@ mod tests {
         assert!(config.validate().is_err());
     }
 
-    // T-277: data_dir uses XDG_DATA_HOME when that environment variable is set
+    // T-227: data_dir uses XDG_DATA_HOME when that environment variable is set
     #[test]
     fn data_dir_respects_xdg() {
         let dir = data_dir_with(|key| match key {
             "XDG_DATA_HOME" => Ok("/tmp/test-xdg".into()),
-            _ => Err(std::env::VarError::NotPresent),
+            _ => Err(VarError::NotPresent),
         })
         .unwrap();
         assert_eq!(dir, PathBuf::from("/tmp/test-xdg/sae"));
     }
 
-    // T-278: data_dir falls back to ~/.local/share/sae when XDG_DATA_HOME is unset
+    // T-228: data_dir falls back to ~/.local/share/sae when XDG_DATA_HOME is unset
     #[test]
     fn data_dir_falls_back_to_home() {
         let dir = data_dir_with(|key| match key {
             "HOME" => Ok("/home/testuser".into()),
-            _ => Err(std::env::VarError::NotPresent),
+            _ => Err(VarError::NotPresent),
         })
         .unwrap();
         assert_eq!(dir, PathBuf::from("/home/testuser/.local/share/sae"));
     }
 
-    // T-279: validate_team_name accepts lowercase alphanumeric names with hyphens
+    // T-229: validate_team_name accepts lowercase alphanumeric names with hyphens
     #[test]
     fn validate_team_name_valid() {
         assert!(validate_team_name("gaji").is_ok());
@@ -270,7 +275,7 @@ mod tests {
         assert!(validate_team_name("a").is_ok());
     }
 
-    // T-280: validate_team_name rejects names containing path traversal sequences
+    // T-230: validate_team_name rejects names containing path traversal sequences
     #[test]
     fn validate_team_name_rejects_path_traversal() {
         assert!(validate_team_name("../etc").is_err());
@@ -278,7 +283,7 @@ mod tests {
         assert!(validate_team_name("./team").is_err());
     }
 
-    // T-281: validate_team_name rejects empty, uppercase, spaces, and special chars
+    // T-231: validate_team_name rejects empty, uppercase, spaces, and special chars
     #[test]
     fn validate_team_name_rejects_special_chars() {
         assert!(validate_team_name("").is_err());
@@ -289,7 +294,7 @@ mod tests {
         assert!(validate_team_name("dot.name").is_err());
     }
 
-    // T-282: resolve_team returns InvalidValue error for a team name with ".."
+    // T-232: resolve_team returns InvalidValue error for a team name with ".."
     #[test]
     fn resolve_team_rejects_invalid_name() {
         let config = Config::default();
@@ -297,7 +302,7 @@ mod tests {
         assert!(matches!(err, ConfigError::InvalidValue(_)));
     }
 
-    // T-283: team_db_path returns a path ending with "<team>.db"
+    // T-233: team_db_path returns a path ending with "<team>.db"
     #[test]
     fn team_db_path_format() {
         let config = Config {

@@ -1,9 +1,13 @@
+use std::env;
+use std::fmt;
 use std::time::Duration;
 
 use reqwest::Client;
+use reqwest::header::{AUTHORIZATION, HeaderValue};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use tokio::sync::Mutex;
-use tokio::time::Instant;
+use tokio::time::{Instant, sleep};
 use tracing::warn;
 
 use crate::redact::{redact_token, truncate_str};
@@ -120,8 +124,8 @@ pub struct EsaClient {
     last_request: Mutex<Option<Instant>>,
 }
 
-impl std::fmt::Debug for EsaClient {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Debug for EsaClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("EsaClient")
             .field("base_url", &self.base_url)
             .field("token", &"[REDACTED]")
@@ -134,7 +138,7 @@ impl EsaClient {
         Self {
             http: Client::new(),
             token,
-            base_url: ESA_API_BASE.to_string(),
+            base_url: ESA_API_BASE.to_owned(),
             request_interval: REQUEST_INTERVAL,
             last_request: Mutex::new(None),
         }
@@ -151,11 +155,11 @@ impl EsaClient {
     }
 
     pub fn from_env() -> Result<Self, ClientError> {
-        Self::from_env_with(|k| std::env::var(k))
+        Self::from_env_with(|k| env::var(k))
     }
 
     pub(crate) fn from_env_with(
-        get_var: impl Fn(&str) -> Result<String, std::env::VarError>,
+        get_var: impl Fn(&str) -> Result<String, env::VarError>,
     ) -> Result<Self, ClientError> {
         let token = get_var("ESA_ACCESS_TOKEN").map_err(|_| ClientError::TokenNotSet)?;
         if token.is_empty() {
@@ -198,7 +202,7 @@ impl EsaClient {
         let url = self.build_url(&format!("teams/{team}/posts"))?.to_string();
         let body = CreatePostRequest {
             post: CreatePostBody {
-                name: params.name.to_string(),
+                name: params.name.to_owned(),
                 body_md: params.body_md.map(str::to_string),
                 category: params.category.map(str::to_string),
                 tags: params.tags.clone(),
@@ -244,19 +248,19 @@ impl EsaClient {
                 .filter(|d| !d.is_zero())
         };
         if let Some(dur) = sleep_dur {
-            tokio::time::sleep(dur).await;
+            sleep(dur).await;
         }
         *self.last_request.lock().await = Some(Instant::now());
     }
 
-    fn auth_header(&self) -> Result<reqwest::header::HeaderValue, ClientError> {
-        let mut v = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", self.token))
+    fn auth_header(&self) -> Result<HeaderValue, ClientError> {
+        let mut v = HeaderValue::from_str(&format!("Bearer {}", self.token))
             .map_err(|_| ClientError::Api("invalid token format".into()))?;
         v.set_sensitive(true);
         Ok(v)
     }
 
-    async fn send<T: serde::de::DeserializeOwned>(
+    async fn send<T: DeserializeOwned>(
         &self,
         build: impl Fn(&Client) -> reqwest::RequestBuilder,
     ) -> Result<T, ClientError> {
@@ -265,7 +269,7 @@ impl EsaClient {
             let auth = self.auth_header()?;
 
             let resp = build(&self.http)
-                .header(reqwest::header::AUTHORIZATION, auth)
+                .header(AUTHORIZATION, auth)
                 .timeout(REQUEST_TIMEOUT)
                 .send()
                 .await?;
@@ -285,10 +289,10 @@ impl EsaClient {
                     warn!(
                         attempt,
                         status,
-                        wait_ms = wait.as_millis() as u64,
+                        wait_ms = u64::try_from(wait.as_millis()).unwrap_or(u64::MAX),
                         "Retrying esa API"
                     );
-                    tokio::time::sleep(wait).await;
+                    sleep(wait).await;
                 }
                 Some(_) => return Err(ClientError::MaxRetries(MAX_RETRIES)),
                 None => {
@@ -503,25 +507,25 @@ mod tests {
         assert_eq!(post.name, "Getting Started");
     }
 
-    // T-203: EsaClient::from_env returns TokenNotSet when ESA_ACCESS_TOKEN is absent
+    // T-153: EsaClient::from_env returns TokenNotSet when ESA_ACCESS_TOKEN is absent
     #[test]
     fn from_env_missing_token() {
-        let err = EsaClient::from_env_with(|_| Err(std::env::VarError::NotPresent)).unwrap_err();
+        let err = EsaClient::from_env_with(|_| Err(env::VarError::NotPresent)).unwrap_err();
         assert!(matches!(err, ClientError::TokenNotSet));
     }
 
-    // T-204: EsaClient::from_env returns TokenNotSet when ESA_ACCESS_TOKEN is empty
+    // T-154: EsaClient::from_env returns TokenNotSet when ESA_ACCESS_TOKEN is empty
     #[test]
     fn from_env_empty_token() {
         let err = EsaClient::from_env_with(|key| match key {
             "ESA_ACCESS_TOKEN" => Ok("".into()),
-            _ => Err(std::env::VarError::NotPresent),
+            _ => Err(env::VarError::NotPresent),
         })
         .unwrap_err();
         assert!(matches!(err, ClientError::TokenNotSet));
     }
 
-    // T-205: EsaClient Debug output redacts the token value
+    // T-155: EsaClient Debug output redacts the token value
     #[test]
     fn debug_redacts_token() {
         let client = EsaClient::new("secret-token-123".into());
@@ -530,19 +534,19 @@ mod tests {
         assert!(!debug.contains("secret-token-123"));
     }
 
-    // T-206: retry_wait returns Retry-After header duration on 429
+    // T-156: retry_wait returns Retry-After header duration on 429
     #[test]
     fn retry_wait_429_uses_header() {
         assert_eq!(retry_wait(429, Some("3"), 0), Some(Duration::from_secs(3)));
     }
 
-    // T-207: retry_wait returns default 5s on 429 when Retry-After header is absent
+    // T-157: retry_wait returns default 5s on 429 when Retry-After header is absent
     #[test]
     fn retry_wait_429_defaults() {
         assert_eq!(retry_wait(429, None, 0), Some(Duration::from_secs(5)));
     }
 
-    // T-208: retry_wait applies exponential backoff for 5xx errors
+    // T-158: retry_wait applies exponential backoff for 5xx errors
     #[test]
     fn retry_wait_500_backoff() {
         assert_eq!(retry_wait(500, None, 0), Some(Duration::from_millis(500)));
@@ -550,14 +554,14 @@ mod tests {
         assert_eq!(retry_wait(503, None, 2), Some(Duration::from_millis(2000)));
     }
 
-    // T-209: retry_wait returns None for non-retryable status codes (4xx)
+    // T-159: retry_wait returns None for non-retryable status codes (4xx)
     #[test]
     fn retry_wait_non_retryable() {
         assert!(retry_wait(400, None, 0).is_none());
         assert!(retry_wait(404, None, 0).is_none());
     }
 
-    // T-210: retry_wait falls back to default 5s when Retry-After header is non-numeric
+    // T-160: retry_wait falls back to default 5s when Retry-After header is non-numeric
     #[test]
     fn retry_wait_429_non_numeric_header_defaults() {
         assert_eq!(
@@ -586,21 +590,21 @@ mod tests {
     fn test_esa_post(body_md: Option<String>) -> EsaPost {
         EsaPost {
             number: 42,
-            name: "Test Post".to_string(),
-            full_name: "dev/Test Post".to_string(),
+            name: "Test Post".to_owned(),
+            full_name: "dev/Test Post".to_owned(),
             body_md,
-            category: Some("dev".to_string()),
-            tags: vec!["rust".to_string()],
+            category: Some("dev".to_owned()),
+            tags: vec!["rust".to_owned()],
             wip: false,
-            kind: "stock".to_string(),
-            url: "https://example.esa.io/posts/42".to_string(),
-            created_at: "2025-01-01T00:00:00+09:00".to_string(),
-            updated_at: "2025-01-02T00:00:00+09:00".to_string(),
+            kind: "stock".to_owned(),
+            url: "https://example.esa.io/posts/42".to_owned(),
+            created_at: "2025-01-01T00:00:00+09:00".to_owned(),
+            updated_at: "2025-01-02T00:00:00+09:00".to_owned(),
             created_by: EsaUser {
-                screen_name: "alice".to_string(),
+                screen_name: "alice".to_owned(),
             },
             updated_by: EsaUser {
-                screen_name: "bob".to_string(),
+                screen_name: "bob".to_owned(),
             },
             revision_number: 3,
         }
@@ -620,7 +624,7 @@ mod tests {
     // T-043: get --json --with-body → body_md is string value
     #[test]
     fn esa_post_json_body_md_present_when_some() {
-        let post = test_esa_post(Some("# Hello\nWorld".to_string()));
+        let post = test_esa_post(Some("# Hello\nWorld".to_owned()));
         let json_str = serde_json::to_string(&post).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(
@@ -631,10 +635,10 @@ mod tests {
 
     // T-048: EsaPost → JSON serialization contract (name, number, url, wip, tags).
     // Shared by create/update/archive/ship --json code paths.
-    // T-187: esa_post_json_has_name_number_url
+    // T-243: esa_post_json_has_name_number_url
     #[test]
     fn esa_post_json_has_name_number_url() {
-        let post = test_esa_post(Some("body".to_string()));
+        let post = test_esa_post(Some("body".to_owned()));
         let json_str = serde_json::to_string(&post).unwrap();
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
         assert_eq!(v["number"], 42, "number field");
@@ -644,7 +648,7 @@ mod tests {
         assert_eq!(v["tags"][0], "rust", "tags field");
     }
 
-    // T-108: create_post sends correct request body
+    // T-058: create_post sends correct request body
     #[tokio::test]
     async fn create_post_sends_correct_payload() {
         let server = MockServer::start().await;
@@ -679,7 +683,7 @@ mod tests {
             .unwrap();
     }
 
-    // T-109: create_post omits None fields via skip_serializing_if
+    // T-059: create_post omits None fields via skip_serializing_if
     #[tokio::test]
     async fn create_post_omits_none_fields() {
         let server = MockServer::start().await;

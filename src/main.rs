@@ -2,14 +2,20 @@
 
 mod commands;
 mod output;
-mod progress;
-mod shorthand;
 
+use std::env;
+use std::ffi;
+use std::io;
+use std::iter;
 use std::process::ExitCode;
 
+use amici::cli::try_expand_shorthand;
 use clap::{Parser, Subcommand};
-use sae::client::EsaClient;
-use sae::config::Config;
+use rurico::model_probe;
+use sae::client::{ClientError, EsaClient};
+use sae::config::{Config, ConfigError};
+use sae::storage::{Db, StorageError};
+use sae::sync::SyncError;
 
 #[derive(Parser)]
 #[command(name = "sae", about = "esa semantic search CLI")]
@@ -176,14 +182,14 @@ const GLOBAL_FLAGS: &[&str] = &["--json"];
 fn parse_cli_args<I, T>(args: I) -> Result<Cli, clap::Error>
 where
     I: IntoIterator<Item = T>,
-    T: Into<std::ffi::OsString> + Clone,
+    T: Into<ffi::OsString> + Clone,
 {
-    let args: Vec<std::ffi::OsString> = args.into_iter().map(Into::into).collect();
-    let expanded = shorthand::try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS);
+    let args: Vec<ffi::OsString> = args.into_iter().map(Into::into).collect();
+    let expanded = try_expand_shorthand(&args, KNOWN_SUBCOMMANDS, GLOBAL_FLAGS);
     if let Some(expanded) = expanded
         && let Ok(cli) = Cli::try_parse_from(&expanded)
     {
-        let display: Vec<_> = std::iter::once("sae")
+        let display: Vec<_> = iter::once("sae")
             .chain(expanded[1..].iter().filter_map(|a| a.to_str()))
             .collect();
         eprintln!("→ {}", display.join(" "));
@@ -195,17 +201,17 @@ where
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum SaeError {
     #[error(transparent)]
-    Config(#[from] sae::config::ConfigError),
+    Config(#[from] ConfigError),
     #[error(transparent)]
-    Client(#[from] sae::client::ClientError),
+    Client(#[from] ClientError),
     #[error(transparent)]
-    Storage(#[from] sae::storage::StorageError),
+    Storage(#[from] StorageError),
     #[error(transparent)]
-    Sync(#[from] sae::sync::SyncError),
+    Sync(#[from] SyncError),
     #[error(transparent)]
     Json(#[from] serde_json::Error),
     #[error(transparent)]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
     /// User action required (e.g., run harvest or model download first)
     #[error("{0}")]
     Input(String),
@@ -223,19 +229,17 @@ pub(crate) fn resolve_client<'a>(
     Ok((team, client))
 }
 
-pub(crate) fn require_db(config: &Config, team: &str) -> Result<sae::storage::Db, SaeError> {
+pub(crate) fn require_db(config: &Config, team: &str) -> Result<Db, SaeError> {
     let db_path = config.team_db_path(team)?;
     if !db_path.exists() {
         return Err(SaeError::Input(format!(
             "No data for team '{team}'. Run `sae harvest {team}` first."
         )));
     }
-    Ok(sae::storage::Db::open(&db_path)?)
+    Ok(Db::open(&db_path)?)
 }
 
 fn exit_code_for(e: &SaeError) -> ExitCode {
-    use sae::client::ClientError;
-    use sae::sync::SyncError;
     match e {
         SaeError::Input(_) | SaeError::Config(_) => ExitCode::from(2),
         SaeError::Client(ClientError::TokenNotSet) => ExitCode::from(2),
@@ -303,17 +307,17 @@ async fn run(cli: Cli, config: Config) -> Result<String, SaeError> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    rurico::model_probe::handle_probe_if_needed();
+    model_probe::handle_probe_if_needed();
 
     tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
+        .with_writer(io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
                 .add_directive("sae=info".parse().expect("hardcoded directive is valid")),
         )
         .init();
 
-    let cli = parse_cli_args(std::env::args_os()).unwrap_or_else(|e| e.exit());
+    let cli = parse_cli_args(env::args_os()).unwrap_or_else(|e| e.exit());
     let config = match Config::load() {
         Ok(c) => c,
         Err(e) => {
@@ -339,6 +343,88 @@ async fn main() -> ExitCode {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+    use ffi::OsString;
+
+    fn os(s: &[&str]) -> Vec<OsString> {
+        s.iter().map(|&a| a.into()).collect()
+    }
+
+    // T-029: bare query expands with "search" inserted as subcommand
+    #[test]
+    fn single_query_expands_to_search() {
+        let exp =
+            try_expand_shorthand(&os(&["sae", "認証"]), KNOWN_SUBCOMMANDS, GLOBAL_FLAGS).unwrap();
+        let s: Vec<&str> = exp.iter().filter_map(|a| a.to_str()).collect();
+        assert_eq!(s, ["sae", "search", "認証"]);
+    }
+
+    // T-031: known subcommand as first positional → not expanded
+    #[test]
+    fn known_subcommand_not_expanded() {
+        assert!(
+            try_expand_shorthand(
+                &os(&["sae", "harvest", "myteam"]),
+                KNOWN_SUBCOMMANDS,
+                GLOBAL_FLAGS
+            )
+            .is_none()
+        );
+    }
+
+    // T-022: trailing options pass through after the inserted "search"
+    #[test]
+    fn query_with_trailing_option_expanded() {
+        let exp = try_expand_shorthand(
+            &os(&["sae", "query", "--limit", "2"]),
+            KNOWN_SUBCOMMANDS,
+            GLOBAL_FLAGS,
+        )
+        .unwrap();
+        let s: Vec<&str> = exp.iter().filter_map(|a| a.to_str()).collect();
+        assert_eq!(s, ["sae", "search", "query", "--limit", "2"]);
+    }
+
+    // T-024: non-global option (--team) stays after the inserted "search"
+    #[test]
+    fn non_global_option_stays_after_search() {
+        let exp = try_expand_shorthand(
+            &os(&["sae", "query", "--team", "myteam"]),
+            KNOWN_SUBCOMMANDS,
+            GLOBAL_FLAGS,
+        )
+        .unwrap();
+        let s: Vec<&str> = exp.iter().filter_map(|a| a.to_str()).collect();
+        assert_eq!(s, ["sae", "search", "query", "--team", "myteam"]);
+    }
+
+    // T-025: typo within OSA distance 1 → not expanded (typo guard)
+    #[test]
+    fn typo_within_distance_not_expanded() {
+        assert!(
+            try_expand_shorthand(&os(&["sae", "serach"]), KNOWN_SUBCOMMANDS, GLOBAL_FLAGS)
+                .is_none(),
+            "typo 'serach' (osa=1 from 'search') should not expand"
+        );
+    }
+
+    // T-092: bare dash counts as flag prefix → positional_count < 2 → not expanded
+    #[test]
+    fn bare_dash_not_expanded() {
+        assert!(
+            try_expand_shorthand(&os(&["sae", "-"]), KNOWN_SUBCOMMANDS, GLOBAL_FLAGS).is_none(),
+            "`sae -` should not expand"
+        );
+    }
+
+    // T-091: flag-like arg (--) → positional_count < 2 → not expanded
+    #[test]
+    fn flag_only_not_expanded() {
+        assert!(
+            try_expand_shorthand(&os(&["sae", "--unknown"]), KNOWN_SUBCOMMANDS, GLOBAL_FLAGS)
+                .is_none(),
+            "--unknown should not expand"
+        );
+    }
 
     fn subcommand_after_help(name: &str) -> String {
         let mut command = Cli::command();
@@ -346,7 +432,7 @@ mod tests {
             .find_subcommand_mut(name)
             .unwrap()
             .get_after_help()
-            .map(|help| help.to_string())
+            .map(ToString::to_string)
             .unwrap_or_default()
     }
 
@@ -401,7 +487,7 @@ mod tests {
         }
     }
 
-    // T-200: --body-file "-" parses correctly with body_file set to "-"
+    // T-150: --body-file "-" parses correctly with body_file set to "-"
     #[test]
     fn body_file_dash_parses_as_stdin() {
         let cli =
@@ -466,7 +552,7 @@ mod tests {
         }
     }
 
-    // T-201: create subcommand help text includes stdin pipe example
+    // T-151: create subcommand help text includes stdin pipe example
     #[test]
     fn create_help_includes_stdin_example() {
         let after_help = subcommand_after_help("create");
@@ -476,7 +562,7 @@ mod tests {
         );
     }
 
-    // T-202: search subcommand help text includes stdin pipe examples
+    // T-152: search subcommand help text includes stdin pipe examples
     #[test]
     fn search_help_includes_stdin_examples() {
         let after_help = subcommand_after_help("search");
@@ -535,7 +621,7 @@ mod tests {
         }
     }
 
-    // T-127: multi-positional args without valid search expansion → clap error
+    // T-077: multi-positional args without valid search expansion → clap error
     #[test]
     fn multi_positional_args_not_shorthand() {
         let result = parse_cli_args(["sae", "foo", "bar"]);
@@ -648,7 +734,7 @@ mod tests {
         }
     }
 
-    // T-128: non-search subcommand names are not rewritten as search shorthand
+    // T-078: non-search subcommand names are not rewritten as search shorthand
     #[test]
     fn all_subcommands_not_shorthand() {
         // `search` itself parses as Command::Search via the normal path — excluded.

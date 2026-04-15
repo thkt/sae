@@ -1,3 +1,6 @@
+use std::fmt;
+use std::io;
+
 #[derive(Debug, Clone)]
 pub struct EsaPostRow {
     pub number: u32,
@@ -85,7 +88,7 @@ impl TeamStatus {
         }
     }
 
-    pub fn error(team: impl Into<String>, message: impl ToString) -> Self {
+    pub fn error(team: impl Into<String>, message: &dyn fmt::Display) -> Self {
         Self {
             team: team.into(),
             status: SyncStatus::Error,
@@ -112,7 +115,7 @@ pub enum StorageError {
     Db(#[from] rusqlite::Error),
 
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
 }
 
 #[cfg(test)]
@@ -123,16 +126,16 @@ mod tests {
     #[test]
     fn team_status_serializes_to_json_with_expected_fields() {
         let status = TeamStatus {
-            team: "myteam".to_string(),
+            team: "myteam".to_owned(),
             status: SyncStatus::Synced,
             posts: 42,
             pending_embed: 0,
             sync_state: Some(SyncState {
-                latest_updated_at: Some("2025-01-01T00:00:00+09:00".to_string()),
+                latest_updated_at: Some("2025-01-01T00:00:00+09:00".to_owned()),
                 total_count: 100,
                 local_count: 42,
                 last_page: None,
-                updated_at: "2025-01-01 00:00:00".to_string(),
+                updated_at: "2025-01-01 00:00:00".to_owned(),
             }),
             error: None,
             db_path: None,
@@ -148,12 +151,12 @@ mod tests {
         );
     }
 
-    // T-180: TeamStatus array serialization
+    // T-130: TeamStatus array serialization
     #[test]
     fn team_status_array_serializes_to_json_array() {
         let statuses = vec![
             TeamStatus {
-                team: "team-a".to_string(),
+                team: "team-a".to_owned(),
                 status: SyncStatus::Synced,
                 posts: 10,
                 pending_embed: 0,
@@ -162,7 +165,7 @@ mod tests {
                 db_path: None,
             },
             TeamStatus {
-                team: "team-b".to_string(),
+                team: "team-b".to_owned(),
                 status: SyncStatus::NotSynced,
                 posts: 0,
                 pending_embed: 0,
@@ -179,16 +182,16 @@ mod tests {
         assert_eq!(v[1]["status"], "not_synced");
     }
 
-    // T-162: SyncStatus::Error serializes to "error" with error message
+    // T-112: SyncStatus::Error serializes to "error" with error message
     #[test]
     fn team_status_error_serializes_correctly() {
         let status = TeamStatus {
-            team: "broken".to_string(),
+            team: "broken".to_owned(),
             status: SyncStatus::Error,
             posts: 0,
             pending_embed: 0,
             sync_state: None,
-            error: Some("config missing".to_string()),
+            error: Some("config missing".to_owned()),
             db_path: None,
         };
         let json_str = serde_json::to_string(&status).expect("should serialize");
@@ -197,15 +200,15 @@ mod tests {
         assert_eq!(v["error"], "config missing");
     }
 
-    // T-181: SyncState serializes (required by TeamStatus.sync_state)
+    // T-131: SyncState serializes (required by TeamStatus.sync_state)
     #[test]
     fn sync_state_serializes_to_json() {
         let state = SyncState {
-            latest_updated_at: Some("2025-01-01T00:00:00+09:00".to_string()),
+            latest_updated_at: Some("2025-01-01T00:00:00+09:00".to_owned()),
             total_count: 100,
             local_count: 50,
             last_page: Some(3),
-            updated_at: "2025-01-01 00:00:00".to_string(),
+            updated_at: "2025-01-01 00:00:00".to_owned(),
         };
         let json_str = serde_json::to_string(&state).expect("SyncState should serialize");
         let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
@@ -214,7 +217,7 @@ mod tests {
         assert_eq!(v["last_page"], 3);
     }
 
-    // T-161: embed --json → EmbedResult JSON (chunks_embedded field)
+    // T-111: embed --json → EmbedResult JSON (chunks_embedded field)
     #[test]
     fn embed_result_serializes_to_json_with_chunks_embedded() {
         let result = EmbedResult {

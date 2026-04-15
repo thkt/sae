@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use rurico::embed::ChunkedEmbedding;
+use rurico::storage::f32_as_bytes;
 use rusqlite::Connection;
 
 use super::StorageError;
@@ -21,7 +22,7 @@ pub fn add_chunked_embeddings(
             continue;
         }
         for (sub_idx, embedding) in chunked_emb.chunks.iter().enumerate() {
-            let bytes: &[u8] = rurico::storage::f32_as_bytes(embedding);
+            let bytes: &[u8] = f32_as_bytes(embedding);
             tx.execute(
                 "INSERT INTO vec_chunks (embedding, chunk_id, sub_idx) VALUES (?1, ?2, ?3)",
                 rusqlite::params![bytes, chunk_id, sub_idx as i64],
@@ -98,7 +99,7 @@ pub fn has_embeddings(conn: &Connection) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::Db;
+    use crate::storage::{self, Db};
     use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
 
     fn make_chunked(val: f32) -> ChunkedEmbedding {
@@ -113,15 +114,15 @@ mod tests {
         }
     }
 
-    // T-223: add_chunked_embeddings stores embedding and clears unembedded queue
+    // T-173: add_chunked_embeddings stores embedding and clears unembedded queue
     #[test]
     fn add_and_query_embeddings() {
         let db = Db::open_memory().unwrap();
 
-        let mut row = crate::storage::test_post_row(1);
+        let mut row = storage::test_post_row(1);
         row.body_md = "# Hello\nWorld".into();
-        crate::storage::upsert_post(db.conn(), &row).unwrap();
-        crate::storage::rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
+        storage::upsert_post(db.conn(), &row).unwrap();
+        storage::rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
 
         let unembedded = get_unembedded_chunks(db.conn(), 100).unwrap();
         assert_eq!(unembedded.len(), 1);
@@ -134,14 +135,14 @@ mod tests {
         assert!(has_embeddings(db.conn()));
     }
 
-    // T-224: add_chunked_embeddings skips chunks that are already embedded
+    // T-174: add_chunked_embeddings skips chunks that are already embedded
     #[test]
     fn skip_already_embedded() {
         let db = Db::open_memory().unwrap();
-        let mut row = crate::storage::test_post_row(1);
+        let mut row = storage::test_post_row(1);
         row.body_md = "# A\nB".into();
-        crate::storage::upsert_post(db.conn(), &row).unwrap();
-        crate::storage::rechunk_post(db.conn(), 1, "# A\nB").unwrap();
+        storage::upsert_post(db.conn(), &row).unwrap();
+        storage::rechunk_post(db.conn(), 1, "# A\nB").unwrap();
 
         let chunks = get_unembedded_chunks(db.conn(), 100).unwrap();
         let emb = vec![(chunks[0].0, make_chunked(1.0))];
@@ -151,14 +152,14 @@ mod tests {
         assert_eq!(added, 0);
     }
 
-    // T-225: add_chunked_embeddings stores multiple sub-embeddings per chunk
+    // T-175: add_chunked_embeddings stores multiple sub-embeddings per chunk
     #[test]
     fn multi_chunk_stores_all_sub_embeddings() {
         let db = Db::open_memory().unwrap();
-        let mut row = crate::storage::test_post_row(1);
+        let mut row = storage::test_post_row(1);
         row.body_md = "# Hello\nWorld".into();
-        crate::storage::upsert_post(db.conn(), &row).unwrap();
-        crate::storage::rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
+        storage::upsert_post(db.conn(), &row).unwrap();
+        storage::rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
 
         let chunks = get_unembedded_chunks(db.conn(), 100).unwrap();
         let chunk_id = chunks[0].0;
@@ -171,21 +172,21 @@ mod tests {
         assert!(has_embeddings(db.conn()));
     }
 
-    // T-226: count_unembedded_chunks returns zero on a fresh empty database
+    // T-176: count_unembedded_chunks returns zero on a fresh empty database
     #[test]
     fn count_unembedded_returns_zero_on_empty_db() {
         let db = Db::open_memory().unwrap();
         assert_eq!(count_unembedded_chunks(db.conn()).unwrap(), 0);
     }
 
-    // T-227: count_unembedded_chunks decrements after embedding is added
+    // T-177: count_unembedded_chunks decrements after embedding is added
     #[test]
     fn count_unembedded_returns_correct_count_before_and_after_embed() {
         let db = Db::open_memory().unwrap();
-        let mut row = crate::storage::test_post_row(1);
+        let mut row = storage::test_post_row(1);
         row.body_md = "# Hello\nWorld".into();
-        crate::storage::upsert_post(db.conn(), &row).unwrap();
-        crate::storage::rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
+        storage::upsert_post(db.conn(), &row).unwrap();
+        storage::rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
 
         assert_eq!(count_unembedded_chunks(db.conn()).unwrap(), 1);
 

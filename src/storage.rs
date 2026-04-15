@@ -1,18 +1,21 @@
-pub mod embed;
-pub mod search;
-pub mod types;
+mod embed;
+mod search;
+mod types;
 pub use embed::{
     add_chunked_embeddings, count_unembedded_chunks, get_unembedded_chunks, has_embeddings,
 };
-pub use search::{MatchSource, SearchFilter, SearchResult, hybrid_search};
+pub use search::{MatchSource, SearchFilter, SearchOutput, SearchResult, hybrid_search};
 pub use types::*;
 
+use std::fs;
 use std::path::Path;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 use tracing::warn;
 
 use rurico::embed::EMBEDDING_DIMS;
+use rurico::storage as rurico_storage;
 
 const SCHEMA_VERSION: u32 = 5;
 
@@ -81,7 +84,7 @@ pub struct Db {
 }
 
 pub(crate) fn ensure_sqlite_vec() -> Result<(), StorageError> {
-    rurico::storage::ensure_sqlite_vec().map_err(StorageError::Open)
+    rurico_storage::ensure_sqlite_vec().map_err(StorageError::Open)
 }
 
 pub(crate) fn migrate_fts_v4(conn: &Connection) -> Result<(), StorageError> {
@@ -178,13 +181,11 @@ impl Db {
     pub fn open(path: &Path) -> Result<Self, StorageError> {
         ensure_sqlite_vec()?;
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            fs::create_dir_all(parent)?;
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                if let Err(e) =
-                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                {
+                if let Err(e) = fs::set_permissions(parent, fs::Permissions::from_mode(0o700)) {
                     warn!(path = %parent.display(), error = %e, "failed to restrict data directory permissions");
                 }
             }
@@ -244,8 +245,8 @@ fn open_with_wal_recovery(path: &Path) -> Result<Connection, StorageError> {
         Err(ref e) if is_recoverable_open_error(e) => {
             warn!(error = %e, "DB open failed, removing WAL/SHM and retrying — uncommitted data may be lost, re-run `sae sync` to rebuild");
             let p = path.to_string_lossy();
-            let _ = std::fs::remove_file(format!("{p}-wal"));
-            let _ = std::fs::remove_file(format!("{p}-shm"));
+            let _ = fs::remove_file(format!("{p}-wal"));
+            let _ = fs::remove_file(format!("{p}-shm"));
             Ok(Connection::open(path)?)
         }
         Err(e) => Err(e.into()),
@@ -253,11 +254,11 @@ fn open_with_wal_recovery(path: &Path) -> Result<Connection, StorageError> {
 }
 
 fn is_recoverable_open_error(err: &rusqlite::Error) -> bool {
-    use rusqlite::ffi::ErrorCode;
+    use rusqlite::ffi::{self, ErrorCode};
     matches!(
         err,
         rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
+            ffi::Error {
                 code: ErrorCode::DatabaseCorrupt | ErrorCode::CannotOpen | ErrorCode::NotADatabase,
                 ..
             },
@@ -318,10 +319,13 @@ pub fn save_sync_state(
     conn: &Connection,
     update: &SyncStateUpdate<'_>,
 ) -> Result<(), StorageError> {
-    let epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("system clock before epoch")
-        .as_secs() as i64;
+    let epoch = i64::try_from(
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock before epoch")
+            .as_secs(),
+    )
+    .unwrap_or(i64::MAX);
     save_sync_state_at(conn, update, epoch)
 }
 
@@ -480,8 +484,10 @@ pub fn test_post_row(number: u32) -> EsaPostRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
+    use rusqlite::ffi::{self, ErrorCode};
 
-    // T-252: Db::open_memory initializes with the current schema version
+    // T-202: Db::open_memory initializes with the current schema version
     #[test]
     fn open_and_init_schema() {
         let db = Db::open_memory().unwrap();
@@ -489,7 +495,7 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
     }
 
-    // T-253: upsert_post inserts a post and count_posts reflects the change
+    // T-203: upsert_post inserts a post and count_posts reflects the change
     #[test]
     fn upsert_and_count() {
         let db = Db::open_memory().unwrap();
@@ -505,7 +511,7 @@ mod tests {
         assert_eq!(name, post.name);
     }
 
-    // T-254: upsert_post overwrites an existing post with the same number
+    // T-204: upsert_post overwrites an existing post with the same number
     #[test]
     fn upsert_replaces_on_conflict() {
         let db = Db::open_memory().unwrap();
@@ -526,14 +532,14 @@ mod tests {
         assert_eq!(name, "Updated");
     }
 
-    // T-255: get_sync_state returns None on a fresh database
+    // T-205: get_sync_state returns None on a fresh database
     #[test]
     fn sync_state_none_initially() {
         let db = Db::open_memory().unwrap();
         assert!(get_sync_state(db.conn()).unwrap().is_none());
     }
 
-    // T-256: save_sync_state and get_sync_state round-trip all fields correctly
+    // T-206: save_sync_state and get_sync_state round-trip all fields correctly
     #[test]
     fn sync_state_roundtrip() {
         let db = Db::open_memory().unwrap();
@@ -561,21 +567,24 @@ mod tests {
         assert_eq!(state.updated_at, "2025-01-01 00:00:00");
     }
 
-    // T-149: sync_harvested_within returns false when no sync state
+    // T-099: sync_harvested_within returns false when no sync state
     #[test]
     fn sync_harvested_within_false_when_no_state() {
         let db = Db::open_memory().unwrap();
         assert!(!sync_harvested_within(db.conn(), 300));
     }
 
-    // T-149: sync_harvested_within returns true when harvest was recent
+    // T-099: sync_harvested_within returns true when harvest was recent
     #[test]
     fn sync_harvested_within_true_when_recent() {
         let db = Db::open_memory().unwrap();
-        let now_epoch = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs() as i64;
+        let now_epoch = i64::try_from(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs(),
+        )
+        .expect("epoch seconds fit in i64");
         save_sync_state_at(
             db.conn(),
             &SyncStateUpdate {
@@ -590,7 +599,7 @@ mod tests {
         assert!(sync_harvested_within(db.conn(), 300));
     }
 
-    // T-149: sync_harvested_within returns false when harvest was older than TTL
+    // T-099: sync_harvested_within returns false when harvest was older than TTL
     #[test]
     fn sync_harvested_within_false_when_stale() {
         let db = Db::open_memory().unwrap();
@@ -609,7 +618,7 @@ mod tests {
         assert!(!sync_harvested_within(db.conn(), 300));
     }
 
-    // T-257: save_sync_state with last_page=None clears a previous checkpoint
+    // T-207: save_sync_state with last_page=None clears a previous checkpoint
     #[test]
     fn sync_state_clears_checkpoint() {
         let db = Db::open_memory().unwrap();
@@ -647,7 +656,7 @@ mod tests {
         );
     }
 
-    // T-258: Db::open creates a database file on disk at the specified path
+    // T-208: Db::open creates a database file on disk at the specified path
     #[test]
     fn open_file_db() {
         let dir = tempfile::tempdir().unwrap();
@@ -661,7 +670,7 @@ mod tests {
         assert_eq!(count_posts(db.conn()).unwrap(), 1);
     }
 
-    // T-259: upsert_post inside a transaction batches inserts correctly
+    // T-209: upsert_post inside a transaction batches inserts correctly
     #[test]
     fn transaction_upsert_batch() {
         let db = Db::open_memory().unwrap();
@@ -680,7 +689,7 @@ mod tests {
         assert_eq!(name, test_post_row(10).name);
     }
 
-    // T-260: rechunk_post creates chunk rows and FTS entries for each section
+    // T-210: rechunk_post creates chunk rows and FTS entries for each section
     #[test]
     fn rechunk_creates_chunks_and_fts() {
         let db = Db::open_memory().unwrap();
@@ -703,7 +712,7 @@ mod tests {
         assert_eq!(hits, 1);
     }
 
-    // T-261: rechunk_post replaces old chunks and removes stale FTS entries
+    // T-211: rechunk_post replaces old chunks and removes stale FTS entries
     #[test]
     fn rechunk_replaces_old_chunks() {
         let db = Db::open_memory().unwrap();
@@ -726,7 +735,7 @@ mod tests {
         assert_eq!(hits, 0);
     }
 
-    // T-262: rechunk_post removes orphaned vector embeddings from previous chunks
+    // T-212: rechunk_post removes orphaned vector embeddings from previous chunks
     #[test]
     fn rechunk_cleans_orphaned_vec_chunks() {
         let db = Db::open_memory().unwrap();
@@ -734,20 +743,20 @@ mod tests {
         upsert_post(db.conn(), &post).unwrap();
         rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
 
-        let chunks = embed::get_unembedded_chunks(db.conn(), 100).unwrap();
-        let emb: Vec<(i64, rurico::embed::ChunkedEmbedding)> = chunks
+        let chunks = get_unembedded_chunks(db.conn(), 100).unwrap();
+        let emb: Vec<(i64, ChunkedEmbedding)> = chunks
             .iter()
             .map(|(id, _)| {
                 (
                     *id,
-                    rurico::embed::ChunkedEmbedding {
-                        chunks: vec![vec![0.1; rurico::embed::EMBEDDING_DIMS as usize]],
+                    ChunkedEmbedding {
+                        chunks: vec![vec![0.1; EMBEDDING_DIMS]],
                     },
                 )
             })
             .collect();
-        embed::add_chunked_embeddings(db.conn(), &emb).unwrap();
-        assert!(embed::has_embeddings(db.conn()));
+        add_chunked_embeddings(db.conn(), &emb).unwrap();
+        assert!(has_embeddings(db.conn()));
 
         rechunk_post(db.conn(), 1, "# New\nContent").unwrap();
 
@@ -760,7 +769,7 @@ mod tests {
         assert_eq!(orphans, 0, "rechunk should clean orphaned embeddings");
     }
 
-    // T-263: FTS trigram index matches a 3-character Japanese substring
+    // T-213: FTS trigram index matches a 3-character Japanese substring
     #[test]
     fn fts_trigram_japanese() {
         let db = Db::open_memory().unwrap();
@@ -779,7 +788,7 @@ mod tests {
         assert_eq!(hits, 1);
     }
 
-    // T-144: rechunk 後 fts_chunks 件数 = chunks 件数 (FR-002)
+    // T-094: rechunk 後 fts_chunks 件数 = chunks 件数 (FR-002)
     #[test]
     fn rechunk_fts_count_matches_chunks_count() {
         let db = Db::open_memory().unwrap();
@@ -807,7 +816,7 @@ mod tests {
         );
     }
 
-    // T-264: enrich_body prepends name, author, category, and tags to body
+    // T-214: enrich_body prepends name, author, category, and tags to body
     #[test]
     fn enrich_body_includes_all_metadata() {
         let mut row = test_post_row(1);
@@ -823,7 +832,7 @@ mod tests {
         );
     }
 
-    // T-265: enrich_body omits category and tags line when both are absent
+    // T-215: enrich_body omits category and tags line when both are absent
     #[test]
     fn enrich_body_no_category_no_tags() {
         let mut row = test_post_row(1);
@@ -834,7 +843,7 @@ mod tests {
         assert_eq!(enriched, "Untitled\nalice\n\ntext");
     }
 
-    // T-266: enrich_body includes category but no tags when tags are empty
+    // T-216: enrich_body includes category but no tags when tags are empty
     #[test]
     fn enrich_body_category_only() {
         let mut row = test_post_row(1);
@@ -844,7 +853,7 @@ mod tests {
         assert_eq!(enriched, "Post\nalice dev\n\nbody");
     }
 
-    // T-267: enrich_body includes tags but no category when category is None
+    // T-217: enrich_body includes tags but no category when category is None
     #[test]
     fn enrich_body_tags_only() {
         let mut row = test_post_row(1);
@@ -877,7 +886,7 @@ mod tests {
         assert_eq!(title, "見出し");
     }
 
-    // T-145: migrate_fts_v4 失敗時 rollback 確認 (FR-005)
+    // T-095: migrate_fts_v4 失敗時 rollback 確認 (FR-005)
     #[test]
     fn migrate_fts_v4_rollback_on_failure() {
         ensure_sqlite_vec().unwrap();
@@ -942,7 +951,7 @@ mod tests {
         assert_eq!(post, 1, "old FTS data must survive after rollback");
     }
 
-    // T-143: temp file DB + 旧スキーマ → Db::open で migration (FR-005)
+    // T-093: temp file DB + 旧スキーマ → Db::open で migration (FR-005)
     #[test]
     fn migration_from_old_schema_rebuilds_fts_with_section_title() {
         let dir = tempfile::tempdir().unwrap();
@@ -990,7 +999,7 @@ mod tests {
                 "CREATE VIRTUAL TABLE vec_chunks USING vec0(\
                      chunk_id INTEGER PRIMARY KEY, \
                      embedding FLOAT[{}])",
-                rurico::embed::EMBEDDING_DIMS,
+                EMBEDDING_DIMS,
             ))
             .unwrap();
             set_schema_version(&conn, 3).unwrap();
@@ -1138,12 +1147,11 @@ mod tests {
         assert_eq!(version, 5, "migrate(0) should reach v5");
     }
 
-    // T-147: WAL recovery — is_recoverable_open_error recognizes DatabaseCorrupt
+    // T-097: WAL recovery — is_recoverable_open_error recognizes DatabaseCorrupt
     #[test]
     fn is_recoverable_for_database_corrupt() {
-        use rusqlite::ffi::ErrorCode;
         let err = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
+            ffi::Error {
                 code: ErrorCode::DatabaseCorrupt,
                 extended_code: 11,
             },
@@ -1152,12 +1160,11 @@ mod tests {
         assert!(is_recoverable_open_error(&err));
     }
 
-    // T-147: WAL recovery — is_recoverable_open_error recognizes CannotOpen
+    // T-097: WAL recovery — is_recoverable_open_error recognizes CannotOpen
     #[test]
     fn is_recoverable_for_cannot_open() {
-        use rusqlite::ffi::ErrorCode;
         let err = rusqlite::Error::SqliteFailure(
-            rusqlite::ffi::Error {
+            ffi::Error {
                 code: ErrorCode::CannotOpen,
                 extended_code: 14,
             },
@@ -1166,14 +1173,14 @@ mod tests {
         assert!(is_recoverable_open_error(&err));
     }
 
-    // T-147: WAL recovery — non-SqliteFailure error is not recoverable
+    // T-097: WAL recovery — non-SqliteFailure error is not recoverable
     #[test]
     fn is_not_recoverable_for_non_sqlite_failure() {
         let err = rusqlite::Error::QueryReturnedNoRows;
         assert!(!is_recoverable_open_error(&err));
     }
 
-    // T-146: init_schema rejects a non-numeric (corrupt) schema version string
+    // T-096: init_schema rejects a non-numeric (corrupt) schema version string
     #[test]
     fn init_schema_rejects_corrupt_version() {
         let dir = tempfile::tempdir().unwrap();
@@ -1197,7 +1204,7 @@ mod tests {
         }
     }
 
-    // T-148: init_schema rejects a schema version number higher than SCHEMA_VERSION
+    // T-098: init_schema rejects a schema version number higher than SCHEMA_VERSION
     #[test]
     fn init_schema_rejects_future_version() {
         let dir = tempfile::tempdir().unwrap();
