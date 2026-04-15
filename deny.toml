@@ -1,6 +1,10 @@
 [advisories]
 version = 2
-ignore = []
+ignore = [
+    # paste v1.0.15 は rurico→tokenizers→macro_rules_attribute 経由の推移的依存。
+    # 直接置き換え不可のため upstream 対応まで抑制。
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2
