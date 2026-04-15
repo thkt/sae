@@ -1,8 +1,11 @@
 use std::collections::HashMap;
 
 use amici::storage::append_eq_filter;
+use chrono::{DateTime, Utc};
 use rurico::reranker::Rerank;
+use rurico::storage::{f32_as_bytes, prepare_match_query, recency_decay, rrf_merge};
 use rusqlite::Connection;
+use rusqlite::types::ToSql;
 use tracing::warn;
 
 use super::StorageError;
@@ -25,352 +28,34 @@ pub struct SearchResult {
     pub match_source: MatchSource,
 }
 
+#[derive(Debug)]
+pub struct SearchOutput {
+    pub results: Vec<SearchResult>,
+    pub warnings: Vec<String>,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SearchFilter<'a> {
     pub tags: Option<&'a [&'a str]>,
     pub category: Option<&'a str>,
     pub created_by: Option<&'a str>,
-    pub updated_after: Option<chrono::DateTime<chrono::Utc>>,
-    pub updated_before: Option<chrono::DateTime<chrono::Utc>>,
+    pub updated_after: Option<DateTime<Utc>>,
+    pub updated_before: Option<DateTime<Utc>>,
 }
 
-pub fn fts_search(
-    conn: &Connection,
-    query: &str,
-    limit: u32,
-    filter: &SearchFilter<'_>,
-) -> Result<Vec<FtsHit>, StorageError> {
-    let normalized = normalize_punctuation(query);
-    let matched = match rurico::storage::prepare_match_query(conn, &normalized) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::debug!(%e, query, "query produced no searchable terms");
-            return Ok(Vec::new());
-        }
-    };
-    let match_query = clean_for_trigram(matched.as_str());
-
-    let mut sql = String::from(
-        "SELECT c.id, c.post_number, c.section_title, c.content, f.rank \
-         FROM fts_chunks f \
-         JOIN chunks c ON c.id = f.rowid \
-         JOIN posts p ON p.number = c.post_number \
-         WHERE fts_chunks MATCH ?",
-    );
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = vec![Box::new(match_query)];
-
-    append_tags_filter(&mut sql, &mut params, filter.tags);
-    append_eq_filter(&mut sql, &mut params, "p.category", filter.category);
-    append_eq_filter(&mut sql, &mut params, "p.created_by", filter.created_by);
-    append_date_filter(&mut sql, &mut params, false, filter.updated_after);
-    append_date_filter(&mut sql, &mut params, true, filter.updated_before);
-    sql.push_str(" ORDER BY f.rank LIMIT ?");
-    params.push(Box::new(limit));
-
-    let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<FtsHit> = stmt
-        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok(FtsHit {
-                chunk_id: row.get(0)?,
-                post_number: row.get(1)?,
-                section_title: row.get(2)?,
-                content: row.get(3)?,
-                rank: row.get(4)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(rows)
+#[derive(Debug, Clone)]
+pub(crate) struct FtsHit {
+    pub post_number: u32,
+    pub section_title: Option<String>,
+    pub content: String,
 }
 
-const VEC_MAXSIM_OVERSAMPLE: u32 = 10;
-
-pub fn vec_search(
-    conn: &Connection,
-    query_embedding: &[f32],
-    limit: u32,
-    filter: &SearchFilter<'_>,
-) -> Result<Vec<VecHit>, StorageError> {
-    let bytes: &[u8] = rurico::storage::f32_as_bytes(query_embedding);
-    let oversample = limit.saturating_mul(VEC_MAXSIM_OVERSAMPLE);
-
-    // Step 1: KNN query — fetch only chunk_id + distance to avoid the sqlite-vec
-    // restriction that prohibits JOIN conditions on vec0 auxiliary columns (+chunk_id).
-    let knn_rows: Vec<(i64, f32)> = {
-        let mut stmt = conn.prepare_cached(
-            "SELECT chunk_id, distance FROM vec_chunks \
-             WHERE embedding MATCH ?1 AND k = ?2 \
-             ORDER BY distance",
-        )?;
-        stmt.query_map(rusqlite::params![bytes, oversample], |row| {
-            Ok((row.get(0)?, row.get(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?
-    };
-
-    if knn_rows.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    // MaxSim: keep the sub-embedding with the smallest distance per chunk_id
-    let mut best: HashMap<i64, f32> = HashMap::new();
-    for (chunk_id, distance) in &knn_rows {
-        best.entry(*chunk_id)
-            .and_modify(|d| {
-                if *distance < *d {
-                    *d = *distance;
-                }
-            })
-            .or_insert(*distance);
-    }
-
-    // Step 2: batch-fetch chunk metadata for the deduplicated chunk_ids
-    let chunk_ids: Vec<i64> = best.keys().copied().collect();
-    let mut sql = format!(
-        "SELECT c.id, c.post_number, c.section_title, c.content \
-         FROM chunks c \
-         JOIN posts p ON p.number = c.post_number \
-         WHERE c.id IN ({})",
-        super::anon_placeholders(chunk_ids.len())
-    );
-    let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = chunk_ids
-        .iter()
-        .map(|id| Box::new(*id) as Box<dyn rusqlite::types::ToSql>)
-        .collect();
-    append_tags_filter(&mut sql, &mut params, filter.tags);
-    append_eq_filter(&mut sql, &mut params, "p.category", filter.category);
-    append_eq_filter(&mut sql, &mut params, "p.created_by", filter.created_by);
-    append_date_filter(&mut sql, &mut params, false, filter.updated_after);
-    append_date_filter(&mut sql, &mut params, true, filter.updated_before);
-
-    let mut stmt2 = conn.prepare(&sql)?;
-    let meta: HashMap<i64, (u32, Option<String>, String)> = stmt2
-        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                (
-                    row.get::<_, u32>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                ),
-            ))
-        })?
-        .collect::<Result<HashMap<_, _>, _>>()?;
-
-    let mut hits: Vec<VecHit> = best
-        .into_iter()
-        .filter_map(|(chunk_id, distance)| {
-            meta.get(&chunk_id)
-                .map(|(post_number, section_title, content)| VecHit {
-                    chunk_id,
-                    distance,
-                    post_number: *post_number,
-                    section_title: section_title.clone(),
-                    content: content.clone(),
-                })
-        })
-        .collect();
-
-    hits.sort_by(|a, b| a.distance.total_cmp(&b.distance));
-    hits.truncate(limit as usize);
-
-    Ok(hits)
-}
-
-const RECENCY_HALF_LIFE: f64 = 30.0;
-const RECENCY_WEIGHT: f64 = 0.2;
-const SECS_PER_DAY: f64 = 86_400.0;
-
-pub fn hybrid_search(
-    conn: &Connection,
-    query: &str,
-    query_embedding: Option<&[f32]>,
-    limit: u32,
-    now: chrono::DateTime<chrono::Utc>,
-    filter: &SearchFilter<'_>,
-    reranker: Option<&dyn Rerank>,
-) -> Result<Vec<SearchResult>, StorageError> {
-    let candidate_limit = if reranker.is_some() {
-        limit * 4
-    } else {
-        limit * 3
-    };
-
-    let fts_hits = fts_search(conn, query, candidate_limit, filter)?;
-
-    let vec_hits = match query_embedding {
-        Some(emb) if super::has_embeddings(conn) => {
-            match vec_search(conn, emb, candidate_limit, filter) {
-                Ok(hits) => hits,
-                Err(e) => {
-                    eprintln!("  warning: vector search failed, falling back to text search only");
-                    warn!(%e, %query, candidate_limit, "vec_search failed, falling back to FTS only");
-                    Vec::new()
-                }
-            }
-        }
-        _ => Vec::new(),
-    };
-
-    let fts_rrf_input: Vec<(u32, f64)> = fts_hits.iter().map(|h| (h.post_number, 0.0)).collect();
-    let vec_rrf_input: Vec<(u32, f64)> = vec_hits.iter().map(|h| (h.post_number, 0.0)).collect();
-    let merged = rurico::storage::rrf_merge(&fts_rrf_input, &vec_rrf_input);
-
-    // Fetch metadata for all candidates (not just limit) to apply decay before truncation
-    let candidate_numbers: Vec<u32> = merged.iter().map(|(pn, _)| *pn).collect();
-    let post_meta = batch_fetch_post_meta(conn, &candidate_numbers)?;
-
-    // P1: keep the first (highest-ranked) chunk per post so the reranker sees
-    // the most relevant content, not whichever chunk happened to be last.
-    let mut fts_map: HashMap<u32, &FtsHit> = HashMap::new();
-    for h in &fts_hits {
-        fts_map.entry(h.post_number).or_insert(h);
-    }
-    let mut vec_map: HashMap<u32, &VecHit> = HashMap::new();
-    for h in &vec_hits {
-        vec_map.entry(h.post_number).or_insert(h);
-    }
-
-    // P2: apply recency boost in every path so it is never discarded.
-    // When the cross-encoder is active it re-scores first, then recency
-    // is added on top; the fallback and no-reranker paths behave as before.
-    let scored = if let Some(ranker) = reranker {
-        let pairs: Vec<(&str, &str)> = merged
-            .iter()
-            .map(|(pn, _)| {
-                let content = fts_map
-                    .get(pn)
-                    .map(|h| h.content.as_str())
-                    .or_else(|| vec_map.get(pn).map(|h| h.content.as_str()))
-                    .unwrap_or("");
-                (query, content)
-            })
-            .collect();
-        match ranker.score_batch(&pairs) {
-            Ok(scores) => {
-                let cross_scored: Vec<(u32, f64)> = merged
-                    .into_iter()
-                    .zip(scores)
-                    .map(|((pn, _), s)| (pn, s as f64))
-                    .collect();
-                apply_recency_boost(cross_scored, &post_meta, now)
-            }
-            Err(e) => {
-                warn!(%e, "cross-encoder reranking failed, keeping heuristic order");
-                apply_recency_boost(merged, &post_meta, now)
-            }
-        }
-    } else {
-        apply_recency_boost(merged, &post_meta, now)
-    };
-
-    let results = scored
-        .into_iter()
-        .take(limit as usize)
-        .map(|(post_number, score)| {
-            let meta = post_meta
-                .get(&post_number)
-                .cloned()
-                .unwrap_or_else(|| PostMeta {
-                    name: format!("#{post_number}"),
-                    url: String::new(),
-                    updated_at: String::new(),
-                });
-            let vec_hit = vec_map.get(&post_number).copied();
-            let (section_title, snippet) = fts_map
-                .get(&post_number)
-                .map(|h| (h.section_title.clone(), h.content.clone()))
-                .or_else(|| vec_hit.map(|h| (h.section_title.clone(), h.content.clone())))
-                .unwrap_or_default();
-            SearchResult {
-                post_number,
-                post_name: meta.name,
-                post_url: meta.url,
-                section_title,
-                snippet: truncate_snippet(&snippet, 200),
-                score: score as f32,
-                // Semantic takes priority when a post matched both sources.
-                match_source: if vec_hit.is_some() {
-                    MatchSource::Semantic
-                } else {
-                    MatchSource::Fts
-                },
-            }
-        })
-        .collect();
-    Ok(results)
-}
-
-fn append_tags_filter(
-    sql: &mut String,
-    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
-    tags: Option<&[&str]>,
-) {
-    if let Some(tags) = tags
-        && !tags.is_empty()
-    {
-        sql.push_str(&format!(
-            " AND EXISTS (SELECT 1 FROM json_each(p.tags) jt WHERE jt.value IN ({}))",
-            super::anon_placeholders(tags.len())
-        ));
-        for &tag in tags {
-            params.push(Box::new(tag.to_string()));
-        }
-    }
-}
-
-fn append_date_filter(
-    sql: &mut String,
-    params: &mut Vec<Box<dyn rusqlite::types::ToSql>>,
-    before: bool,
-    value: Option<chrono::DateTime<chrono::Utc>>,
-) {
-    let Some(dt) = value else { return };
-    // For `before`, advance one day and use `<` so the boundary day is fully
-    // included ("2025-01-15T23:59:59+09:00" < "2025-01-16" is TRUE).
-    let (op, date_str) = if before {
-        let next = dt
-            .date_naive()
-            .succ_opt()
-            .unwrap_or(dt.date_naive())
-            .format("%Y-%m-%d")
-            .to_string();
-        ("<", next)
-    } else {
-        (">=", dt.format("%Y-%m-%d").to_string())
-    };
-    sql.push_str(&format!(" AND p.updated_at {op} ?"));
-    params.push(Box::new(date_str));
-}
-
-fn apply_recency_boost(
-    merged: Vec<(u32, f64)>,
-    post_meta: &HashMap<u32, PostMeta>,
-    now: chrono::DateTime<chrono::Utc>,
-) -> Vec<(u32, f64)> {
-    let mut scored: Vec<(u32, f64)> = merged
-        .into_iter()
-        .map(|(post_number, rrf_score)| {
-            let decay = post_meta
-                .get(&post_number)
-                .and_then(|meta| {
-                    let updated_at = &meta.updated_at;
-                    chrono::DateTime::parse_from_rfc3339(updated_at)
-                        .map_err(|e| warn!(%e, %updated_at, "unparseable updated_at, decay=0.0"))
-                        .ok()
-                })
-                .map(|updated| {
-                    let age_days = (now - updated.with_timezone(&chrono::Utc)).num_seconds() as f64
-                        / SECS_PER_DAY;
-                    rurico::storage::recency_decay(age_days, RECENCY_HALF_LIFE)
-                })
-                .unwrap_or(0.0);
-            let boosted = rrf_score * (1.0 + RECENCY_WEIGHT * decay);
-            (post_number, boosted)
-        })
-        .collect();
-    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
-    scored
+#[derive(Debug, Clone)]
+pub(crate) struct VecHit {
+    pub distance: f32,
+    pub post_number: u32,
+    pub section_title: Option<String>,
+    pub content: String,
 }
 
 #[derive(Debug, Clone)]
@@ -378,62 +63,6 @@ struct PostMeta {
     name: String,
     url: String,
     updated_at: String,
-}
-
-fn batch_fetch_post_meta(
-    conn: &Connection,
-    post_numbers: &[u32],
-) -> Result<HashMap<u32, PostMeta>, StorageError> {
-    if post_numbers.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let sql = format!(
-        "SELECT number, name, url, updated_at FROM posts WHERE number IN ({})",
-        super::in_placeholders(post_numbers.len())
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let params = super::as_sql_params(post_numbers);
-    let rows = stmt
-        .query_map(params.as_slice(), |row| {
-            Ok((
-                row.get::<_, u32>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(rows
-        .into_iter()
-        .map(|(n, name, url, updated_at)| {
-            (
-                n,
-                PostMeta {
-                    name,
-                    url,
-                    updated_at,
-                },
-            )
-        })
-        .collect())
-}
-
-#[derive(Debug, Clone)]
-pub struct FtsHit {
-    pub chunk_id: i64,
-    pub post_number: u32,
-    pub section_title: Option<String>,
-    pub content: String,
-    pub rank: f64,
-}
-
-#[derive(Debug, Clone)]
-pub struct VecHit {
-    pub chunk_id: i64,
-    pub distance: f32,
-    pub post_number: u32,
-    pub section_title: Option<String>,
-    pub content: String,
 }
 
 /// Strip general punctuation while preserving technical term characters
@@ -491,7 +120,7 @@ fn parse_fts_segments(cleaned: &str) -> (Vec<String>, Vec<Vec<String>>) {
             let terms: Vec<String> = group
                 .split(" OR ")
                 .filter(|t| t.trim().trim_matches('"').chars().count() >= 3)
-                .map(|t| t.trim().to_string())
+                .map(|t| t.trim().to_owned())
                 .collect();
             if !terms.is_empty() {
                 or_groups.push(terms);
@@ -538,23 +167,399 @@ fn clean_for_trigram(query: &str) -> String {
     alternatives.join(" OR ")
 }
 
+fn append_tags_filter(sql: &mut String, params: &mut Vec<Box<dyn ToSql>>, tags: Option<&[&str]>) {
+    if let Some(tags) = tags
+        && !tags.is_empty()
+    {
+        sql.push_str(&format!(
+            " AND EXISTS (SELECT 1 FROM json_each(p.tags) jt WHERE jt.value IN ({}))",
+            super::anon_placeholders(tags.len())
+        ));
+        for &tag in tags {
+            params.push(Box::new(tag.to_owned()));
+        }
+    }
+}
+
+fn append_date_filter(
+    sql: &mut String,
+    params: &mut Vec<Box<dyn ToSql>>,
+    before: bool,
+    value: Option<DateTime<Utc>>,
+) {
+    let Some(dt) = value else { return };
+    // For `before`, advance one day and use `<` so the boundary day is fully
+    // included ("2025-01-15T23:59:59+09:00" < "2025-01-16" is TRUE).
+    let (op, date_str) = if before {
+        let next = dt
+            .date_naive()
+            .succ_opt()
+            .unwrap_or(dt.date_naive())
+            .format("%Y-%m-%d")
+            .to_string();
+        ("<", next)
+    } else {
+        (">=", dt.format("%Y-%m-%d").to_string())
+    };
+    sql.push_str(&format!(" AND p.updated_at {op} ?"));
+    params.push(Box::new(date_str));
+}
+
 fn truncate_snippet(s: &str, max_chars: usize) -> String {
     match s.char_indices().nth(max_chars) {
-        None => s.to_string(),
+        None => s.to_owned(),
         Some((byte_pos, _)) => format!("{}...", &s[..byte_pos]),
     }
+}
+
+fn batch_fetch_post_meta(
+    conn: &Connection,
+    post_numbers: &[u32],
+) -> Result<HashMap<u32, PostMeta>, StorageError> {
+    if post_numbers.is_empty() {
+        return Ok(HashMap::new());
+    }
+    let sql = format!(
+        "SELECT number, name, url, updated_at FROM posts WHERE number IN ({})",
+        super::in_placeholders(post_numbers.len())
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let params = super::as_sql_params(post_numbers);
+    let rows = stmt
+        .query_map(params.as_slice(), |row| {
+            Ok((
+                row.get::<_, u32>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, String>(3)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .map(|(n, name, url, updated_at)| {
+            (
+                n,
+                PostMeta {
+                    name,
+                    url,
+                    updated_at,
+                },
+            )
+        })
+        .collect())
+}
+
+const RECENCY_HALF_LIFE: f64 = 30.0;
+const RECENCY_WEIGHT: f64 = 0.2;
+const SECS_PER_DAY: f64 = 86_400.0;
+
+fn apply_recency_boost(
+    merged: Vec<(u32, f64)>,
+    post_meta: &HashMap<u32, PostMeta>,
+    now: DateTime<Utc>,
+) -> Vec<(u32, f64)> {
+    let mut scored: Vec<(u32, f64)> = merged
+        .into_iter()
+        .map(|(post_number, rrf_score)| {
+            let decay = post_meta
+                .get(&post_number)
+                .and_then(|meta| {
+                    let updated_at = &meta.updated_at;
+                    DateTime::parse_from_rfc3339(updated_at)
+                        .map_err(|e| warn!(%e, %updated_at, "unparseable updated_at, decay=0.0"))
+                        .ok()
+                })
+                .map(|updated| {
+                    let age_days =
+                        (now - updated.with_timezone(&Utc)).num_seconds() as f64 / SECS_PER_DAY;
+                    recency_decay(age_days, RECENCY_HALF_LIFE)
+                })
+                .unwrap_or(0.0);
+            let boosted = rrf_score * (1.0 + RECENCY_WEIGHT * decay);
+            (post_number, boosted)
+        })
+        .collect();
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
+    scored
+}
+
+pub(crate) fn fts_search(
+    conn: &Connection,
+    query: &str,
+    limit: u32,
+    filter: &SearchFilter<'_>,
+) -> Result<Vec<FtsHit>, StorageError> {
+    let normalized = normalize_punctuation(query);
+    let matched = match prepare_match_query(conn, &normalized) {
+        Ok(m) => m,
+        Err(e) => {
+            tracing::debug!(%e, query, "query produced no searchable terms");
+            return Ok(Vec::new());
+        }
+    };
+    let match_query = clean_for_trigram(matched.as_str());
+
+    let mut sql = String::from(
+        "SELECT c.post_number, c.section_title, c.content \
+         FROM fts_chunks f \
+         JOIN chunks c ON c.id = f.rowid \
+         JOIN posts p ON p.number = c.post_number \
+         WHERE fts_chunks MATCH ?",
+    );
+    let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(match_query)];
+
+    append_tags_filter(&mut sql, &mut params, filter.tags);
+    append_eq_filter(&mut sql, &mut params, "p.category", filter.category);
+    append_eq_filter(&mut sql, &mut params, "p.created_by", filter.created_by);
+    append_date_filter(&mut sql, &mut params, false, filter.updated_after);
+    append_date_filter(&mut sql, &mut params, true, filter.updated_before);
+    sql.push_str(" ORDER BY f.rank LIMIT ?");
+    params.push(Box::new(limit));
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows: Vec<FtsHit> = stmt
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok(FtsHit {
+                post_number: row.get(0)?,
+                section_title: row.get(1)?,
+                content: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    Ok(rows)
+}
+
+const VEC_MAXSIM_OVERSAMPLE: u32 = 10;
+
+pub(crate) fn vec_search(
+    conn: &Connection,
+    query_embedding: &[f32],
+    limit: u32,
+    filter: &SearchFilter<'_>,
+) -> Result<Vec<VecHit>, StorageError> {
+    let bytes: &[u8] = f32_as_bytes(query_embedding);
+    let oversample = limit.saturating_mul(VEC_MAXSIM_OVERSAMPLE);
+
+    // Step 1: KNN query — fetch only chunk_id + distance to avoid the sqlite-vec
+    // restriction that prohibits JOIN conditions on vec0 auxiliary columns (+chunk_id).
+    let knn_rows: Vec<(i64, f32)> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT chunk_id, distance FROM vec_chunks \
+             WHERE embedding MATCH ?1 AND k = ?2 \
+             ORDER BY distance",
+        )?;
+        stmt.query_map(rusqlite::params![bytes, oversample], |row| {
+            Ok((row.get(0)?, row.get(1)?))
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+    };
+
+    if knn_rows.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    // MaxSim: keep the sub-embedding with the smallest distance per chunk_id
+    let mut best: HashMap<i64, f32> = HashMap::new();
+    for (chunk_id, distance) in &knn_rows {
+        best.entry(*chunk_id)
+            .and_modify(|d| {
+                if *distance < *d {
+                    *d = *distance;
+                }
+            })
+            .or_insert(*distance);
+    }
+
+    // Step 2: batch-fetch chunk metadata for the deduplicated chunk_ids
+    let chunk_ids: Vec<i64> = best.keys().copied().collect();
+    let mut sql = format!(
+        "SELECT c.id, c.post_number, c.section_title, c.content \
+         FROM chunks c \
+         JOIN posts p ON p.number = c.post_number \
+         WHERE c.id IN ({})",
+        super::anon_placeholders(chunk_ids.len())
+    );
+    let mut params: Vec<Box<dyn ToSql>> = chunk_ids
+        .iter()
+        .map(|id| Box::new(*id) as Box<dyn ToSql>)
+        .collect();
+    append_tags_filter(&mut sql, &mut params, filter.tags);
+    append_eq_filter(&mut sql, &mut params, "p.category", filter.category);
+    append_eq_filter(&mut sql, &mut params, "p.created_by", filter.created_by);
+    append_date_filter(&mut sql, &mut params, false, filter.updated_after);
+    append_date_filter(&mut sql, &mut params, true, filter.updated_before);
+
+    let mut stmt2 = conn.prepare(&sql)?;
+    let meta: HashMap<i64, (u32, Option<String>, String)> = stmt2
+        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                (
+                    row.get::<_, u32>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, String>(3)?,
+                ),
+            ))
+        })?
+        .collect::<Result<HashMap<_, _>, _>>()?;
+
+    let mut hits: Vec<VecHit> = best
+        .into_iter()
+        .filter_map(|(chunk_id, distance)| {
+            meta.get(&chunk_id)
+                .map(|(post_number, section_title, content)| VecHit {
+                    distance,
+                    post_number: *post_number,
+                    section_title: section_title.clone(),
+                    content: content.clone(),
+                })
+        })
+        .collect();
+
+    hits.sort_by(|a, b| a.distance.total_cmp(&b.distance));
+    hits.truncate(limit as usize);
+
+    Ok(hits)
+}
+
+pub fn hybrid_search(
+    conn: &Connection,
+    query: &str,
+    query_embedding: Option<&[f32]>,
+    limit: u32,
+    now: DateTime<Utc>,
+    filter: &SearchFilter<'_>,
+    reranker: Option<&dyn Rerank>,
+) -> Result<SearchOutput, StorageError> {
+    let candidate_limit = if reranker.is_some() {
+        limit * 4
+    } else {
+        limit * 3
+    };
+
+    let fts_hits = fts_search(conn, query, candidate_limit, filter)?;
+
+    let mut warnings: Vec<String> = Vec::new();
+    let vec_hits = match query_embedding {
+        Some(emb) if super::has_embeddings(conn) => {
+            match vec_search(conn, emb, candidate_limit, filter) {
+                Ok(hits) => hits,
+                Err(e) => {
+                    warn!(%e, %query, candidate_limit, "vec_search failed, falling back to FTS only");
+                    warnings.push(format!(
+                        "vector search failed ({e}), falling back to text search only"
+                    ));
+                    Vec::new()
+                }
+            }
+        }
+        _ => Vec::new(),
+    };
+
+    let fts_rrf_input: Vec<(u32, f64)> = fts_hits.iter().map(|h| (h.post_number, 0.0)).collect();
+    let vec_rrf_input: Vec<(u32, f64)> = vec_hits.iter().map(|h| (h.post_number, 0.0)).collect();
+    let merged = rrf_merge(&fts_rrf_input, &vec_rrf_input);
+
+    // Fetch metadata for all candidates (not just limit) to apply decay before truncation
+    let candidate_numbers: Vec<u32> = merged.iter().map(|(pn, _)| *pn).collect();
+    let post_meta = batch_fetch_post_meta(conn, &candidate_numbers)?;
+
+    // P1: keep the first (highest-ranked) chunk per post so the reranker sees
+    // the most relevant content, not whichever chunk happened to be last.
+    let mut fts_map: HashMap<u32, &FtsHit> = HashMap::new();
+    for h in &fts_hits {
+        fts_map.entry(h.post_number).or_insert(h);
+    }
+    let mut vec_map: HashMap<u32, &VecHit> = HashMap::new();
+    for h in &vec_hits {
+        vec_map.entry(h.post_number).or_insert(h);
+    }
+
+    // P2: apply recency boost in every path so it is never discarded.
+    // When the cross-encoder is active it re-scores first, then recency
+    // is added on top; the fallback and no-reranker paths behave as before.
+    let scored = if let Some(ranker) = reranker {
+        let pairs: Vec<(&str, &str)> = merged
+            .iter()
+            .map(|(pn, _)| {
+                let content = fts_map
+                    .get(pn)
+                    .map(|h| h.content.as_str())
+                    .or_else(|| vec_map.get(pn).map(|h| h.content.as_str()))
+                    .unwrap_or("");
+                (query, content)
+            })
+            .collect();
+        match ranker.score_batch(&pairs) {
+            Ok(scores) => {
+                let cross_scored: Vec<(u32, f64)> = merged
+                    .into_iter()
+                    .zip(scores)
+                    .map(|((pn, _), s)| (pn, s as f64))
+                    .collect();
+                apply_recency_boost(cross_scored, &post_meta, now)
+            }
+            Err(e) => {
+                warn!(%e, "cross-encoder reranking failed, keeping heuristic order");
+                apply_recency_boost(merged, &post_meta, now)
+            }
+        }
+    } else {
+        apply_recency_boost(merged, &post_meta, now)
+    };
+
+    #[allow(clippy::cast_possible_truncation)]
+    let results = scored
+        .into_iter()
+        .take(limit as usize)
+        .map(|(post_number, score)| {
+            let meta = post_meta
+                .get(&post_number)
+                .cloned()
+                .unwrap_or_else(|| PostMeta {
+                    name: format!("#{post_number}"),
+                    url: String::new(),
+                    updated_at: String::new(),
+                });
+            let vec_hit = vec_map.get(&post_number).copied();
+            let (section_title, snippet) = fts_map
+                .get(&post_number)
+                .map(|h| (h.section_title.clone(), h.content.clone()))
+                .or_else(|| vec_hit.map(|h| (h.section_title.clone(), h.content.clone())))
+                .unwrap_or_default();
+            SearchResult {
+                post_number,
+                post_name: meta.name,
+                post_url: meta.url,
+                section_title,
+                snippet: truncate_snippet(&snippet, 200),
+                score: score as f32,
+                // Semantic takes priority when a post matched both sources.
+                match_source: if vec_hit.is_some() {
+                    MatchSource::Semantic
+                } else {
+                    MatchSource::Fts
+                },
+            }
+        })
+        .collect();
+    Ok(SearchOutput { results, warnings })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::storage::{self, Db};
+    use chrono::{NaiveDate, NaiveTime};
+    use std::collections::HashSet;
 
     fn test_post(number: u32, name: &str, body_md: &str) -> storage::EsaPostRow {
         let mut row = storage::test_post_row(number);
-        row.name = name.to_string();
+        row.name = name.to_owned();
         row.full_name = format!("dev/{name}");
-        row.body_md = body_md.to_string();
+        row.body_md = body_md.to_owned();
         row
     }
 
@@ -579,7 +584,7 @@ mod tests {
         }
     }
 
-    // T-228: fts_search matches a 3-character trigram term
+    // T-178: fts_search matches a 3-character trigram term
     #[test]
     fn fts_trigram_match_3chars() {
         let db = Db::open_memory().unwrap();
@@ -591,7 +596,7 @@ mod tests {
         assert!(post_nums.contains(&3));
     }
 
-    // T-229: fts_search expands a short (< 3 char) query via vocab table
+    // T-179: fts_search expands a short (< 3 char) query via vocab table
     #[test]
     fn fts_vocab_expansion_short_term() {
         let db = Db::open_memory().unwrap();
@@ -603,7 +608,7 @@ mod tests {
         assert!(post_nums.contains(&1) || post_nums.contains(&2));
     }
 
-    // T-230: fts_search expands a single-character query via vocab table
+    // T-180: fts_search expands a single-character query via vocab table
     #[test]
     fn fts_single_char_expansion() {
         let db = Db::open_memory().unwrap();
@@ -613,18 +618,18 @@ mod tests {
         assert!(!hits.is_empty());
     }
 
-    // T-231: rrf_merge ranks the result appearing in both sources first
+    // T-181: rrf_merge ranks the result appearing in both sources first
     #[test]
     fn rrf_merge_combines_sources() {
         let fts: Vec<(u32, f64)> = vec![(1, 0.0), (2, 0.0)];
         let vec: Vec<(u32, f64)> = vec![(2, 0.0), (3, 0.0)];
-        let merged = rurico::storage::rrf_merge(&fts, &vec);
+        let merged = rrf_merge(&fts, &vec);
         assert_eq!(merged[0].0, 2);
         assert!(merged[0].1 > merged[1].1);
         assert_eq!(merged.len(), 3);
     }
 
-    // T-232: hybrid_search returns results via FTS when no embeddings are present
+    // T-182: hybrid_search returns results via FTS when no embeddings are present
     #[test]
     fn hybrid_search_fts_only() {
         let db = Db::open_memory().unwrap();
@@ -635,18 +640,19 @@ mod tests {
             "認証の仕組み",
             None,
             10,
-            chrono::Utc::now(),
+            Utc::now(),
             &SearchFilter::default(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .results;
         assert!(!results.is_empty());
         assert_eq!(results[0].post_number, 1);
         assert!(!results[0].post_name.is_empty());
         assert!(!results[0].post_url.is_empty());
     }
 
-    // T-233: hybrid_search returns empty results for an empty query string
+    // T-183: hybrid_search returns empty results for an empty query string
     #[test]
     fn empty_query_returns_empty() {
         let db = Db::open_memory().unwrap();
@@ -657,15 +663,16 @@ mod tests {
             "",
             None,
             10,
-            chrono::Utc::now(),
+            Utc::now(),
             &SearchFilter::default(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .results;
         assert!(results.is_empty());
     }
 
-    // T-234: normalize_punctuation strips general punct but preserves technical symbols
+    // T-184: normalize_punctuation strips general punct but preserves technical symbols
     #[test]
     fn normalize_punctuation_strips_general_keeps_technical() {
         // General punctuation → space
@@ -689,7 +696,7 @@ mod tests {
         assert_eq!(normalize_punctuation("rate-limit"), "rate limit");
     }
 
-    // T-235: clean_for_trigram distributes OR groups and removes sub-trigram terms
+    // T-185: clean_for_trigram distributes OR groups and removes sub-trigram terms
     #[test]
     fn clean_for_trigram_adapts_query() {
         // Control chars removed + sub-trigram dropped + distributed
@@ -723,7 +730,7 @@ mod tests {
         );
     }
 
-    // T-236: fts_search does not error when query contains punctuation characters
+    // T-186: fts_search does not error when query contains punctuation characters
     #[test]
     fn fts_search_with_punctuation_does_not_error() {
         let db = Db::open_memory().unwrap();
@@ -732,7 +739,7 @@ mod tests {
         fts_search(db.conn(), "認証、フロー", 10, &SearchFilter::default()).unwrap();
     }
 
-    // T-237: fts_search finds C++, rate-limit, and std::io after normalization
+    // T-187: fts_search finds C++, rate-limit, and std::io after normalization
     #[test]
     fn fts_search_technical_terms_e2e() {
         let db = Db::open_memory().unwrap();
@@ -772,7 +779,7 @@ mod tests {
         assert!(hits.iter().any(|h| h.post_number == 10));
     }
 
-    // T-238: batch_fetch_post_meta returns metadata for each requested post number
+    // T-188: batch_fetch_post_meta returns metadata for each requested post number
     #[test]
     fn batch_fetch_post_meta_works() {
         let db = Db::open_memory().unwrap();
@@ -785,7 +792,7 @@ mod tests {
         assert!(!meta.get(&1).unwrap().updated_at.is_empty());
     }
 
-    // T-239: batch_fetch_post_meta returns empty map for an empty input slice
+    // T-189: batch_fetch_post_meta returns empty map for an empty input slice
     #[test]
     fn batch_fetch_empty() {
         let db = Db::open_memory().unwrap();
@@ -793,7 +800,7 @@ mod tests {
         assert!(meta.is_empty());
     }
 
-    // T-153: recent post scores higher than old post
+    // T-103: recent post scores higher than old post
     #[test]
     fn hybrid_search_recency_boost_recent_post_scores_higher() {
         let db = Db::open_memory().unwrap();
@@ -810,9 +817,9 @@ mod tests {
             storage::rechunk_post(db.conn(), *num, shared_body).unwrap();
         }
 
-        let now = chrono::DateTime::parse_from_rfc3339("2025-02-01T00:00:00+00:00")
+        let now = DateTime::parse_from_rfc3339("2025-02-01T00:00:00+00:00")
             .unwrap()
-            .with_timezone(&chrono::Utc);
+            .with_timezone(&Utc);
         let results = hybrid_search(
             db.conn(),
             "認証の仕組み",
@@ -822,7 +829,8 @@ mod tests {
             &SearchFilter::default(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .results;
         assert!(results.len() >= 2, "both posts should match");
 
         let score_a = results.iter().find(|r| r.post_number == 1).unwrap().score;
@@ -834,7 +842,7 @@ mod tests {
         );
     }
 
-    // T-154: unparseable updated_at does not panic, decay=0.0 applied
+    // T-104: unparseable updated_at does not panic, decay=0.0 applied
     #[test]
     fn hybrid_search_unparseable_updated_at_no_panic() {
         let db = Db::open_memory().unwrap();
@@ -845,9 +853,9 @@ mod tests {
         storage::upsert_post(db.conn(), &post).unwrap();
         storage::rechunk_post(db.conn(), 1, body).unwrap();
 
-        let now = chrono::DateTime::parse_from_rfc3339("2025-02-01T00:00:00+00:00")
+        let now = DateTime::parse_from_rfc3339("2025-02-01T00:00:00+00:00")
             .unwrap()
-            .with_timezone(&chrono::Utc);
+            .with_timezone(&Utc);
         let results = hybrid_search(
             db.conn(),
             "認証の仕組み",
@@ -857,7 +865,8 @@ mod tests {
             &SearchFilter::default(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .results;
 
         assert!(!results.is_empty(), "post should still be returned");
         assert!(
@@ -866,7 +875,7 @@ mod tests {
         );
     }
 
-    // T-151: content のみの語で fts_search ヒット — regression (FR-003)
+    // T-101: content のみの語で fts_search ヒット — regression (FR-003)
     #[test]
     fn fts_search_matches_content_only_term_regression() {
         let db = Db::open_memory().unwrap();
@@ -883,7 +892,7 @@ mod tests {
         assert_eq!(hits[0].post_number, 1);
     }
 
-    // T-152: heading なし preamble chunk で rechunk + fts_search エラーなし (FR-004)
+    // T-102: heading なし preamble chunk で rechunk + fts_search エラーなし (FR-004)
     #[test]
     fn fts_search_preamble_chunk_no_heading_no_error() {
         let db = Db::open_memory().unwrap();
@@ -904,7 +913,7 @@ mod tests {
         );
     }
 
-    // T-150: section_title のみの語で fts_search ヒット (FR-003)
+    // T-100: section_title のみの語で fts_search ヒット (FR-003)
     #[test]
     fn fts_search_matches_section_title_only_term() {
         let db = Db::open_memory().unwrap();
@@ -922,7 +931,7 @@ mod tests {
         assert_eq!(hits[0].section_title.as_deref(), Some("認証ガイド"));
     }
 
-    // T-240: fts_search finds posts by name, author, category, and tag metadata
+    // T-190: fts_search finds posts by name, author, category, and tag metadata
     #[test]
     fn fts_search_matches_enriched_metadata() {
         let db = Db::open_memory().unwrap();
@@ -968,10 +977,10 @@ mod tests {
     fn search_result_serializes_to_json_with_expected_fields() {
         let result = SearchResult {
             post_number: 42,
-            post_name: "Test Post".to_string(),
-            post_url: "https://example.esa.io/posts/42".to_string(),
-            section_title: Some("Section".to_string()),
-            snippet: "snippet text".to_string(),
+            post_name: "Test Post".to_owned(),
+            post_url: "https://example.esa.io/posts/42".to_owned(),
+            section_title: Some("Section".to_owned()),
+            snippet: "snippet text".to_owned(),
             score: 0.75,
             match_source: MatchSource::Fts,
         };
@@ -986,19 +995,19 @@ mod tests {
         assert_eq!(v["snippet"], "snippet text");
     }
 
-    // T-156: truncate_snippet
+    // T-106: truncate_snippet
     #[test]
     fn truncate_snippet_short_unchanged() {
         assert_eq!(truncate_snippet("abc", 5), "abc");
     }
 
-    // T-241: truncate_snippet appends "..." when snippet exceeds char limit
+    // T-191: truncate_snippet appends "..." when snippet exceeds char limit
     #[test]
     fn truncate_snippet_over_limit_truncated() {
         assert_eq!(truncate_snippet("abcdef", 3), "abc...");
     }
 
-    // T-242: truncate_snippet truncates at character boundary for multi-byte chars
+    // T-192: truncate_snippet truncates at character boundary for multi-byte chars
     #[test]
     fn truncate_snippet_multibyte_boundary() {
         let s = "あいうえお";
@@ -1006,7 +1015,7 @@ mod tests {
         assert_eq!(result, "あいう...");
     }
 
-    // T-243: hybrid_search uses vector search when embeddings are present
+    // T-193: hybrid_search uses vector search when embeddings are present
     #[test]
     fn hybrid_search_with_embeddings() {
         use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
@@ -1035,18 +1044,19 @@ mod tests {
             "認証",
             Some(&query_emb),
             10,
-            chrono::Utc::now(),
+            Utc::now(),
             &SearchFilter::default(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .results;
         assert!(!results.is_empty());
         assert!(!results[0].post_name.is_empty());
         assert!(!results[0].post_url.is_empty());
     }
 
     /// Distinct embeddings produce different vec_search distances and ranking.
-    // T-244: vec_search ranks the chunk with the closer embedding first
+    // T-194: vec_search ranks the chunk with the closer embedding first
     #[test]
     fn vec_search_ranks_closer_embedding_first() {
         use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
@@ -1081,11 +1091,12 @@ mod tests {
             "認証",
             Some(&query_emb),
             10,
-            chrono::Utc::now(),
+            Utc::now(),
             &SearchFilter::default(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .results;
         assert!(results.len() >= 2, "expected at least 2 results");
 
         // First result should come from the chunk with the closest embedding
@@ -1099,7 +1110,7 @@ mod tests {
     }
 
     /// MaxSim dedup: multiple sub-embeddings per chunk, best distance wins.
-    // T-245: vec_search deduplicates chunks and keeps only the best sub-embedding
+    // T-195: vec_search deduplicates chunks and keeps only the best sub-embedding
     #[test]
     fn maxsim_dedup_selects_best_sub_embedding() {
         use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
@@ -1143,11 +1154,12 @@ mod tests {
             "認証",
             Some(&query_emb),
             10,
-            chrono::Utc::now(),
+            Utc::now(),
             &SearchFilter::default(),
             None,
         )
-        .unwrap();
+        .unwrap()
+        .results;
         assert!(
             !results.is_empty(),
             "should have results with multi-sub embeddings"
@@ -1161,7 +1173,7 @@ mod tests {
             chunks.len()
         );
         // No duplicate (post_number, section_title) pairs in results
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = HashSet::new();
         for r in &results {
             let key = (r.post_number, r.section_title.clone());
             assert!(
@@ -1173,7 +1185,7 @@ mod tests {
         }
     }
 
-    // T-155: MaxSim selects the sub-embedding with the lower distance (closer to query)
+    // T-105: MaxSim selects the sub-embedding with the lower distance (closer to query)
     #[test]
     fn vec_search_maxsim_picks_closer_sub_embedding() {
         use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
@@ -1218,7 +1230,7 @@ mod tests {
         );
     }
 
-    // T-246: fts_search with category filter returns only posts in that category
+    // T-196: fts_search with category filter returns only posts in that category
     #[test]
     fn fts_filter_category_narrows_results() {
         let db = Db::open_memory().unwrap();
@@ -1252,7 +1264,7 @@ mod tests {
         );
     }
 
-    // T-247: fts_search with created_by filter returns only posts by that author
+    // T-197: fts_search with created_by filter returns only posts by that author
     #[test]
     fn fts_filter_created_by_narrows_results() {
         let db = Db::open_memory().unwrap();
@@ -1286,7 +1298,7 @@ mod tests {
         );
     }
 
-    // T-248: fts_search with tags filter returns only posts containing that tag
+    // T-198: fts_search with tags filter returns only posts containing that tag
     #[test]
     fn fts_filter_tags_narrows_results() {
         let db = Db::open_memory().unwrap();
@@ -1320,7 +1332,7 @@ mod tests {
         );
     }
 
-    // T-249: fts_search with no filters returns all matching posts
+    // T-199: fts_search with no filters returns all matching posts
     #[test]
     fn fts_filter_all_none_returns_all_matching() {
         let db = Db::open_memory().unwrap();
@@ -1333,7 +1345,7 @@ mod tests {
         );
     }
 
-    // T-250: fts_search with empty tags slice does not filter results
+    // T-200: fts_search with empty tags slice does not filter results
     #[test]
     fn fts_filter_empty_tags_returns_all_matching() {
         let db = Db::open_memory().unwrap();
@@ -1355,7 +1367,7 @@ mod tests {
         );
     }
 
-    // T-251: hybrid_search with category filter returns only posts in that category
+    // T-201: hybrid_search with category filter returns only posts in that category
     #[test]
     fn hybrid_search_filter_category_narrows_results() {
         let db = Db::open_memory().unwrap();
@@ -1377,14 +1389,15 @@ mod tests {
             "認証の仕組み",
             None,
             10,
-            chrono::Utc::now(),
+            Utc::now(),
             &SearchFilter {
                 category: Some("backend"),
                 ..Default::default()
             },
             None,
         )
-        .unwrap();
+        .unwrap()
+        .results;
         assert!(!results.is_empty(), "category filter should return results");
         assert!(
             results.iter().all(|r| r.post_number == 1),
@@ -1396,8 +1409,8 @@ mod tests {
         let mut row = storage::test_post_row(number);
         row.name = format!("ガイド {number}");
         row.full_name = format!("dev/ガイド{number}");
-        row.body_md = "# ガイド\n設定方法を解説".to_string();
-        row.updated_at = updated_at.to_string();
+        row.body_md = "# ガイド\n設定方法を解説".to_owned();
+        row.updated_at = updated_at.to_owned();
         row
     }
 
@@ -1414,15 +1427,14 @@ mod tests {
         }
     }
 
-    fn date_utc(s: &str) -> chrono::DateTime<chrono::Utc> {
-        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+    fn date_utc(s: &str) -> DateTime<Utc> {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d")
             .unwrap()
-            .and_hms_opt(0, 0, 0)
-            .unwrap()
+            .and_time(NaiveTime::MIN)
             .and_utc()
     }
 
-    // T-158: updated_after filters out posts with updated_at before threshold
+    // T-108: updated_after filters out posts with updated_at before threshold
     #[test]
     fn hybrid_search_updated_after_excludes_old_posts() {
         let db = Db::open_memory().unwrap();
@@ -1432,22 +1444,15 @@ mod tests {
             updated_after: Some(date_utc("2025-03-01")),
             ..Default::default()
         };
-        let results = hybrid_search(
-            db.conn(),
-            "ガイド",
-            None,
-            10,
-            chrono::Utc::now(),
-            &filter,
-            None,
-        )
-        .unwrap();
+        let results = hybrid_search(db.conn(), "ガイド", None, 10, Utc::now(), &filter, None)
+            .unwrap()
+            .results;
 
         assert_eq!(results.len(), 1, "only the newer post should be returned");
         assert_eq!(results[0].post_number, 2);
     }
 
-    // T-159: updated_before filters out posts with updated_at after threshold
+    // T-109: updated_before filters out posts with updated_at after threshold
     #[test]
     fn hybrid_search_updated_before_excludes_new_posts() {
         let db = Db::open_memory().unwrap();
@@ -1457,22 +1462,15 @@ mod tests {
             updated_before: Some(date_utc("2025-03-01")),
             ..Default::default()
         };
-        let results = hybrid_search(
-            db.conn(),
-            "ガイド",
-            None,
-            10,
-            chrono::Utc::now(),
-            &filter,
-            None,
-        )
-        .unwrap();
+        let results = hybrid_search(db.conn(), "ガイド", None, 10, Utc::now(), &filter, None)
+            .unwrap()
+            .results;
 
         assert_eq!(results.len(), 1, "only the older post should be returned");
         assert_eq!(results[0].post_number, 1);
     }
 
-    // T-160: updated_after and updated_before combined apply AND condition
+    // T-110: updated_after and updated_before combined apply AND condition
     #[test]
     fn hybrid_search_date_range_returns_matching_posts_only() {
         let db = Db::open_memory().unwrap();
@@ -1484,16 +1482,9 @@ mod tests {
             updated_before: Some(date_utc("2025-03-01")),
             ..Default::default()
         };
-        let results = hybrid_search(
-            db.conn(),
-            "ガイド",
-            None,
-            10,
-            chrono::Utc::now(),
-            &filter,
-            None,
-        )
-        .unwrap();
+        let results = hybrid_search(db.conn(), "ガイド", None, 10, Utc::now(), &filter, None)
+            .unwrap()
+            .results;
 
         assert_eq!(
             results.len(),
@@ -1503,7 +1494,7 @@ mod tests {
         assert_eq!(results[0].post_number, 1);
     }
 
-    // T-157: hybrid_search with MockReranker applies cross-encoder scores to results
+    // T-107: hybrid_search with MockReranker applies cross-encoder scores to results
     #[test]
     fn hybrid_search_reranker_applies_cross_encoder_scores() {
         use rurico::reranker::MockReranker;
@@ -1517,11 +1508,12 @@ mod tests {
             "認証の仕組み",
             None,
             10,
-            chrono::Utc::now(),
+            Utc::now(),
             &SearchFilter::default(),
             Some(&reranker),
         )
-        .unwrap();
+        .unwrap()
+        .results;
         assert!(!results.is_empty(), "reranker search should return results");
         for r in &results {
             assert!(

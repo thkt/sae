@@ -1,4 +1,4 @@
-pub mod chunker;
+pub(crate) mod chunker;
 pub mod client;
 pub mod config;
 pub(crate) mod redact;

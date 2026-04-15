@@ -1,6 +1,9 @@
 use rurico::embed::ChunkedEmbedding;
+use sae::storage;
 
 use crate::SaeError;
+
+pub(crate) const BATCH_SIZE: u32 = 128;
 
 pub(crate) struct BatchResult {
     pub added: u32,
@@ -16,7 +19,7 @@ pub(crate) fn embed_one_batch<F>(
 where
     F: Fn(&[&str]) -> Result<Vec<ChunkedEmbedding>, SaeError>,
 {
-    let batch = sae::storage::get_unembedded_chunks(conn, budget)?;
+    let batch = storage::get_unembedded_chunks(conn, budget)?;
     if batch.is_empty() {
         return Ok(BatchResult {
             added: 0,
@@ -25,7 +28,7 @@ where
         });
     }
     let texts: Vec<&str> = batch.iter().map(|(_, c)| c.as_str()).collect();
-    let batch_len = batch.len() as u32;
+    let batch_len = u32::try_from(batch.len()).expect("batch size exceeds u32::MAX");
     let embs = embed_fn(&texts)?;
     if embs.len() != batch.len() {
         return Err(SaeError::Other(format!(
@@ -35,7 +38,7 @@ where
         )));
     }
     let embeddings: Vec<(i64, _)> = batch.iter().map(|(id, _)| *id).zip(embs).collect();
-    let added = sae::storage::add_chunked_embeddings(conn, &embeddings)?;
+    let added = storage::add_chunked_embeddings(conn, &embeddings)?;
     Ok(BatchResult {
         added,
         processed: batch_len,

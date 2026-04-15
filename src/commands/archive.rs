@@ -1,7 +1,7 @@
 use sae::client::UpdatePostParams;
 use sae::config::Config;
 
-use crate::{SaeError, resolve_client};
+use crate::{SaeError, output, resolve_client};
 
 pub(crate) fn archive_category(current: Option<&str>) -> Option<String> {
     let current = current.unwrap_or("");
@@ -9,7 +9,7 @@ pub(crate) fn archive_category(current: Option<&str>) -> Option<String> {
         return None;
     }
     Some(if current.is_empty() {
-        "Archived".to_string()
+        "Archived".to_owned()
     } else {
         format!("Archived/{current}")
     })
@@ -27,18 +27,18 @@ pub(crate) async fn run_archive(
     let new_category = match archive_category(post.category.as_deref()) {
         Some(c) => c,
         None if dry_run => {
-            return crate::output::dry_run(&serde_json::json!({
+            return output::dry_run(&serde_json::json!({
                 "number": number,
                 "already_archived": true,
                 "category": post.category.as_deref().unwrap_or(""),
             }));
         }
         None => {
-            return crate::output::action_result("Already archived", &post, json);
+            return output::action_result("Already archived", &post, json);
         }
     };
     if dry_run {
-        return crate::output::dry_run(&serde_json::json!({
+        return output::dry_run(&serde_json::json!({
             "number": number,
             "from_category": post.category.as_deref().unwrap_or(""),
             "to_category": new_category,
@@ -49,7 +49,7 @@ pub(crate) async fn run_archive(
         ..Default::default()
     };
     let post = client.update_post(team, number, &params).await?;
-    crate::output::action_result("Archived", &post, json)
+    output::action_result("Archived", &post, json)
 }
 
 pub(crate) async fn run_ship(
@@ -60,7 +60,7 @@ pub(crate) async fn run_ship(
     json: bool,
 ) -> Result<String, SaeError> {
     if dry_run {
-        return crate::output::dry_run(&serde_json::json!({
+        return output::dry_run(&serde_json::json!({
             "number": number,
             "wip": false,
         }));
@@ -71,21 +71,21 @@ pub(crate) async fn run_ship(
         ..Default::default()
     };
     let post = client.update_post(team, number, &params).await?;
-    crate::output::action_result("Shipped", &post, json)
+    output::action_result("Shipped", &post, json)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // T-190: archive_category returns "Archived" when post has no category
+    // T-140: archive_category returns "Archived" when post has no category
     #[test]
     fn archive_no_category() {
         assert_eq!(archive_category(None), Some("Archived".into()));
         assert_eq!(archive_category(Some("")), Some("Archived".into()));
     }
 
-    // T-191: archive_category prefixes existing category with "Archived/"
+    // T-141: archive_category prefixes existing category with "Archived/"
     #[test]
     fn archive_with_category() {
         assert_eq!(
@@ -94,14 +94,14 @@ mod tests {
         );
     }
 
-    // T-192: archive_category returns None when post is already archived
+    // T-142: archive_category returns None when post is already archived
     #[test]
     fn archive_already_archived() {
         assert_eq!(archive_category(Some("Archived")), None);
         assert_eq!(archive_category(Some("Archived/dev")), None);
     }
 
-    // T-193: archive_category treats "ArchivedData" as not archived (prefix only)
+    // T-143: archive_category treats "ArchivedData" as not archived (prefix only)
     #[test]
     fn archive_not_prefix_match() {
         assert_eq!(

@@ -1,3 +1,5 @@
+use rurico::text::split_text;
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChunkType {
     Section,
@@ -33,7 +35,7 @@ pub fn chunk_markdown(body_md: &str) -> Vec<Chunk> {
     if headings.is_empty() {
         return split_oversized(Chunk {
             section_title: None,
-            content: body_md.to_string(),
+            content: body_md.to_owned(),
             chunk_type: ChunkType::Full,
         });
     }
@@ -74,11 +76,11 @@ fn split_oversized(chunk: Chunk) -> Vec<Chunk> {
     if chunk.content.len() <= MAX_CHUNK_BYTES {
         return vec![chunk];
     }
-    rurico::text::split_text(&chunk.content, MAX_CHUNK_BYTES)
+    split_text(&chunk.content, MAX_CHUNK_BYTES)
         .into_iter()
         .map(|part| Chunk {
             section_title: chunk.section_title.clone(),
-            content: part.to_string(),
+            content: part.to_owned(),
             chunk_type: chunk.chunk_type.clone(),
         })
         .collect()
@@ -120,14 +122,14 @@ fn parse_heading(line: &str) -> Option<String> {
         return None;
     }
     let title = rest.trim().trim_end_matches('#').trim();
-    Some(title.to_string())
+    Some(title.to_owned())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // T-176: empty_body_returns_empty
+    // T-234: empty_body_returns_empty
     #[test]
     fn empty_body_returns_empty() {
         assert!(chunk_markdown("").is_empty());
@@ -135,7 +137,7 @@ mod tests {
         assert!(chunk_markdown("\n\n").is_empty());
     }
 
-    // T-177: no_headings_returns_full_chunk
+    // T-235: no_headings_returns_full_chunk
     #[test]
     fn no_headings_returns_full_chunk() {
         let chunks = chunk_markdown("Just some text\nwithout headings");
@@ -144,7 +146,7 @@ mod tests {
         assert!(chunks[0].section_title.is_none());
     }
 
-    // T-178: three_headings_three_chunks
+    // T-128: three_headings_three_chunks
     #[test]
     fn three_headings_three_chunks() {
         let md = "# Introduction\nHello world\n# Details\nSome details\n# Conclusion\nGoodbye";
@@ -156,7 +158,7 @@ mod tests {
         assert!(chunks.iter().all(|c| c.chunk_type == ChunkType::Section));
     }
 
-    // T-179: preamble_before_first_heading
+    // T-129: preamble_before_first_heading
     #[test]
     fn preamble_before_first_heading() {
         let md = "Some preamble\n\n# First Section\nContent";
@@ -167,7 +169,7 @@ mod tests {
         assert_eq!(chunks[1].section_title.as_deref(), Some("First Section"));
     }
 
-    // T-180: respects_code_fences
+    // T-236: respects_code_fences
     #[test]
     fn respects_code_fences() {
         let md = "# Real Heading\nContent\n```\n# Not A Heading\n```\n# Another Heading\nMore";
@@ -178,7 +180,7 @@ mod tests {
         assert_eq!(chunks[1].section_title.as_deref(), Some("Another Heading"));
     }
 
-    // T-181: nested_headings
+    // T-237: nested_headings
     #[test]
     fn nested_headings() {
         let md = "# H1\nText1\n## H2\nText2\n### H3\nText3";
@@ -188,21 +190,21 @@ mod tests {
         assert!(chunks[0].content.contains("Text1"));
     }
 
-    // T-182: heading_only_returns_empty
+    // T-238: heading_only_returns_empty
     #[test]
     fn heading_only_returns_empty() {
         let chunks = chunk_markdown("# Title Only");
         assert!(chunks.is_empty());
     }
 
-    // T-183: headings_only_no_body_returns_empty
+    // T-239: headings_only_no_body_returns_empty
     #[test]
     fn headings_only_no_body_returns_empty() {
         let chunks = chunk_markdown("# H1\n## H2\n### H3");
         assert!(chunks.is_empty());
     }
 
-    // T-184: heading_with_trailing_hashes
+    // T-240: heading_with_trailing_hashes
     #[test]
     fn heading_with_trailing_hashes() {
         let md = "# Title ##\nContent";
@@ -210,7 +212,7 @@ mod tests {
         assert_eq!(chunks[0].section_title.as_deref(), Some("Title"));
     }
 
-    // T-185: rejects_invalid_headings
+    // T-241: rejects_invalid_headings
     #[test]
     fn rejects_invalid_headings() {
         assert!(parse_heading("#NoSpace").is_none());
@@ -223,7 +225,7 @@ mod tests {
     fn oversized_chunk_is_split() {
         // 20KB section with paragraph breaks
         let paragraph = "あ".repeat(500); // ~1500 bytes in UTF-8
-        let mut body = "# Big Section\n".to_string();
+        let mut body = "# Big Section\n".to_owned();
         for i in 0..15 {
             body.push_str(&format!("Paragraph {i}: {paragraph}\n\n"));
         }
@@ -253,7 +255,7 @@ mod tests {
     #[test]
     fn split_chunks_preserve_section_title() {
         let paragraph = "あ".repeat(500);
-        let mut body = "# My Title\n".to_string();
+        let mut body = "# My Title\n".to_owned();
         for i in 0..15 {
             body.push_str(&format!("Paragraph {i}: {paragraph}\n\n"));
         }
@@ -285,7 +287,7 @@ mod tests {
         assert_eq!(chunks.len(), 1, "exactly at threshold should not split");
     }
 
-    // T-186: tilde_fences
+    // T-242: tilde_fences
     #[test]
     fn tilde_fences() {
         let md = "# Before\nText\n~~~\n# Inside Fence\n~~~\n# After\nMore";

@@ -1,9 +1,10 @@
-use std::io::Read;
+use std::fs;
+use std::io::{self, Read};
 
 use sae::client::{CreatePostParams, UpdatePostParams};
 use sae::config::Config;
 
-use crate::{SaeError, resolve_client};
+use crate::{SaeError, output, resolve_client};
 
 #[derive(Debug, clap::Args)]
 pub(crate) struct CreateArgs {
@@ -42,7 +43,7 @@ pub(crate) async fn run_get(
 ) -> Result<String, SaeError> {
     let (team, client) = resolve_client(config, team)?;
     let post = client.get_post(team, number).await?;
-    crate::output::get(&post, json, with_body)
+    output::get(&post, json, with_body)
 }
 
 pub(crate) async fn run_create(
@@ -52,7 +53,7 @@ pub(crate) async fn run_create(
 ) -> Result<String, SaeError> {
     let resolved_body = resolve_body(args.body.as_deref(), args.body_file.as_deref())?;
     if args.dry_run {
-        return crate::output::dry_run(&serde_json::json!({
+        return output::dry_run(&serde_json::json!({
             "name": args.name,
             "body_md": resolved_body,
             "category": args.category,
@@ -69,7 +70,7 @@ pub(crate) async fn run_create(
         wip: args.wip,
     };
     let post = client.create_post(team, &params).await?;
-    crate::output::action_result("Created", &post, json)
+    output::action_result("Created", &post, json)
 }
 
 #[derive(Debug, clap::Args)]
@@ -111,7 +112,7 @@ pub(crate) async fn run_update(
         Some(args.tag)
     };
     if args.dry_run {
-        return crate::output::dry_run(&serde_json::json!({
+        return output::dry_run(&serde_json::json!({
             "number": args.number,
             "name": args.name,
             "body_md": resolved_body,
@@ -128,14 +129,14 @@ pub(crate) async fn run_update(
         ..Default::default()
     };
     let post = client.update_post(team, args.number, &params).await?;
-    crate::output::action_result("Updated", &post, json)
+    output::action_result("Updated", &post, json)
 }
 
 pub(crate) fn resolve_body(
     body: Option<&str>,
     body_file: Option<&str>,
 ) -> Result<Option<String>, SaeError> {
-    let mut stdin = std::io::stdin();
+    let mut stdin = io::stdin();
     resolve_body_with_reader(body, body_file, &mut stdin)
 }
 
@@ -145,14 +146,14 @@ pub(crate) fn resolve_body_with_reader(
     stdin: &mut impl Read,
 ) -> Result<Option<String>, SaeError> {
     match (body, body_file) {
-        (Some(b), None) => Ok(Some(b.to_string())),
+        (Some(b), None) => Ok(Some(b.to_owned())),
         (None, Some("-")) => {
             let mut buf = String::new();
             stdin.read_to_string(&mut buf)?;
             Ok(Some(buf))
         }
         (None, Some(path)) => {
-            let content = std::fs::read_to_string(path)?;
+            let content = fs::read_to_string(path)?;
             Ok(Some(content))
         }
         (None, None) => Ok(None),
@@ -166,28 +167,28 @@ mod tests {
     use std::io::Cursor;
     use tempfile::tempdir;
 
-    // T-110: resolve_body(Some, None) → inline body
+    // T-060: resolve_body(Some, None) → inline body
     #[test]
     fn resolve_body_inline_text() {
         let result = resolve_body(Some("inline text"), None).unwrap();
         assert_eq!(result.as_deref(), Some("inline text"));
     }
 
-    // T-111: resolve_body(None, None) → no body
+    // T-061: resolve_body(None, None) → no body
     #[test]
     fn resolve_body_none_returns_none() {
         let result = resolve_body(None, None).unwrap();
         assert_eq!(result, None);
     }
 
-    // T-112: resolve_body with nonexistent file → error
+    // T-062: resolve_body with nonexistent file → error
     #[test]
     fn resolve_body_nonexistent_file_is_error() {
         let result = resolve_body(None, Some("/nonexistent/path.md"));
         assert!(result.is_err(), "nonexistent file should return error");
     }
 
-    // T-113: resolve_body_with_reader(`-`) reads from stdin
+    // T-063: resolve_body_with_reader(`-`) reads from stdin
     #[test]
     fn resolve_body_with_reader_reads_stdin_when_dash() {
         let result = resolve_body_with_reader(None, Some("-"), &mut Cursor::new("本文\n")).unwrap();
@@ -198,7 +199,7 @@ mod tests {
         );
     }
 
-    // T-114: resolve_body_with_reader(`-`) with empty stdin → Some("")
+    // T-064: resolve_body_with_reader(`-`) with empty stdin → Some("")
     #[test]
     fn resolve_body_with_reader_empty_stdin_returns_empty_body() {
         let result = resolve_body_with_reader(None, Some("-"), &mut Cursor::new("")).unwrap();
@@ -214,7 +215,7 @@ mod tests {
     fn body_file_reads_from_file() {
         let dir = tempdir().unwrap();
         let file_path = dir.path().join("body.md");
-        std::fs::write(&file_path, "# Hello\nBody from file").unwrap();
+        fs::write(&file_path, "# Hello\nBody from file").unwrap();
 
         let result = resolve_body(None, Some(file_path.to_str().unwrap())).unwrap();
         assert_eq!(
