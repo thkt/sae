@@ -3,6 +3,7 @@ name = "sae"
 version = "0.1.0"
 edition = "2024"
 description = "esa semantic search CLI"
+license = "MIT"
 
 [features]
 test-support = ["rurico/test-support"]
