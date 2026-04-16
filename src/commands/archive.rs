@@ -1,7 +1,7 @@
-use sae::client::UpdatePostParams;
-use sae::config::Config;
-
-use crate::{SaeError, output, resolve_client};
+use crate::client::UpdatePostParams;
+use crate::config::Config;
+use crate::output;
+use crate::tools::{SaeError, resolve_client};
 
 pub(crate) fn archive_category(current: Option<&str>) -> Option<String> {
     let current = current.unwrap_or("");

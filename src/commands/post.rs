@@ -1,37 +1,38 @@
 use std::fs;
 use std::io::{self, Read};
 
-use sae::client::{CreatePostParams, UpdatePostParams};
-use sae::config::Config;
+use crate::client::{CreatePostParams, UpdatePostParams};
+use crate::config::Config;
 
-use crate::{SaeError, output, resolve_client};
+use crate::output;
+use crate::tools::{SaeError, resolve_client};
 
 #[derive(Debug, clap::Args)]
-pub(crate) struct CreateArgs {
+pub struct CreateArgs {
     /// Post title
     #[arg(long)]
-    pub(crate) name: String,
+    pub name: String,
     /// Post body (Markdown)
     #[arg(long, conflicts_with = "body_file")]
-    pub(crate) body: Option<String>,
+    pub body: Option<String>,
     /// Read body from file (use "-" for stdin)
     #[arg(long, conflicts_with = "body")]
-    pub(crate) body_file: Option<String>,
+    pub body_file: Option<String>,
     /// Category path
     #[arg(long)]
-    pub(crate) category: Option<String>,
+    pub category: Option<String>,
     /// Tags
     #[arg(long)]
-    pub(crate) tag: Vec<String>,
+    pub tag: Vec<String>,
     /// Mark as WIP
     #[arg(long)]
-    pub(crate) wip: bool,
+    pub wip: bool,
     /// Team name
     #[arg(long)]
-    pub(crate) team: Option<String>,
+    pub team: Option<String>,
     /// Preview without creating (no mutation API calls)
     #[arg(long)]
-    pub(crate) dry_run: bool,
+    pub dry_run: bool,
 }
 
 pub(crate) async fn run_get(
@@ -74,30 +75,30 @@ pub(crate) async fn run_create(
 }
 
 #[derive(Debug, clap::Args)]
-pub(crate) struct UpdateArgs {
+pub struct UpdateArgs {
     /// Post number
-    pub(crate) number: u32,
+    pub number: u32,
     /// New title
     #[arg(long)]
-    pub(crate) name: Option<String>,
+    pub name: Option<String>,
     /// New body (Markdown)
     #[arg(long, conflicts_with = "body_file")]
-    pub(crate) body: Option<String>,
+    pub body: Option<String>,
     /// Read body from file (use "-" for stdin)
     #[arg(long, conflicts_with = "body")]
-    pub(crate) body_file: Option<String>,
+    pub body_file: Option<String>,
     /// New category path
     #[arg(long)]
-    pub(crate) category: Option<String>,
+    pub category: Option<String>,
     /// New tags (replaces existing)
     #[arg(long)]
-    pub(crate) tag: Vec<String>,
+    pub tag: Vec<String>,
     /// Team name
     #[arg(long)]
-    pub(crate) team: Option<String>,
+    pub team: Option<String>,
     /// Preview without updating (no mutation API calls)
     #[arg(long)]
-    pub(crate) dry_run: bool,
+    pub dry_run: bool,
 }
 
 pub(crate) async fn run_update(

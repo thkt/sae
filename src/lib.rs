@@ -1,6 +1,11 @@
 pub(crate) mod chunker;
 pub mod client;
+pub mod commands;
 pub mod config;
+pub(crate) mod output;
 pub(crate) mod redact;
 pub mod storage;
 pub mod sync;
+pub mod tools;
+
+pub use tools::{Sae, SaeError, exit_code_for};

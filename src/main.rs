@@ -1,8 +1,5 @@
 #![warn(unreachable_pub)]
 
-mod commands;
-mod output;
-
 use std::env;
 use std::ffi;
 use std::io;
@@ -12,10 +9,8 @@ use std::process::ExitCode;
 use amici::cli::try_expand_shorthand;
 use clap::{Parser, Subcommand};
 use rurico::model_probe;
-use sae::client::{ClientError, EsaClient};
-use sae::config::{Config, ConfigError};
-use sae::storage::{Db, StorageError};
-use sae::sync::SyncError;
+use sae::config::Config;
+use sae::tools::{CreateArgs, Sae, SaeError, SearchArgs, UpdateArgs, exit_code_for};
 
 #[derive(Parser)]
 #[command(name = "sae", about = "esa semantic search CLI")]
@@ -52,20 +47,8 @@ Examples:
   echo \"認証\" | sae search
   sae search -")]
     Search {
-        /// Search query. Reads piped stdin when omitted, or any stdin with `-`.
-        query: Option<String>,
-        /// Team name
-        #[arg(long)]
-        team: Option<String>,
-        /// Max results (1-100)
-        #[arg(long, default_value = "10")]
-        limit: u32,
-        /// Filter: updated on or after this date (YYYY-MM-DD)
-        #[arg(long, value_name = "DATE")]
-        after: Option<String>,
-        /// Filter: updated on or before this date (YYYY-MM-DD)
-        #[arg(long, value_name = "DATE")]
-        before: Option<String>,
+        #[command(flatten)]
+        args: SearchArgs,
     },
     /// Get a post by number
     #[command(after_help = "\
@@ -92,7 +75,7 @@ Examples:
   sae create --name \"Title\" --dry-run")]
     Create {
         #[command(flatten)]
-        args: commands::post::CreateArgs,
+        args: CreateArgs,
     },
     /// Update a post
     #[command(after_help = "\
@@ -102,7 +85,7 @@ Examples:
   sae update 42 --name \"New Title\" --dry-run")]
     Update {
         #[command(flatten)]
-        args: commands::post::UpdateArgs,
+        args: UpdateArgs,
     },
     /// Archive a post
     #[command(after_help = "\
@@ -137,8 +120,7 @@ Examples:
     /// Embed all chunks (model must be downloaded first)
     #[command(after_help = "\
 Examples:
-  sae embed myteam
-  SAE_AUTO_DOWNLOAD_MODEL=1 sae embed myteam")]
+  sae embed myteam")]
     Embed {
         /// Team name
         team: String,
@@ -198,111 +180,38 @@ where
     Cli::try_parse_from(args)
 }
 
-#[derive(Debug, thiserror::Error)]
-pub(crate) enum SaeError {
-    #[error(transparent)]
-    Config(#[from] ConfigError),
-    #[error(transparent)]
-    Client(#[from] ClientError),
-    #[error(transparent)]
-    Storage(#[from] StorageError),
-    #[error(transparent)]
-    Sync(#[from] SyncError),
-    #[error(transparent)]
-    Json(#[from] serde_json::Error),
-    #[error(transparent)]
-    Io(#[from] io::Error),
-    /// User action required (e.g., run harvest or model download first)
-    #[error("{0}")]
-    Input(String),
-    /// Operational failure (e.g., model load, embedding, download)
-    #[error("{0}")]
-    Other(String),
-}
-
-pub(crate) fn resolve_client<'a>(
-    config: &'a Config,
-    team: Option<&'a str>,
-) -> Result<(&'a str, EsaClient), SaeError> {
-    let team = config.resolve_team(team)?;
-    let client = EsaClient::from_env()?;
-    Ok((team, client))
-}
-
-pub(crate) fn require_db(config: &Config, team: &str) -> Result<Db, SaeError> {
-    let db_path = config.team_db_path(team)?;
-    if !db_path.exists() {
-        return Err(SaeError::Input(format!(
-            "No data for team '{team}'. Run `sae harvest {team}` first."
-        )));
-    }
-    Ok(Db::open(&db_path)?)
-}
-
-fn exit_code_for(e: &SaeError) -> ExitCode {
-    match e {
-        SaeError::Input(_) | SaeError::Config(_) => ExitCode::from(2),
-        SaeError::Client(ClientError::TokenNotSet) => ExitCode::from(2),
-        SaeError::Sync(SyncError::Client(ClientError::TokenNotSet)) => ExitCode::from(2),
-        SaeError::Storage(_) | SaeError::Sync(SyncError::Storage(_)) | SaeError::Json(_) => {
-            ExitCode::from(4)
-        }
-        SaeError::Client(_) | SaeError::Sync(_) | SaeError::Io(_) | SaeError::Other(_) => {
-            ExitCode::FAILURE
-        }
-    }
-}
-
 async fn run(cli: Cli, config: Config) -> Result<String, SaeError> {
     let json = cli.json;
-    let output = match cli.command {
-        Command::Harvest { team, full } => {
-            commands::data::run_harvest(&config, &team, full, json).await?
-        }
-        Command::Search {
-            query,
-            team,
-            limit,
-            after,
-            before,
-        } => {
-            let query = commands::search::resolve_search_query(query)?;
-            commands::search::run_search(
-                &config,
-                &query,
-                team.as_deref(),
-                limit,
-                after.as_deref(),
-                before.as_deref(),
-                json,
-            )?
-        }
+    if let Command::Model { command } = cli.command {
+        return match command {
+            ModelCommand::Download => Sae::model_download(json),
+        };
+    }
+    let sae = Sae::new(config);
+    match cli.command {
+        Command::Harvest { team, full } => sae.harvest(&team, full, json).await,
+        Command::Search { args } => sae.search(args, json),
         Command::Get {
             number,
             team,
             with_body,
-        } => commands::post::run_get(&config, number, team.as_deref(), with_body, json).await?,
-        Command::Create { args } => commands::post::run_create(&config, args, json).await?,
-        Command::Update { args } => commands::post::run_update(&config, args, json).await?,
-        Command::Embed { team } => commands::data::run_embed(&config, &team, json)?,
+        } => sae.get(number, team.as_deref(), with_body, json).await,
+        Command::Create { args } => sae.create(args, json).await,
+        Command::Update { args } => sae.update(args, json).await,
+        Command::Embed { team } => sae.embed(&team, json),
         Command::Archive {
             number,
             team,
             dry_run,
-        } => {
-            commands::archive::run_archive(&config, number, team.as_deref(), dry_run, json).await?
-        }
+        } => sae.archive(number, team.as_deref(), dry_run, json).await,
         Command::Ship {
             number,
             team,
             dry_run,
-        } => commands::archive::run_ship(&config, number, team.as_deref(), dry_run, json).await?,
-        Command::Status { team } => commands::status::run_status(&config, team.as_deref(), json)?,
-        Command::Model { command } => match command {
-            ModelCommand::Download => commands::data::run_model_download(json)?,
-        },
-    };
-    Ok(output)
+        } => sae.ship(number, team.as_deref(), dry_run, json).await,
+        Command::Status { team } => sae.status(team.as_deref(), json),
+        Command::Model { .. } => unreachable!("handled before Sae::new()"),
+    }
 }
 
 #[tokio::main]
@@ -441,7 +350,7 @@ mod tests {
     fn explicit_search_not_double_injected() {
         let cli = parse_cli_args(["sae", "search", "認証"]).unwrap();
         match cli.command {
-            Command::Search { query, .. } => assert_eq!(query.as_deref(), Some("認証")),
+            Command::Search { args } => assert_eq!(args.query.as_deref(), Some("認証")),
             other => panic!("expected Search, got {other:?}"),
         }
     }
@@ -451,7 +360,7 @@ mod tests {
     fn search_missing_arg_parses_for_stdin_fallback() {
         let cli = parse_cli_args(["sae", "search"]).unwrap();
         match cli.command {
-            Command::Search { query, .. } => assert_eq!(query, None),
+            Command::Search { args } => assert_eq!(args.query, None),
             other => panic!("expected Search, got {other:?}"),
         }
     }
@@ -469,7 +378,7 @@ mod tests {
         let cli = parse_cli_args(["sae", "query"]).unwrap();
         assert!(!cli.json, "json should default to false");
         match cli.command {
-            Command::Search { query, .. } => assert_eq!(query.as_deref(), Some("query")),
+            Command::Search { args } => assert_eq!(args.query.as_deref(), Some("query")),
             other => panic!("expected Search, got {other:?}"),
         }
     }
@@ -580,7 +489,7 @@ mod tests {
         let cli = parse_cli_args(["sae", "model", "download"]).unwrap();
         match cli.command {
             Command::Model { command } => match command {
-                ModelCommand::Download => {} // pass
+                ModelCommand::Download => {}
             },
             other => panic!("expected Model {{ Download }}, got {other:?}"),
         }
@@ -603,7 +512,7 @@ mod tests {
         assert!(cli.json, "global json flag should be true");
         match cli.command {
             Command::Model { command } => match command {
-                ModelCommand::Download => {} // pass
+                ModelCommand::Download => {}
             },
             other => panic!("expected Model {{ Download }}, got {other:?}"),
         }
@@ -737,7 +646,6 @@ mod tests {
     // T-078: non-search subcommand names are not rewritten as search shorthand
     #[test]
     fn all_subcommands_not_shorthand() {
-        // `search` itself parses as Command::Search via the normal path — excluded.
         for cmd in [
             "harvest", "get", "update", "ship", "archive", "embed", "status", "model",
         ] {

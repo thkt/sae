@@ -1,4 +1,4 @@
-mod embed;
+pub(crate) mod embed;
 mod search;
 mod types;
 pub use embed::{

@@ -1,8 +1,7 @@
-use sae::client::EsaPost;
-use sae::storage::{EmbedResult, SearchResult, SyncStatus, TeamStatus};
-use sae::sync::HarvestResult;
-
-use crate::SaeError;
+use crate::client::EsaPost;
+use crate::storage::{EmbedResult, SearchResult, SyncStatus, TeamStatus};
+use crate::sync::HarvestResult;
+use crate::tools::SaeError;
 
 fn format_json<T: serde::Serialize + ?Sized>(val: &T) -> Result<String, SaeError> {
     Ok(serde_json::to_string(val)?)
@@ -17,9 +16,9 @@ pub(crate) fn harvest(result: &HarvestResult, json: bool) -> Result<String, SaeE
 }
 
 pub(crate) struct EmbedInfo {
-    pub processed: u32,
-    pub budget_exhausted: bool,
-    pub team: String,
+    pub(crate) processed: u32,
+    pub(crate) budget_exhausted: bool,
+    pub(crate) team: String,
 }
 
 pub(crate) fn search(
@@ -213,7 +212,7 @@ pub(crate) fn status(statuses: &[TeamStatus], json: bool) -> Result<String, SaeE
 #[cfg(test)]
 mod tests {
     use super::*;
-    use sae::storage::{EmbedResult, MatchSource, SyncState};
+    use crate::storage::{EmbedResult, MatchSource, SyncState};
 
     fn make_synced(team: &str, posts: u32) -> TeamStatus {
         TeamStatus {

@@ -2,17 +2,37 @@ use std::env;
 use std::io::{self, IsTerminal, Read};
 use std::process::{Command, Stdio};
 
+use crate::config::Config;
+use crate::storage;
 use amici::model::ModelLoad;
 use amici::model::embedder::degraded_reason_user_note;
 use rurico::embed::ChunkedEmbedding;
 use rurico::reranker::Rerank;
-use sae::config::Config;
-use sae::storage;
 
 use super::embedder::try_load_embedder;
 use super::reranker::try_load_reranker;
-use crate::{SaeError, output, require_db};
+use crate::output;
+use crate::tools::{SaeError, require_db};
+
 const SEARCH_EMBED_BUDGET: u32 = 128;
+
+#[derive(Debug, clap::Args)]
+pub struct SearchArgs {
+    /// Search query. Reads piped stdin when omitted, or any stdin with `-`.
+    pub query: Option<String>,
+    /// Team name
+    #[arg(long)]
+    pub team: Option<String>,
+    /// Max results (1-100)
+    #[arg(long, default_value = "10")]
+    pub limit: u32,
+    /// Filter: updated on or after this date (YYYY-MM-DD)
+    #[arg(long, value_name = "DATE")]
+    pub after: Option<String>,
+    /// Filter: updated on or before this date (YYYY-MM-DD)
+    #[arg(long, value_name = "DATE")]
+    pub before: Option<String>,
+}
 
 fn parse_date_arg(
     s: Option<&str>,
@@ -189,7 +209,7 @@ pub(crate) fn resolve_value_with_reader(
     }
 }
 
-pub(crate) fn resolve_search_query(query: Option<String>) -> Result<String, SaeError> {
+pub fn resolve_search_query(query: Option<String>) -> Result<String, SaeError> {
     let stdin = io::stdin();
     resolve_value_with_reader(
         query,
