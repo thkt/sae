@@ -16,24 +16,6 @@ use crate::tools::{SaeError, require_db};
 
 const SEARCH_EMBED_BUDGET: u32 = 128;
 
-#[derive(Debug, clap::Args)]
-pub struct SearchArgs {
-    /// Search query. Reads piped stdin when omitted, or any stdin with `-`.
-    pub query: Option<String>,
-    /// Team name
-    #[arg(long)]
-    pub team: Option<String>,
-    /// Max results (1-100)
-    #[arg(long, default_value = "10")]
-    pub limit: u32,
-    /// Filter: updated on or after this date (YYYY-MM-DD)
-    #[arg(long, value_name = "DATE")]
-    pub after: Option<String>,
-    /// Filter: updated on or before this date (YYYY-MM-DD)
-    #[arg(long, value_name = "DATE")]
-    pub before: Option<String>,
-}
-
 fn parse_date_arg(
     s: Option<&str>,
     flag: &str,
@@ -41,12 +23,13 @@ fn parse_date_arg(
     let Some(s) = s else {
         return Ok(None);
     };
-    let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
-        SaeError::Input(format!(
-            "Invalid date '--{flag} {s}': expected YYYY-MM-DD (e.g. 2025-01-01)"
-        ))
-    })?;
-    Ok(Some(date.and_time(chrono::NaiveTime::MIN).and_utc()))
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .map_err(|_| {
+            SaeError::Input(format!(
+                "Invalid date '--{flag} {s}': expected YYYY-MM-DD (e.g. 2025-01-01)"
+            ))
+        })
+        .map(|d| Some(d.and_time(chrono::NaiveTime::MIN).and_utc()))
 }
 
 /// Embeds up to `budget` pending chunks in one batch.

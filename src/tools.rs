@@ -14,8 +14,80 @@ use crate::output;
 use crate::storage::{Db, EmbedResult, StorageError, count_unembedded_chunks};
 use crate::sync::{self, SyncError};
 
-pub use crate::commands::post::{CreateArgs, UpdateArgs};
-pub use crate::commands::search::{SearchArgs, resolve_search_query};
+pub use crate::commands::search::resolve_search_query;
+
+#[derive(Debug, clap::Args)]
+pub struct SearchArgs {
+    /// Search query. Reads piped stdin when omitted, or any stdin with `-`.
+    pub query: Option<String>,
+    /// Team name
+    #[arg(long)]
+    pub team: Option<String>,
+    /// Max results (1-100)
+    #[arg(long, default_value = "10")]
+    pub limit: u32,
+    /// Filter: updated on or after this date (YYYY-MM-DD)
+    #[arg(long, value_name = "DATE")]
+    pub after: Option<String>,
+    /// Filter: updated on or before this date (YYYY-MM-DD)
+    #[arg(long, value_name = "DATE")]
+    pub before: Option<String>,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct CreateArgs {
+    /// Post title
+    #[arg(long)]
+    pub name: String,
+    /// Post body (Markdown)
+    #[arg(long, conflicts_with = "body_file")]
+    pub body: Option<String>,
+    /// Read body from file (use "-" for stdin)
+    #[arg(long, conflicts_with = "body")]
+    pub body_file: Option<String>,
+    /// Category path
+    #[arg(long)]
+    pub category: Option<String>,
+    /// Tags
+    #[arg(long)]
+    pub tag: Vec<String>,
+    /// Mark as WIP
+    #[arg(long)]
+    pub wip: bool,
+    /// Team name
+    #[arg(long)]
+    pub team: Option<String>,
+    /// Preview without creating (no mutation API calls)
+    #[arg(long)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, clap::Args)]
+pub struct UpdateArgs {
+    /// Post number
+    pub number: u32,
+    /// New title
+    #[arg(long)]
+    pub name: Option<String>,
+    /// New body (Markdown)
+    #[arg(long, conflicts_with = "body_file")]
+    pub body: Option<String>,
+    /// Read body from file (use "-" for stdin)
+    #[arg(long, conflicts_with = "body")]
+    pub body_file: Option<String>,
+    /// New category path
+    #[arg(long)]
+    pub category: Option<String>,
+    /// New tags (replaces existing)
+    #[arg(long)]
+    pub tag: Vec<String>,
+    /// Team name
+    #[arg(long)]
+    pub team: Option<String>,
+    /// Preview without updating (no mutation API calls)
+    #[arg(long)]
+    pub dry_run: bool,
+}
 
 pub struct Sae {
     config: Config,
