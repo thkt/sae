@@ -15,12 +15,35 @@ pub fn add_chunked_embeddings(
     }
     let chunk_ids: Vec<i64> = embeddings.iter().map(|(id, _)| *id).collect();
     let existing = existing_embedded_ids(conn, &chunk_ids)?;
+    let new: Vec<_> = embeddings
+        .iter()
+        .filter(|(id, _)| !existing.contains(id))
+        .collect();
+    insert_embeddings(conn, &new)
+}
+
+/// Inserts embeddings without checking for duplicates.
+///
+/// Only safe when the caller guarantees none of the `chunk_ids` are already embedded
+/// (e.g., immediately after [`get_unembedded_chunks`]).
+pub(crate) fn insert_new_embeddings(
+    conn: &Connection,
+    embeddings: &[(i64, ChunkedEmbedding)],
+) -> Result<u32, StorageError> {
+    let refs: Vec<_> = embeddings.iter().collect();
+    insert_embeddings(conn, &refs)
+}
+
+fn insert_embeddings(
+    conn: &Connection,
+    embeddings: &[&(i64, ChunkedEmbedding)],
+) -> Result<u32, StorageError> {
+    if embeddings.is_empty() {
+        return Ok(0);
+    }
     let tx = conn.unchecked_transaction()?;
     let mut count = 0u32;
     for (chunk_id, chunked_emb) in embeddings {
-        if existing.contains(chunk_id) {
-            continue;
-        }
         for (sub_idx, embedding) in chunked_emb.chunks.iter().enumerate() {
             let bytes: &[u8] = f32_as_bytes(embedding);
             tx.execute(

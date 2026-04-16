@@ -1,10 +1,10 @@
 use std::path::Path;
 
-use sae::config::{Config, validate_team_name};
-use sae::storage;
-use sae::storage::TeamStatus;
-
-use crate::{SaeError, output};
+use crate::config::{Config, validate_team_name};
+use crate::output;
+use crate::storage;
+use crate::storage::TeamStatus;
+use crate::tools::SaeError;
 
 pub(crate) fn run_status(
     config: &Config,

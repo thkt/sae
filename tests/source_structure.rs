@@ -117,7 +117,7 @@ fn each_command_file_under_200_non_test_lines() {
         "[T-116] src/commands/ directory does not exist"
     );
 
-    let expected_files = ["search.rs", "post.rs", "archive.rs", "data.rs", "status.rs"];
+    let expected_files = ["search.rs", "post.rs", "archive.rs", "status.rs"];
     for filename in &expected_files {
         let path = commands_dir.join(filename);
         assert!(
@@ -132,32 +132,29 @@ fn each_command_file_under_200_non_test_lines() {
     }
 }
 
-// T-117: run_embed uses tracing instead of eprintln! (zero eprintln! calls)
+// T-117: embed uses tracing instead of eprintln! (zero eprintln! calls)
 #[test]
 fn run_embed_no_eprintln() {
-    let path = src_dir().join("commands").join("data.rs");
-    assert!(
-        path.exists(),
-        "[T-117] src/commands/data.rs does not exist (run_embed should live there)"
-    );
+    let path = src_dir().join("tools.rs");
+    assert!(path.exists(), "[T-117] src/tools.rs does not exist");
     let source = fs::read_to_string(&path).unwrap();
-    let count = count_in_function(&source, "run_embed", "eprintln!");
+    let count = count_in_function(&source, "embed", "eprintln!");
     assert_eq!(
         count, 0,
-        "[T-117] run_embed should contain 0 eprintln! calls, found {count}"
+        "[T-117] Sae::embed should contain 0 eprintln! calls, found {count}"
     );
 }
 
-// T-118: run_embed emits exactly one tracing::info! call
+// T-118: embed emits exactly one tracing::info! call
 #[test]
 fn run_embed_has_1_tracing_info() {
-    let path = src_dir().join("commands").join("data.rs");
-    assert!(path.exists(), "[T-118] src/commands/data.rs does not exist");
+    let path = src_dir().join("tools.rs");
+    assert!(path.exists(), "[T-118] src/tools.rs does not exist");
     let source = fs::read_to_string(&path).unwrap();
-    let count = count_in_function(&source, "run_embed", "tracing::info!");
+    let count = count_in_function(&source, "embed", "tracing::info!");
     assert_eq!(
         count, 1,
-        "[T-118] run_embed should contain 1 tracing::info! call, found {count}"
+        "[T-118] Sae::embed should contain 1 tracing::info! call, found {count}"
     );
 }
 
@@ -200,7 +197,7 @@ fn each_command_file_has_test_module() {
         "[T-120] src/commands/ directory does not exist"
     );
 
-    let expected_files = ["search.rs", "post.rs", "archive.rs", "data.rs", "status.rs"];
+    let expected_files = ["search.rs", "post.rs", "archive.rs", "status.rs"];
     for filename in &expected_files {
         let path = commands_dir.join(filename);
         assert!(

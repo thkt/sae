@@ -2,16 +2,18 @@ use std::env;
 use std::io::{self, IsTerminal, Read};
 use std::process::{Command, Stdio};
 
+use crate::config::Config;
+use crate::storage;
 use amici::model::ModelLoad;
 use amici::model::embedder::degraded_reason_user_note;
 use rurico::embed::ChunkedEmbedding;
 use rurico::reranker::Rerank;
-use sae::config::Config;
-use sae::storage;
 
 use super::embedder::try_load_embedder;
 use super::reranker::try_load_reranker;
-use crate::{SaeError, output, require_db};
+use crate::output;
+use crate::tools::{SaeError, require_db};
+
 const SEARCH_EMBED_BUDGET: u32 = 128;
 
 fn parse_date_arg(
@@ -21,12 +23,13 @@ fn parse_date_arg(
     let Some(s) = s else {
         return Ok(None);
     };
-    let date = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d").map_err(|_| {
-        SaeError::Input(format!(
-            "Invalid date '--{flag} {s}': expected YYYY-MM-DD (e.g. 2025-01-01)"
-        ))
-    })?;
-    Ok(Some(date.and_time(chrono::NaiveTime::MIN).and_utc()))
+    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+        .map_err(|_| {
+            SaeError::Input(format!(
+                "Invalid date '--{flag} {s}': expected YYYY-MM-DD (e.g. 2025-01-01)"
+            ))
+        })
+        .map(|d| Some(d.and_time(chrono::NaiveTime::MIN).and_utc()))
 }
 
 /// Embeds up to `budget` pending chunks in one batch.
@@ -189,7 +192,7 @@ pub(crate) fn resolve_value_with_reader(
     }
 }
 
-pub(crate) fn resolve_search_query(query: Option<String>) -> Result<String, SaeError> {
+pub fn resolve_search_query(query: Option<String>) -> Result<String, SaeError> {
     let stdin = io::stdin();
     resolve_value_with_reader(
         query,
