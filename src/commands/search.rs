@@ -342,7 +342,7 @@ mod tests {
         is_terminal: bool,
     ) -> Result<String, SaeError> {
         resolve_value_with_reader(
-            value.map(str::to_string),
+            value.map(str::to_owned),
             Cursor::new(stdin),
             is_terminal,
             "search query",
