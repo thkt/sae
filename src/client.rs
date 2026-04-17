@@ -203,8 +203,8 @@ impl EsaClient {
         let body = CreatePostRequest {
             post: CreatePostBody {
                 name: params.name.to_owned(),
-                body_md: params.body_md.map(str::to_string),
-                category: params.category.map(str::to_string),
+                body_md: params.body_md.map(str::to_owned),
+                category: params.category.map(str::to_owned),
                 tags: params.tags.clone(),
                 wip: params.wip,
             },
@@ -223,9 +223,9 @@ impl EsaClient {
             .to_string();
         let body = UpdatePostRequest {
             post: UpdatePostBody {
-                name: params.name.map(str::to_string),
-                body_md: params.body_md.map(str::to_string),
-                category: params.category.map(str::to_string),
+                name: params.name.map(str::to_owned),
+                body_md: params.body_md.map(str::to_owned),
+                category: params.category.map(str::to_owned),
                 tags: params.tags.clone(),
                 wip: params.wip,
             },
@@ -283,7 +283,7 @@ impl EsaClient {
                 .headers()
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
-                .map(str::to_string);
+                .map(str::to_owned);
             match retry_wait(status, retry_after.as_deref(), attempt) {
                 Some(wait) if attempt < MAX_RETRIES => {
                     warn!(
