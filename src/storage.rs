@@ -19,6 +19,7 @@ use rurico::storage as rurico_storage;
 
 const SCHEMA_VERSION: u32 = 5;
 
+use amici::migration::notify_schema_change;
 pub(crate) use amici::storage::{anon_placeholders, as_sql_params, in_placeholders};
 
 const DDL_FTS: &str = "\
@@ -121,10 +122,8 @@ pub(crate) fn migrate_v5(conn: &Connection, from_version: u32) -> Result<(), Sto
     set_schema_version(&tx, 5)?;
     tx.commit()?;
     if from_version > 0 {
-        warn!(
-            from = from_version,
-            "schema upgraded to v5: embeddings cleared, please re-run `sae embed`"
-        );
+        let _span = tracing::info_span!("migration", from = from_version).entered();
+        notify_schema_change("sae", "embeddings", 0, "sae embed");
     }
     Ok(())
 }

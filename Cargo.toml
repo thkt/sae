@@ -10,7 +10,7 @@ license = "MIT"
 test-support = ["rurico/test-support"]
 
 [dependencies]
-amici = { git = "https://github.com/thkt/amici", rev = "466b4cb" }
+amici = { git = "https://github.com/thkt/amici", rev = "2dd9a52" }
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 clap = { version = "4.6", features = ["derive"] }
 reqwest = { version = "0.13", features = ["json"] }
