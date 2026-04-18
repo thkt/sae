@@ -20,7 +20,7 @@ pub(crate) fn run_status(
             .filter(|t| match validate_team_name(t) {
                 Ok(_) => true,
                 Err(_) => {
-                    eprintln!("Warning: skipping invalid team name: {t}");
+                    tracing::warn!(team = %t, "skipping invalid team name");
                     false
                 }
             })
