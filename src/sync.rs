@@ -1,5 +1,6 @@
 use std::fmt;
 
+use amici::cli::progress_step;
 use tracing::info;
 
 use crate::client::{ClientError, EsaClient, EsaPost};
@@ -91,10 +92,13 @@ pub async fn harvest(
             Err(ClientError::Api(ref msg)) if is_pagination_limit(msg) => {
                 if let Some(ref oldest) = batch_oldest_ts {
                     if window_boundary.as_ref() == Some(oldest) {
-                        eprintln!("  window didn't advance, stopping");
+                        progress_step(&["window didn't advance, stopping"]);
                         break;
                     }
-                    eprintln!("  pagination limit — narrowing to updated:<={oldest}");
+                    progress_step(&[
+                        "pagination limit",
+                        &format!("narrowing to updated:<={oldest}"),
+                    ]);
                     window_boundary = Some(oldest.clone());
                     batch_oldest_ts = None;
                     page = 1;
@@ -138,7 +142,10 @@ pub async fn harvest(
         )?;
         tx.commit().map_err(StorageError::Db)?;
 
-        eprintln!("  page {page}/{est_pages} — {total_fetched} posts fetched");
+        progress_step(&[
+            &format!("page {page}/{est_pages}"),
+            &format!("{total_fetched} posts fetched"),
+        ]);
         info!(
             page,
             fetched = resp.posts.len(),
@@ -166,10 +173,10 @@ pub async fn harvest(
     )?;
 
     if gap_detected {
-        eprintln!(
-            "  warning: gap detected — {} missing posts (run with --full to re-sync)",
+        progress_step(&[&format!(
+            "warning: gap detected — {} missing posts (run with --full to re-sync)",
             api_total - local_count
-        );
+        )]);
         info!(
             local_count,
             api_total,

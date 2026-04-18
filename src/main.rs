@@ -6,7 +6,7 @@ use std::io;
 use std::iter;
 use std::process::ExitCode;
 
-use amici::cli::try_expand_shorthand;
+use amici::cli::{exit_error, hint_arrow, try_expand_shorthand};
 use clap::{Parser, Subcommand};
 use rurico::model_probe;
 use sae::config::Config;
@@ -174,7 +174,7 @@ where
         let display: Vec<_> = iter::once("sae")
             .chain(expanded[1..].iter().filter_map(|a| a.to_str()))
             .collect();
-        eprintln!("→ {}", display.join(" "));
+        hint_arrow(&display);
         return Ok(cli);
     }
     Cli::try_parse_from(args)
@@ -230,7 +230,7 @@ async fn main() -> ExitCode {
     let config = match Config::load() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("error: {e}");
+            exit_error(&e.to_string());
             return exit_code_for(&e.into());
         }
     };
@@ -242,7 +242,7 @@ async fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            exit_error(&e.to_string());
             exit_code_for(&e)
         }
     }

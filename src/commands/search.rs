@@ -86,7 +86,7 @@ pub(crate) fn run_search(
     if let Err(reason) = embedder
         && let Some(note) = degraded_reason_user_note(*reason)
     {
-        eprintln!("Warning: {note}");
+        tracing::warn!("{note}");
     }
     let embed_info = if let Ok(emb) = embedder {
         match auto_embed_pending_with(&db, SEARCH_EMBED_BUDGET, |texts| {
@@ -99,8 +99,7 @@ pub(crate) fn run_search(
                 team: team.to_owned(),
             }),
             Err(e) => {
-                eprintln!("Warning: auto-embed failed ({e}), continuing with existing embeddings");
-                tracing::warn!(error = %e, "auto_embed_pending failed, continuing search");
+                tracing::warn!(error = %e, "auto-embed failed, continuing with existing embeddings");
                 None
             }
         }
@@ -111,7 +110,6 @@ pub(crate) fn run_search(
         match e.embed_query(query) {
             Ok(v) => Some(v),
             Err(e) => {
-                eprintln!("Warning: embed_query failed ({e}), falling back to FTS");
                 tracing::warn!(error = %e, %query, "embed_query failed, falling back to FTS");
                 None
             }
@@ -146,7 +144,7 @@ pub(crate) fn run_search(
         reranker_ref,
     )?;
     for w in &search_output.warnings {
-        eprintln!("Warning: {w}");
+        tracing::warn!("{w}");
     }
     let semantic = query_embedding.is_some();
     let output = output::search(&search_output.results, query, json, semantic, embed_info)?;
