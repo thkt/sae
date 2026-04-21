@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use amici::storage::append_eq_filter;
+use amici::storage::{append_eq_filter, fts::clean_for_trigram};
 use chrono::{DateTime, Utc};
 use rurico::reranker::Rerank;
 use rurico::storage::{f32_as_bytes, prepare_match_query, recency_decay, rrf_merge};
@@ -85,86 +85,6 @@ fn normalize_punctuation(query: &str) -> String {
         .split_whitespace()
         .collect::<Vec<_>>()
         .join(" ")
-}
-
-fn cross_product(groups: &[Vec<String>]) -> Vec<Vec<String>> {
-    if groups.is_empty() {
-        return vec![vec![]];
-    }
-    let rest = cross_product(&groups[1..]);
-    let mut result = Vec::new();
-    for term in &groups[0] {
-        for combo in &rest {
-            let mut v = vec![term.clone()];
-            v.extend(combo.iter().cloned());
-            result.push(v);
-        }
-    }
-    result
-}
-
-fn parse_fts_segments(cleaned: &str) -> (Vec<String>, Vec<Vec<String>>) {
-    let mut fixed: Vec<String> = Vec::new();
-    let mut or_groups: Vec<Vec<String>> = Vec::new();
-    let mut chars = cleaned.chars();
-
-    while let Some(c) = chars.next() {
-        if c == '(' {
-            let mut group = String::new();
-            for gc in chars.by_ref() {
-                if gc == ')' {
-                    break;
-                }
-                group.push(gc);
-            }
-            let terms: Vec<String> = group
-                .split(" OR ")
-                .filter(|t| t.trim().trim_matches('"').chars().count() >= 3)
-                .map(|t| t.trim().to_owned())
-                .collect();
-            if !terms.is_empty() {
-                or_groups.push(terms);
-            }
-        } else if c == '"' {
-            let mut term = String::from('"');
-            for tc in chars.by_ref() {
-                term.push(tc);
-                if tc == '"' {
-                    break;
-                }
-            }
-            fixed.push(term);
-        }
-    }
-
-    (fixed, or_groups)
-}
-
-/// Adapt rurico's MatchFtsQuery output for FTS5 trigram tokenizer.
-///
-/// Trigram FTS5 does not support `("a" OR "b") "c"` (parenthesized
-/// OR + implicit AND). This distributes OR groups into flat alternatives:
-/// `(A OR B) C` → `A C OR B C`. Also strips control chars and drops
-/// sub-trigram terms (<3 chars).
-fn clean_for_trigram(query: &str) -> String {
-    let cleaned: String = query.chars().filter(|c| !c.is_control()).collect();
-    let (fixed, or_groups) = parse_fts_segments(&cleaned);
-
-    if or_groups.is_empty() {
-        return fixed.join(" ");
-    }
-
-    // (A1 OR A2) (B1 OR B2) C → A1 B1 C OR A1 B2 C OR A2 B1 C OR A2 B2 C
-    let combos = cross_product(&or_groups);
-    let alternatives: Vec<String> = combos
-        .iter()
-        .map(|combo| {
-            let mut parts = combo.clone();
-            parts.extend(fixed.iter().cloned());
-            parts.join(" ")
-        })
-        .collect();
-    alternatives.join(" OR ")
 }
 
 fn append_tags_filter(sql: &mut String, params: &mut Vec<Box<dyn ToSql>>, tags: Option<&[&str]>) {
@@ -298,7 +218,9 @@ pub(crate) fn fts_search(
             return Ok(Vec::new());
         }
     };
-    let match_query = clean_for_trigram(matched.as_str());
+    let Some(match_query) = clean_for_trigram(&matched) else {
+        return Ok(Vec::new());
+    };
 
     let mut sql = String::from(
         "SELECT c.post_number, c.section_title, c.content \
@@ -694,40 +616,6 @@ mod tests {
         // : and - are stripped (rurico double-quoting bug workaround)
         assert_eq!(normalize_punctuation("std::io"), "std io");
         assert_eq!(normalize_punctuation("rate-limit"), "rate limit");
-    }
-
-    // T-185: clean_for_trigram distributes OR groups and removes sub-trigram terms
-    #[test]
-    fn clean_for_trigram_adapts_query() {
-        // Control chars removed + sub-trigram dropped + distributed
-        assert_eq!(
-            clean_for_trigram("(\"認証の\" OR \"認証\n\" OR \"認証フ\") \"フロー\""),
-            "\"認証の\" \"フロー\" OR \"認証フ\" \"フロー\""
-        );
-        // Single-element group + fixed term → distributed
-        assert_eq!(clean_for_trigram("\"std\" (\"ioの\")"), "\"ioの\" \"std\"");
-        // Multi-element group + fixed term → distributed
-        assert_eq!(
-            clean_for_trigram("(\"abc\" OR \"def\") \"ghi\""),
-            "\"abc\" \"ghi\" OR \"def\" \"ghi\""
-        );
-        // No parens → unchanged
-        assert_eq!(clean_for_trigram("\"hello\""), "\"hello\"");
-        // Single group, no fixed terms → just OR
-        assert_eq!(
-            clean_for_trigram("(\"abc\" OR \"def\")"),
-            "\"abc\" OR \"def\""
-        );
-        // Multiple OR groups → cross-product
-        assert_eq!(
-            clean_for_trigram("(\"a01\" OR \"a02\") (\"b01\" OR \"b02\")"),
-            "\"a01\" \"b01\" OR \"a01\" \"b02\" OR \"a02\" \"b01\" OR \"a02\" \"b02\""
-        );
-        // Multiple OR groups + fixed term
-        assert_eq!(
-            clean_for_trigram("(\"a01\" OR \"a02\") \"xyz\" (\"b01\" OR \"b02\")"),
-            "\"a01\" \"b01\" \"xyz\" OR \"a01\" \"b02\" \"xyz\" OR \"a02\" \"b01\" \"xyz\" OR \"a02\" \"b02\" \"xyz\""
-        );
     }
 
     // T-186: fts_search does not error when query contains punctuation characters
