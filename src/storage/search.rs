@@ -291,7 +291,7 @@ pub(crate) fn fts_search(
     filter: &SearchFilter<'_>,
 ) -> Result<Vec<FtsHit>, StorageError> {
     let normalized = normalize_punctuation(query);
-    let matched = match prepare_match_query(conn, &normalized) {
+    let matched = match prepare_match_query(conn, &normalized, "fts_chunks_vocab") {
         Ok(m) => m,
         Err(e) => {
             tracing::debug!(%e, query, "query produced no searchable terms");
