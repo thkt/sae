@@ -1,6 +1,9 @@
 use std::collections::HashMap;
 
-use amici::storage::{append_eq_filter, fts::clean_for_trigram};
+use amici::storage::{
+    filter::{append_eq_filter, append_timestamp_day_cutoff_filter},
+    fts::clean_for_trigram,
+};
 use chrono::{DateTime, Utc};
 use rurico::reranker::Rerank;
 use rurico::storage::{f32_as_bytes, prepare_match_query, recency_decay, rrf_merge};
@@ -87,6 +90,8 @@ fn normalize_punctuation(query: &str) -> String {
         .join(" ")
 }
 
+/// `EXISTS + json_each` shape does not fit `amici::storage::filter::append_in_filter`
+/// (which emits `AND {col} IN (...)`), so the subquery is built inline.
 fn append_tags_filter(sql: &mut String, params: &mut Vec<Box<dyn ToSql>>, tags: Option<&[&str]>) {
     if let Some(tags) = tags
         && !tags.is_empty()
@@ -101,28 +106,22 @@ fn append_tags_filter(sql: &mut String, params: &mut Vec<Box<dyn ToSql>>, tags: 
     }
 }
 
-fn append_date_filter(
+fn append_search_filters(
     sql: &mut String,
     params: &mut Vec<Box<dyn ToSql>>,
-    before: bool,
-    value: Option<DateTime<Utc>>,
+    filter: &SearchFilter<'_>,
 ) {
-    let Some(dt) = value else { return };
-    // For `before`, advance one day and use `<` so the boundary day is fully
-    // included ("2025-01-15T23:59:59+09:00" < "2025-01-16" is TRUE).
-    let (op, date_str) = if before {
-        let next = dt
-            .date_naive()
-            .succ_opt()
-            .unwrap_or(dt.date_naive())
-            .format("%Y-%m-%d")
-            .to_string();
-        ("<", next)
-    } else {
-        (">=", dt.format("%Y-%m-%d").to_string())
-    };
-    sql.push_str(&format!(" AND p.updated_at {op} ?"));
-    params.push(Box::new(date_str));
+    append_tags_filter(sql, params, filter.tags);
+    append_eq_filter(sql, params, "p.category", filter.category);
+    append_eq_filter(sql, params, "p.created_by", filter.created_by);
+    let after = filter
+        .updated_after
+        .map(|dt| dt.format("%Y-%m-%d").to_string());
+    let before = filter
+        .updated_before
+        .map(|dt| dt.format("%Y-%m-%d").to_string());
+    append_timestamp_day_cutoff_filter(sql, params, "p.updated_at", false, after.as_deref());
+    append_timestamp_day_cutoff_filter(sql, params, "p.updated_at", true, before.as_deref());
 }
 
 fn truncate_snippet(s: &str, max_chars: usize) -> String {
@@ -231,11 +230,7 @@ pub(crate) fn fts_search(
     );
     let mut params: Vec<Box<dyn ToSql>> = vec![Box::new(match_query)];
 
-    append_tags_filter(&mut sql, &mut params, filter.tags);
-    append_eq_filter(&mut sql, &mut params, "p.category", filter.category);
-    append_eq_filter(&mut sql, &mut params, "p.created_by", filter.created_by);
-    append_date_filter(&mut sql, &mut params, false, filter.updated_after);
-    append_date_filter(&mut sql, &mut params, true, filter.updated_before);
+    append_search_filters(&mut sql, &mut params, filter);
     sql.push_str(" ORDER BY f.rank LIMIT ?");
     params.push(Box::new(limit));
 
@@ -307,11 +302,7 @@ pub(crate) fn vec_search(
         .iter()
         .map(|id| Box::new(*id) as Box<dyn ToSql>)
         .collect();
-    append_tags_filter(&mut sql, &mut params, filter.tags);
-    append_eq_filter(&mut sql, &mut params, "p.category", filter.category);
-    append_eq_filter(&mut sql, &mut params, "p.created_by", filter.created_by);
-    append_date_filter(&mut sql, &mut params, false, filter.updated_after);
-    append_date_filter(&mut sql, &mut params, true, filter.updated_before);
+    append_search_filters(&mut sql, &mut params, filter);
 
     let mut stmt2 = conn.prepare(&sql)?;
     let meta: HashMap<i64, (u32, Option<String>, String)> = stmt2
@@ -1380,6 +1371,50 @@ mod tests {
             "range 2025-01-01..2025-03-01 should include only post 1"
         );
         assert_eq!(results[0].post_number, 1);
+    }
+
+    // T-202: updated_before is inclusive of the cutoff day (day-inclusive --before)
+    #[test]
+    fn hybrid_search_updated_before_includes_boundary_day() {
+        let db = Db::open_memory().unwrap();
+        let post = test_post_dated(1, "2025-03-01T12:00:00+00:00");
+        storage::upsert_post(db.conn(), &post).unwrap();
+        storage::rechunk_post(db.conn(), 1, &post.body_md).unwrap();
+
+        let filter = SearchFilter {
+            updated_before: Some(date_utc("2025-03-01")),
+            ..Default::default()
+        };
+        let results = hybrid_search(db.conn(), "ガイド", None, 10, Utc::now(), &filter, None)
+            .unwrap()
+            .results;
+        assert_eq!(
+            results.len(),
+            1,
+            "updated_before is inclusive of the boundary day (CLI: on or before)"
+        );
+    }
+
+    // T-203: updated_after is inclusive of the cutoff day (day-inclusive --after)
+    #[test]
+    fn hybrid_search_updated_after_includes_boundary_day() {
+        let db = Db::open_memory().unwrap();
+        let post = test_post_dated(1, "2025-03-01T12:00:00+00:00");
+        storage::upsert_post(db.conn(), &post).unwrap();
+        storage::rechunk_post(db.conn(), 1, &post.body_md).unwrap();
+
+        let filter = SearchFilter {
+            updated_after: Some(date_utc("2025-03-01")),
+            ..Default::default()
+        };
+        let results = hybrid_search(db.conn(), "ガイド", None, 10, Utc::now(), &filter, None)
+            .unwrap()
+            .results;
+        assert_eq!(
+            results.len(),
+            1,
+            "updated_after cutoff day is inclusive against T-suffixed timestamps"
+        );
     }
 
     // T-107: hybrid_search with MockReranker applies cross-encoder scores to results
