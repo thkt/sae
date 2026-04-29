@@ -483,6 +483,31 @@ mod tests {
         }
     }
 
+    // T-244: search args + --no-embed → no_embed=true
+    #[test]
+    fn search_with_no_embed_parses_flag() {
+        let cli = parse_cli_args(["sae", "search", "認証", "--no-embed"]).unwrap();
+        match cli.command {
+            Command::Search { args } => {
+                assert_eq!(args.query.as_deref(), Some("認証"), "query should match");
+                assert!(args.no_embed, "no_embed should be true");
+            }
+            other => panic!("expected Search, got {other:?}"),
+        }
+    }
+
+    // T-245: search args without --no-embed → no_embed defaults to false
+    #[test]
+    fn search_without_no_embed_defaults_to_false() {
+        let cli = parse_cli_args(["sae", "search", "認証"]).unwrap();
+        match cli.command {
+            Command::Search { args } => {
+                assert!(!args.no_embed, "no_embed should default to false");
+            }
+            other => panic!("expected Search, got {other:?}"),
+        }
+    }
+
     // T-001: `sae model download` parses to Command::Model { ModelCommand::Download }
     #[test]
     fn model_download_parses_correctly() {

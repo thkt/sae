@@ -32,6 +32,9 @@ pub struct SearchArgs {
     /// Filter: updated on or before this date (YYYY-MM-DD)
     #[arg(long, value_name = "DATE")]
     pub before: Option<String>,
+    /// Skip embedding lookups; use FTS only. Avoids embedder load cost.
+    #[arg(long)]
+    pub no_embed: bool,
 }
 
 #[derive(Debug, clap::Args)]
@@ -226,6 +229,7 @@ impl Sae {
             args.limit,
             args.after.as_deref(),
             args.before.as_deref(),
+            args.no_embed,
             json,
         )
     }

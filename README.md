@@ -94,6 +94,9 @@ sae embed myteam
 
 # 以降の検索は FTS + ベクトルのハイブリッド
 sae search "認証フローの設計方針"
+
+# embedder のロードコストを避けて FTS のみで検索（CI / スクリプト用途）
+sae search "認証" --no-embed
 ```
 
 ### 同期状態の確認

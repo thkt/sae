@@ -69,6 +69,7 @@ fn spawn_background_harvest(team: &str) {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn run_search(
     config: &Config,
     query: &str,
@@ -76,19 +77,25 @@ pub(crate) fn run_search(
     limit: u32,
     after: Option<&str>,
     before: Option<&str>,
+    no_embed: bool,
     json: bool,
 ) -> Result<String, SaeError> {
     let updated_after = parse_date_arg(after, "after")?;
     let updated_before = parse_date_arg(before, "before")?;
     let team = config.resolve_team(team)?;
     let db = require_db(config, team)?;
-    let embedder = try_load_embedder();
-    if let Err(reason) = embedder
-        && let Some(note) = degraded_reason_user_note(*reason)
-    {
-        tracing::warn!("{note}");
-    }
-    let embed_info = if let Ok(emb) = embedder {
+    let embedder = if no_embed {
+        None
+    } else {
+        let result = try_load_embedder();
+        if let Err(reason) = result
+            && let Some(note) = degraded_reason_user_note(*reason)
+        {
+            tracing::warn!("{note}");
+        }
+        result.as_ref().ok()
+    };
+    let embed_info = if let Some(emb) = embedder {
         match auto_embed_pending_with(&db, SEARCH_EMBED_BUDGET, |texts| {
             emb.embed_documents_batch(texts)
                 .map_err(|e| SaeError::Other(format!("Batch embedding failed: {e}")))
@@ -106,7 +113,7 @@ pub(crate) fn run_search(
     } else {
         None
     };
-    let query_embedding = if let Ok(e) = embedder {
+    let query_embedding = if let Some(e) = embedder {
         match e.embed_query(query) {
             Ok(v) => Some(v),
             Err(e) => {
