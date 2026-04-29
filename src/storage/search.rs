@@ -6,7 +6,9 @@ use amici::storage::{
 };
 use chrono::{DateTime, Utc};
 use rurico::reranker::Rerank;
-use rurico::storage::{f32_as_bytes, prepare_match_query, recency_decay, rrf_merge};
+use rurico::storage::{
+    QueryNormalizationConfig, f32_as_bytes, prepare_match_query, recency_decay, rrf_merge,
+};
 use rusqlite::Connection;
 use rusqlite::types::ToSql;
 use tracing::warn;
@@ -210,7 +212,12 @@ pub(crate) fn fts_search(
     filter: &SearchFilter<'_>,
 ) -> Result<Vec<FtsHit>, StorageError> {
     let normalized = normalize_punctuation(query);
-    let matched = match prepare_match_query(conn, &normalized, "fts_chunks_vocab") {
+    let matched = match prepare_match_query(
+        conn,
+        &normalized,
+        "fts_chunks_vocab",
+        &QueryNormalizationConfig::default(),
+    ) {
         Ok(m) => m,
         Err(e) => {
             tracing::debug!(%e, query, "query produced no searchable terms");
@@ -906,14 +913,7 @@ mod tests {
         assert!(!unembedded.is_empty());
         let embeddings: Vec<(i64, ChunkedEmbedding)> = unembedded
             .iter()
-            .map(|(id, _)| {
-                (
-                    *id,
-                    ChunkedEmbedding {
-                        chunks: vec![vec![0.1; EMBEDDING_DIMS]],
-                    },
-                )
-            })
+            .map(|(id, _)| (*id, ChunkedEmbedding::new(vec![vec![0.1; EMBEDDING_DIMS]])))
             .collect();
         storage::add_chunked_embeddings(db.conn(), &embeddings).unwrap();
 
@@ -956,7 +956,7 @@ mod tests {
                 // chunk 1+: weaker dim-0 signal (farther from query)
                 emb[0] = if i == 0 { 1.0 } else { 0.01 };
                 emb[1] = if i == 0 { 0.01 } else { 1.0 };
-                (*id, ChunkedEmbedding { chunks: vec![emb] })
+                (*id, ChunkedEmbedding::new(vec![emb]))
             })
             .collect();
         storage::add_chunked_embeddings(db.conn(), &embeddings).unwrap();
@@ -1014,12 +1014,7 @@ mod tests {
                 let mut sub_b = vec![0.01_f32; EMBEDDING_DIMS];
                 sub_b[2] = 1.0;
 
-                (
-                    *id,
-                    ChunkedEmbedding {
-                        chunks: vec![sub_a, sub_b],
-                    },
-                )
+                (*id, ChunkedEmbedding::new(vec![sub_a, sub_b]))
             })
             .collect();
         storage::add_chunked_embeddings(db.conn(), &embeddings).unwrap();
@@ -1088,12 +1083,7 @@ mod tests {
 
         storage::add_chunked_embeddings(
             db.conn(),
-            &[(
-                chunk_id,
-                ChunkedEmbedding {
-                    chunks: vec![sub_far, sub_close],
-                },
-            )],
+            &[(chunk_id, ChunkedEmbedding::new(vec![sub_far, sub_close]))],
         )
         .unwrap();
 

@@ -745,14 +745,7 @@ mod tests {
         let chunks = get_unembedded_chunks(db.conn(), 100).unwrap();
         let emb: Vec<(i64, ChunkedEmbedding)> = chunks
             .iter()
-            .map(|(id, _)| {
-                (
-                    *id,
-                    ChunkedEmbedding {
-                        chunks: vec![vec![0.1; EMBEDDING_DIMS]],
-                    },
-                )
-            })
+            .map(|(id, _)| (*id, ChunkedEmbedding::new(vec![vec![0.1; EMBEDDING_DIMS]])))
             .collect();
         add_chunked_embeddings(db.conn(), &emb).unwrap();
         assert!(has_embeddings(db.conn()));

@@ -126,15 +126,11 @@ mod tests {
     use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
 
     fn make_chunked(val: f32) -> ChunkedEmbedding {
-        ChunkedEmbedding {
-            chunks: vec![vec![val; EMBEDDING_DIMS]],
-        }
+        ChunkedEmbedding::new(vec![vec![val; EMBEDDING_DIMS]])
     }
 
     fn make_multi_chunked(vals: &[f32]) -> ChunkedEmbedding {
-        ChunkedEmbedding {
-            chunks: vals.iter().map(|&v| vec![v; EMBEDDING_DIMS]).collect(),
-        }
+        ChunkedEmbedding::new(vals.iter().map(|&v| vec![v; EMBEDDING_DIMS]).collect())
     }
 
     // T-173: add_chunked_embeddings stores embedding and clears unembedded queue

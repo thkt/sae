@@ -246,9 +246,7 @@ mod tests {
         let result = auto_embed_pending_with(&db, 256, |texts| {
             Ok(texts
                 .iter()
-                .map(|_| ChunkedEmbedding {
-                    chunks: vec![vec![0.5; EMBEDDING_DIMS]],
-                })
+                .map(|_| ChunkedEmbedding::new(vec![vec![0.5; EMBEDDING_DIMS]]))
                 .collect())
         });
         assert!(result.is_ok());
@@ -272,9 +270,7 @@ mod tests {
         let result = auto_embed_pending_with(&db, 1, |texts| {
             Ok(texts
                 .iter()
-                .map(|_| ChunkedEmbedding {
-                    chunks: vec![vec![0.5; EMBEDDING_DIMS]],
-                })
+                .map(|_| ChunkedEmbedding::new(vec![vec![0.5; EMBEDDING_DIMS]]))
                 .collect())
         });
         assert!(result.is_ok());
