@@ -7,7 +7,7 @@ use amici::storage::{
 use chrono::{DateTime, Utc};
 use rurico::reranker::Rerank;
 use rurico::storage::{
-    QueryNormalizationConfig, f32_as_bytes, prepare_match_query, recency_decay, rrf_merge,
+    f32_as_bytes, normalize_for_fts, prepare_match_query, recency_decay, rrf_merge,
 };
 use rusqlite::Connection;
 use rusqlite::types::ToSql;
@@ -211,13 +211,12 @@ pub(crate) fn fts_search(
     limit: u32,
     filter: &SearchFilter<'_>,
 ) -> Result<Vec<FtsHit>, StorageError> {
-    let normalized = normalize_punctuation(query);
-    let matched = match prepare_match_query(
-        conn,
-        &normalized,
-        "fts_chunks_vocab",
-        &QueryNormalizationConfig::default(),
-    ) {
+    // Order matters: NFKC first folds full-width tech symbols (Ｃ＋＋ → c++) so
+    // `normalize_punctuation` can preserve `+` instead of stripping U+FF0B.
+    let config = super::query_norm_config();
+    let nfkc = normalize_for_fts(query, &config);
+    let stripped = normalize_punctuation(&nfkc);
+    let matched = match prepare_match_query(conn, &stripped, "fts_chunks_vocab", &config) {
         Ok(m) => m,
         Err(e) => {
             tracing::debug!(%e, query, "query produced no searchable terms");
@@ -663,6 +662,59 @@ mod tests {
         let hits = fts_search(db.conn(), "std::io", 10, &SearchFilter::default()).unwrap();
         assert!(!hits.is_empty(), "std::io (split) should match");
         assert!(hits.iter().any(|h| h.post_number == 10));
+    }
+
+    // T-218: fullwidth query matches halfwidth-indexed content (NFKC + lowercase)
+    #[test]
+    fn fts_search_fullwidth_query_matches_halfwidth_index() {
+        let db = Db::open_memory().unwrap();
+        let body = "# React Hooks\nuseEffect の依存配列";
+        let post = test_post(10, "React guide", body);
+        storage::upsert_post(db.conn(), &post).unwrap();
+        storage::rechunk_post(db.conn(), 10, body).unwrap();
+
+        let hits = fts_search(db.conn(), "Ｒｅａｃｔ", 10, &SearchFilter::default()).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "fullwidth query Ｒｅａｃｔ must match halfwidth-indexed React"
+        );
+        assert!(hits.iter().any(|h| h.post_number == 10));
+    }
+
+    // T-219: halfwidth query matches fullwidth-indexed content (index-side normalize)
+    #[test]
+    fn fts_search_halfwidth_query_matches_fullwidth_index() {
+        let db = Db::open_memory().unwrap();
+        let body = "# ＲｅａｃｔのHooks\n依存配列";
+        let post = test_post(11, "ＲｅａｃｔのHooks", body);
+        storage::upsert_post(db.conn(), &post).unwrap();
+        storage::rechunk_post(db.conn(), 11, body).unwrap();
+
+        let hits = fts_search(db.conn(), "react", 10, &SearchFilter::default()).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "halfwidth query react must match fullwidth-indexed Ｒｅａｃｔ \
+             (index-side normalize_for_fts must apply)"
+        );
+        assert!(hits.iter().any(|h| h.post_number == 11));
+    }
+
+    // T-220: order proof — fullwidth ＋ must be NFKC-folded before punctuation strip
+    #[test]
+    fn fts_search_fullwidth_plus_preserved_via_nfkc_first() {
+        let db = Db::open_memory().unwrap();
+        let body = "# C++入門\nC++のテンプレート";
+        let post = test_post(12, "C++ guide", body);
+        storage::upsert_post(db.conn(), &post).unwrap();
+        storage::rechunk_post(db.conn(), 12, body).unwrap();
+
+        let hits = fts_search(db.conn(), "Ｃ＋＋", 10, &SearchFilter::default()).unwrap();
+        assert!(
+            !hits.is_empty(),
+            "fullwidth Ｃ＋＋ must match halfwidth-indexed C++ \
+             (NFKC must run before punctuation strip to preserve +)"
+        );
+        assert!(hits.iter().any(|h| h.post_number == 12));
     }
 
     // T-188: batch_fetch_post_meta returns metadata for each requested post number

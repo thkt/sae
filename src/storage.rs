@@ -16,11 +16,16 @@ use tracing::warn;
 
 use rurico::embed::EMBEDDING_DIMS;
 use rurico::storage as rurico_storage;
+use rurico::storage::{QueryNormalizationConfig, normalize_for_fts};
 
-const SCHEMA_VERSION: u32 = 5;
-
-use amici::migration::notify_schema_change;
 pub(crate) use amici::storage::{anon_placeholders, as_sql_params, in_placeholders};
+
+/// Shared `normalize_for_fts` configuration for index- and query-side calls.
+/// Divergence between sides makes FTS5 token streams disagree and silently
+/// misses matches, so callers must funnel through this single helper.
+pub(crate) fn query_norm_config() -> QueryNormalizationConfig {
+    QueryNormalizationConfig::default()
+}
 
 const DDL_FTS: &str = "\
     CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(\
@@ -73,11 +78,6 @@ const DDL: &str = "
         last_page INTEGER,
         updated_at TEXT NOT NULL DEFAULT ''
     );
-
-    CREATE TABLE IF NOT EXISTS index_meta (
-        key TEXT PRIMARY KEY,
-        value TEXT NOT NULL
-    );
 ";
 
 pub struct Db {
@@ -88,46 +88,6 @@ pub(crate) fn ensure_sqlite_vec() -> Result<(), StorageError> {
     rurico_storage::ensure_sqlite_vec().map_err(StorageError::Open)
 }
 
-pub(crate) fn migrate_fts_v4(conn: &Connection) -> Result<(), StorageError> {
-    let tx = conn.unchecked_transaction()?;
-
-    tx.execute_batch(
-        "DROP TABLE IF EXISTS fts_chunks_vocab;\
-         DROP TABLE IF EXISTS fts_chunks;",
-    )?;
-    tx.execute_batch(DDL_FTS)?;
-
-    tx.execute_batch(
-        "INSERT INTO fts_chunks(rowid, section_title, content) \
-         SELECT id, section_title, content FROM chunks;",
-    )?;
-
-    set_schema_version(&tx, 4)?;
-    tx.commit()?;
-
-    // optimize outside the transaction: avoids journalling the full merge into WAL
-    if let Err(e) = conn.execute_batch("INSERT INTO fts_chunks(fts_chunks) VALUES('optimize');") {
-        warn!(error = %e, "FTS optimize failed (non-fatal, segments will merge lazily)");
-    }
-    Ok(())
-}
-
-pub(crate) fn migrate_v5(conn: &Connection, from_version: u32) -> Result<(), StorageError> {
-    let tx = conn.unchecked_transaction()?;
-
-    tx.execute_batch("DROP TABLE IF EXISTS vec_chunks;")?;
-    tx.execute_batch(&ddl_vec_chunks())?;
-    tx.execute_batch(DDL_EMBEDDED_CHUNK_IDS)?;
-
-    set_schema_version(&tx, 5)?;
-    tx.commit()?;
-    if from_version > 0 {
-        let _span = tracing::info_span!("migration", from = from_version).entered();
-        notify_schema_change("sae", "embeddings", 0, "sae embed");
-    }
-    Ok(())
-}
-
 fn ddl_vec_chunks() -> String {
     format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(\
@@ -136,44 +96,6 @@ fn ddl_vec_chunks() -> String {
              +sub_idx INTEGER\
          )"
     )
-}
-
-fn set_schema_version(conn: &Connection, version: u32) -> Result<(), StorageError> {
-    conn.execute(
-        "INSERT OR REPLACE INTO index_meta (key, value) VALUES ('schema_version', ?1)",
-        [version.to_string()],
-    )?;
-    Ok(())
-}
-
-fn get_schema_version(conn: &Connection) -> Result<u32, StorageError> {
-    match conn.query_row(
-        "SELECT value FROM index_meta WHERE key = 'schema_version'",
-        [],
-        |row| row.get::<_, String>(0),
-    ) {
-        Ok(v) => v
-            .parse()
-            .map_err(|_| StorageError::Open(format!("corrupt schema version: {v:?}"))),
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(0),
-        Err(e) => Err(e.into()),
-    }
-}
-
-pub(crate) fn migrate(conn: &Connection, from_version: u32) -> Result<(), StorageError> {
-    tracing::info!(
-        from = from_version,
-        to = SCHEMA_VERSION,
-        "running schema migration"
-    );
-    if from_version < 4 {
-        migrate_fts_v4(conn)?;
-    }
-    if from_version < 5 {
-        migrate_v5(conn, from_version)?;
-    }
-    tracing::info!(version = SCHEMA_VERSION, "schema migration complete");
-    Ok(())
 }
 
 impl Db {
@@ -220,20 +142,8 @@ impl Db {
     fn init_schema(&self) -> Result<(), StorageError> {
         self.conn.execute_batch(DDL)?;
         self.conn.execute_batch(DDL_EMBEDDED_CHUNK_IDS)?;
-
         self.conn.execute_batch(DDL_FTS)?;
         self.conn.execute_batch(&ddl_vec_chunks())?;
-
-        let stored = get_schema_version(&self.conn)?;
-        if stored > SCHEMA_VERSION {
-            return Err(StorageError::Open(format!(
-                "database schema version {stored} is newer than supported version {SCHEMA_VERSION}"
-            )));
-        }
-        if stored < SCHEMA_VERSION {
-            migrate(&self.conn, stored)?;
-        }
-
         Ok(())
     }
 }
@@ -433,6 +343,7 @@ pub fn rechunk_post(
         let mut insert_fts = conn.prepare_cached(
             "INSERT INTO fts_chunks(rowid, section_title, content) VALUES (?1, ?2, ?3)",
         )?;
+        let config = query_norm_config();
         let mut count = 0u32;
         for chunk in &chunks {
             insert_chunk.execute(rusqlite::params![
@@ -442,7 +353,12 @@ pub fn rechunk_post(
                 chunk.chunk_type.as_str(),
             ])?;
             let id = conn.last_insert_rowid();
-            insert_fts.execute(rusqlite::params![id, chunk.section_title, chunk.content])?;
+            let fts_section_title = chunk
+                .section_title
+                .as_deref()
+                .map(|t| normalize_for_fts(t, &config));
+            let fts_content = normalize_for_fts(&chunk.content, &config);
+            insert_fts.execute(rusqlite::params![id, fts_section_title, fts_content])?;
             count += 1;
         }
         Ok(count)
@@ -486,12 +402,20 @@ mod tests {
     use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
     use rusqlite::ffi::{self, ErrorCode};
 
-    // T-202: Db::open_memory initializes with the current schema version
+    // T-202: Db::open_memory creates the core tables via init_schema
     #[test]
-    fn open_and_init_schema() {
+    fn open_creates_core_tables() {
         let db = Db::open_memory().unwrap();
-        let version = get_schema_version(db.conn()).unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
+        let tbl_count: u32 = db
+            .conn()
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type='table' AND name IN ('posts', 'chunks', 'sync_state')",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tbl_count, 3, "core tables must exist after init_schema");
     }
 
     // T-203: upsert_post inserts a post and count_posts reflects the change
@@ -878,267 +802,6 @@ mod tests {
         assert_eq!(title, "見出し");
     }
 
-    // T-095: migrate_fts_v4 失敗時 rollback 確認 (FR-005)
-    #[test]
-    fn migrate_fts_v4_rollback_on_failure() {
-        ensure_sqlite_vec().unwrap();
-        let conn = Connection::open_in_memory().unwrap();
-
-        // 旧スキーマ構築: chunks テーブル + 旧 1-column FTS + data
-        conn.execute_batch(
-            "CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
-             CREATE TABLE chunks (
-                 id INTEGER PRIMARY KEY, post_number INTEGER NOT NULL,
-                 section_title TEXT, content TEXT NOT NULL,
-                 chunk_type TEXT NOT NULL DEFAULT 'section'
-             );
-             CREATE VIRTUAL TABLE fts_chunks USING fts5(content, tokenize='trigram');
-             CREATE VIRTUAL TABLE fts_chunks_vocab USING fts5vocab(fts_chunks, row);",
-        )
-        .unwrap();
-        set_schema_version(&conn, 3).unwrap();
-        conn.execute(
-            "INSERT INTO chunks (id, post_number, section_title, content, chunk_type) \
-             VALUES (1, 1, '旧セクション', '旧データの本文テキスト', 'section')",
-            [],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO fts_chunks(rowid, content) VALUES (1, '旧データの本文テキスト')",
-            [],
-        )
-        .unwrap();
-
-        // 前提確認: 旧データが検索可能
-        let pre: u32 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM fts_chunks WHERE fts_chunks MATCH '旧データ'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(pre, 1, "precondition: old FTS data searchable");
-
-        // chunks テーブルを DROP して rebuild を失敗させる
-        conn.execute_batch("DROP TABLE chunks").unwrap();
-
-        let result = migrate_fts_v4(&conn);
-        assert!(
-            result.is_err(),
-            "migrate_fts_v4 should fail when chunks table is missing"
-        );
-
-        // rollback 確認: version は 3 のまま
-        let version = get_schema_version(&conn).unwrap();
-        assert_eq!(version, 3, "schema_version should remain 3");
-
-        // rollback 確認: 旧 FTS data が生存（実検索 MATCH）
-        let post: u32 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM fts_chunks WHERE fts_chunks MATCH '旧データ'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(post, 1, "old FTS data must survive after rollback");
-    }
-
-    // T-093: temp file DB + 旧スキーマ → Db::open で migration (FR-005)
-    #[test]
-    fn migration_from_old_schema_rebuilds_fts_with_section_title() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("migration_test.db");
-
-        // 旧スキーマ DB を手動構築
-        {
-            ensure_sqlite_vec().unwrap();
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
-                .unwrap();
-            conn.execute_batch(
-                "CREATE TABLE posts (
-                     number INTEGER PRIMARY KEY, name TEXT NOT NULL,
-                     full_name TEXT NOT NULL, body_md TEXT NOT NULL DEFAULT '',
-                     category TEXT, tags TEXT NOT NULL DEFAULT '[]',
-                     wip INTEGER NOT NULL DEFAULT 0, kind TEXT NOT NULL DEFAULT 'stock',
-                     url TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                     created_by TEXT NOT NULL, updated_by TEXT NOT NULL,
-                     revision_number INTEGER NOT NULL DEFAULT 0
-                 );
-                 CREATE INDEX idx_posts_updated ON posts(updated_at);
-                 CREATE TABLE chunks (
-                     id INTEGER PRIMARY KEY, post_number INTEGER NOT NULL,
-                     section_title TEXT, content TEXT NOT NULL,
-                     chunk_type TEXT NOT NULL DEFAULT 'section'
-                 );
-                 CREATE INDEX idx_chunks_post ON chunks(post_number);
-                 CREATE TABLE sync_state (
-                     id INTEGER PRIMARY KEY CHECK (id = 1),
-                     latest_updated_at TEXT, total_count INTEGER NOT NULL DEFAULT 0,
-                     local_count INTEGER NOT NULL DEFAULT 0, last_page INTEGER,
-                     updated_at TEXT NOT NULL DEFAULT ''
-                 );
-                 CREATE TABLE index_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
-            )
-            .unwrap();
-            // 旧 1-column FTS
-            conn.execute_batch(
-                "CREATE VIRTUAL TABLE fts_chunks USING fts5(content, tokenize='trigram');
-                 CREATE VIRTUAL TABLE fts_chunks_vocab USING fts5vocab(fts_chunks, row);",
-            )
-            .unwrap();
-            conn.execute_batch(&format!(
-                "CREATE VIRTUAL TABLE vec_chunks USING vec0(\
-                     chunk_id INTEGER PRIMARY KEY, \
-                     embedding FLOAT[{}])",
-                EMBEDDING_DIMS,
-            ))
-            .unwrap();
-            set_schema_version(&conn, 3).unwrap();
-            // テストデータ
-            conn.execute(
-                "INSERT INTO posts (number, name, full_name, body_md, url, created_at, \
-                 updated_at, created_by, updated_by) \
-                 VALUES (1, '認証ガイド', 'dev/認証ガイド', '# 認証ガイド\n認証フローの説明', \
-                 'https://example.esa.io/posts/1', '2025-01-01T00:00:00+09:00', \
-                 '2025-01-01T00:00:00+09:00', 'alice', 'alice')",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO chunks (id, post_number, section_title, content, chunk_type) \
-                 VALUES (1, 1, '認証ガイド', '認証フローの説明', 'section')",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO fts_chunks(rowid, content) VALUES (1, '認証フローの説明')",
-                [],
-            )
-            .unwrap();
-        }
-
-        // Db::open で migration 発火
-        let db = Db::open(&db_path).unwrap();
-
-        let version = get_schema_version(db.conn()).unwrap();
-        assert_eq!(
-            version, 5,
-            "schema_version should be 5 after full migration"
-        );
-
-        // section_title の語で検索可能
-        let hits: u32 = db
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM fts_chunks WHERE fts_chunks MATCH '認証ガイド'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(hits > 0, "section_title term should match after migration");
-
-        // fts_chunks_vocab が機能
-        let vocab: u32 = db
-            .conn()
-            .query_row("SELECT COUNT(*) FROM fts_chunks_vocab", [], |row| {
-                row.get(0)
-            })
-            .unwrap();
-        assert!(vocab > 0, "fts_chunks_vocab should be populated");
-    }
-
-    // T-010: v4 スキーマ → Db::open で v5 のみ migration (FTS 再構築なし)
-    #[test]
-    fn migration_from_v4_only_runs_v5() {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("v4_migration_test.db");
-
-        {
-            ensure_sqlite_vec().unwrap();
-            let conn = Connection::open(&db_path).unwrap();
-            conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000;")
-                .unwrap();
-            conn.execute_batch(DDL).unwrap();
-            // v4 スキーマ: 2-column FTS あり、vec_chunks なし
-            conn.execute_batch(
-                "CREATE VIRTUAL TABLE fts_chunks USING fts5(\
-                     section_title, content, tokenize='trigram'\
-                 );\
-                 CREATE VIRTUAL TABLE fts_chunks_vocab \
-                     USING fts5vocab(fts_chunks, row);",
-            )
-            .unwrap();
-            set_schema_version(&conn, 4).unwrap();
-            conn.execute(
-                "INSERT INTO chunks (id, post_number, section_title, content, chunk_type) \
-                 VALUES (1, 1, 'v4テスト', 'v4のコンテンツ', 'section')",
-                [],
-            )
-            .unwrap();
-            conn.execute(
-                "INSERT INTO fts_chunks(rowid, section_title, content) \
-                 VALUES (1, 'v4テスト', 'v4のコンテンツ')",
-                [],
-            )
-            .unwrap();
-        }
-
-        let db = Db::open(&db_path).unwrap();
-
-        let version = get_schema_version(db.conn()).unwrap();
-        assert_eq!(
-            version, 5,
-            "schema_version should be 5 after v4→v5 migration"
-        );
-
-        // FTS データが保持されている（再構築されていない）
-        let hits: u32 = db
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM fts_chunks WHERE fts_chunks MATCH 'v4テスト'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(hits > 0, "FTS data should survive v4→v5 migration");
-
-        // vec_chunks テーブルが存在する
-        let tbl_count: u32 = db
-            .conn()
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master \
-                 WHERE type='table' AND name='vec_chunks'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            tbl_count, 1,
-            "vec_chunks table should exist after v5 migration"
-        );
-    }
-
-    // T-011: migrate() が from=0 で v4, v5 を累積適用する
-    #[test]
-    fn migrate_incremental_from_zero_applies_all_steps() {
-        ensure_sqlite_vec().unwrap();
-        let conn = Connection::open_in_memory().unwrap();
-        conn.execute_batch(DDL).unwrap();
-        // DDL はベーステーブルを作成済み。旧 1-column FTS のみ追加
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE fts_chunks USING fts5(content, tokenize='trigram');\
-             CREATE VIRTUAL TABLE fts_chunks_vocab USING fts5vocab(fts_chunks, row);",
-        )
-        .unwrap();
-        set_schema_version(&conn, 0).unwrap();
-
-        migrate(&conn, 0).unwrap();
-
-        let version = get_schema_version(&conn).unwrap();
-        assert_eq!(version, 5, "migrate(0) should reach v5");
-    }
-
     // T-097: WAL recovery — is_recoverable_open_error recognizes DatabaseCorrupt
     #[test]
     fn is_recoverable_for_database_corrupt() {
@@ -1170,55 +833,5 @@ mod tests {
     fn is_not_recoverable_for_non_sqlite_failure() {
         let err = rusqlite::Error::QueryReturnedNoRows;
         assert!(!is_recoverable_open_error(&err));
-    }
-
-    // T-096: init_schema rejects a non-numeric (corrupt) schema version string
-    #[test]
-    fn init_schema_rejects_corrupt_version() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("corrupt.db");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(DDL).unwrap();
-            conn.execute(
-                "INSERT INTO index_meta (key, value) VALUES ('schema_version', 'not-a-number')",
-                [],
-            )
-            .unwrap();
-        }
-        match Db::open(&path) {
-            Ok(_) => panic!("expected Db::open to fail"),
-            Err(StorageError::Open(msg)) => assert!(
-                msg.contains("corrupt schema version"),
-                "unexpected error message: {msg}"
-            ),
-            Err(e) => panic!("expected StorageError::Open, got {e:?}"),
-        }
-    }
-
-    // T-098: init_schema rejects a schema version number higher than SCHEMA_VERSION
-    #[test]
-    fn init_schema_rejects_future_version() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("future.db");
-        {
-            let conn = Connection::open(&path).unwrap();
-            conn.execute_batch(DDL).unwrap();
-            set_schema_version(&conn, 99).unwrap();
-        }
-        match Db::open(&path) {
-            Ok(_) => panic!("expected Db::open to fail"),
-            Err(StorageError::Open(msg)) => {
-                assert!(
-                    msg.contains("newer than supported"),
-                    "unexpected error message: {msg}"
-                );
-                assert!(
-                    msg.contains("99"),
-                    "message should include the invalid version: {msg}"
-                );
-            }
-            Err(e) => panic!("expected StorageError::Open, got {e:?}"),
-        }
     }
 }
