@@ -4,7 +4,7 @@ use crate::storage;
 use crate::storage::embed::insert_new_embeddings;
 use crate::tools::SaeError;
 
-pub(crate) const BATCH_SIZE: u32 = 128;
+pub(crate) const BATCH_SIZE: u32 = 512;
 
 pub(crate) struct BatchResult {
     pub(crate) added: u32,
