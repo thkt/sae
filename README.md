@@ -119,3 +119,23 @@ sae --json status
 | 1    | Operational エラー | API エラー、ネットワーク障害             |
 | 2    | Input エラー       | 不明なチーム、トークン未設定、未 harvest |
 | 4    | Internal エラー    | DB 破損、JSON シリアライズ失敗           |
+
+## 開発
+
+### セットアップ
+
+clone 後に1度だけ実行:
+
+```sh
+git config --local core.hooksPath .githooks
+```
+
+`cargo fmt --check` と `cargo clippy --all-targets --all-features -- -D warnings` を commit 前に走らせる pre-commit hook が有効になる。違反があると commit は中止される。1コミットだけスキップしたいときは `git commit --no-verify`。
+
+### よく使うコマンド
+
+```sh
+cargo test                                                # 全テスト
+cargo clippy --all-targets --all-features -- -D warnings  # lint（CI と同じ）
+cargo fmt -- --check                                      # フォーマット確認
+```
