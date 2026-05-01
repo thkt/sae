@@ -309,8 +309,15 @@ impl CliError for SaeError {
             | Self::Other(_)
             | Self::Client(ClientError::Api(_))
             | Self::Sync(SyncError::Client(ClientError::Api(_))) => ExitCode::from(codes::SOFTWARE),
+            // reqwest decode failures are schema/payload issues, not transient network.
+            Self::Client(ClientError::Network(e))
+            | Self::Sync(SyncError::Client(ClientError::Network(e)))
+                if e.is_decode() =>
+            {
+                ExitCode::from(codes::SOFTWARE)
+            }
             Self::Io(_) => ExitCode::from(codes::IO_ERR),
-            // Remaining Client/Sync paths (Network, MaxRetries) are retry-eligible.
+            // Remaining Client/Sync paths (Network connect/timeout, MaxRetries) are retry-eligible.
             Self::Client(_) | Self::Sync(_) => ExitCode::from(codes::TEMP_FAIL),
         }
     }
@@ -331,10 +338,7 @@ mod tests {
     use super::*;
 
     fn assert_code(err: &SaeError, expected: u8) {
-        assert_eq!(
-            format!("{:?}", err.exit_code()),
-            format!("{:?}", ExitCode::from(expected))
-        );
+        assert_eq!(err.exit_code(), ExitCode::from(expected));
     }
 
     // T-237: Input variant maps to USAGE (sysexits 64)
@@ -401,6 +405,42 @@ mod tests {
         assert_code(
             &SaeError::Client(ClientError::Api("404 Not Found".into())),
             codes::SOFTWARE,
+        );
+    }
+
+    // T-246: Sync(Client(TokenNotSet)) maps to USAGE (sysexits 64)
+    #[test]
+    fn exit_code_sync_token_not_set_is_usage() {
+        assert_code(
+            &SaeError::Sync(SyncError::Client(ClientError::TokenNotSet)),
+            codes::USAGE,
+        );
+    }
+
+    // T-247: Sync(Storage) maps to CANT_CREAT (sysexits 73)
+    #[test]
+    fn exit_code_sync_storage_is_cant_creat() {
+        assert_code(
+            &SaeError::Sync(SyncError::Storage(StorageError::Open("missing".into()))),
+            codes::CANT_CREAT,
+        );
+    }
+
+    // T-248: Sync(Client(Api)) maps to SOFTWARE (sysexits 70) — non-retryable HTTP 4xx
+    #[test]
+    fn exit_code_sync_client_api_is_software() {
+        assert_code(
+            &SaeError::Sync(SyncError::Client(ClientError::Api("404 Not Found".into()))),
+            codes::SOFTWARE,
+        );
+    }
+
+    // T-249: Sync(Client(MaxRetries)) maps to TEMP_FAIL (sysexits 75) for retry
+    #[test]
+    fn exit_code_sync_client_max_retries_is_temp_fail() {
+        assert_code(
+            &SaeError::Sync(SyncError::Client(ClientError::MaxRetries(5))),
+            codes::TEMP_FAIL,
         );
     }
 
