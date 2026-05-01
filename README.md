@@ -126,6 +126,19 @@ sae --json status
 
 > ⚠️ 破壊的変更（issue #91 / amici #34 migration）: 旧 schema (`1` / `2` / `4`) からの切り替え。スクリプト / CI で specific number に branch している場合は更新が必要。
 
+## ログ
+
+`tracing` ベース。`RUST_LOG` で制御する。
+
+| 環境 | filter | 例 |
+|---|---|---|
+| 未設定（default） | `sae=info,rurico=warn` | sae の通常ログ + rurico の degraded path warn |
+| 任意指定 | `RUST_LOG=<directives>` | env var の値が完全に default を上書き |
+
+degraded path（embedder/reranker fallback、MLX cache 復旧、probe timeout 等）は rurico 側で `tracing::warn!` を発行する。default filter で `rurico=warn` を含めることで operator が観測可能。
+
+> ⚠️ 破壊的変更（issue #85 / amici #36 migration）: 旧挙動「`RUST_LOG` 設定時も常に `sae=info` を layer」を廃止。`RUST_LOG` 設定時は env 優先、未設定時のみ default を使う。`RUST_LOG=sae=info` を export する運用へ移行が必要な場合は明示指定。
+
 ## 開発
 
 ### セットアップ
