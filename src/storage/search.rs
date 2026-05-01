@@ -13,7 +13,7 @@ use rusqlite::Connection;
 use rusqlite::types::ToSql;
 use tracing::warn;
 
-use super::StorageError;
+use super::{StorageError, collect_rows};
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -241,17 +241,16 @@ pub(crate) fn fts_search(
     params.push(Box::new(limit));
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<FtsHit> = stmt
-        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok(FtsHit {
-                post_number: row.get(0)?,
-                section_title: row.get(1)?,
-                content: row.get(2)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok(FtsHit {
+            post_number: row.get(0)?,
+            section_title: row.get(1)?,
+            content: row.get(2)?,
+        })
+    })?;
+    let hits: Vec<FtsHit> = collect_rows::<_, _, _, StorageError>(rows)?;
 
-    Ok(rows)
+    Ok(hits)
 }
 
 const VEC_MAXSIM_OVERSAMPLE: u32 = 10;
@@ -273,10 +272,10 @@ pub(crate) fn vec_search(
              WHERE embedding MATCH ?1 AND k = ?2 \
              ORDER BY distance",
         )?;
-        stmt.query_map(rusqlite::params![bytes, oversample], |row| {
+        let rows = stmt.query_map(rusqlite::params![bytes, oversample], |row| {
             Ok((row.get(0)?, row.get(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?
+        })?;
+        collect_rows::<_, _, _, StorageError>(rows)?
     };
 
     if knn_rows.is_empty() {
@@ -311,18 +310,18 @@ pub(crate) fn vec_search(
     append_search_filters(&mut sql, &mut params, filter);
 
     let mut stmt2 = conn.prepare(&sql)?;
-    let meta: HashMap<i64, (u32, Option<String>, String)> = stmt2
-        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                (
-                    row.get::<_, u32>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                ),
-            ))
-        })?
-        .collect::<Result<HashMap<_, _>, _>>()?;
+    let rows = stmt2.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            (
+                row.get::<_, u32>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ),
+        ))
+    })?;
+    let meta: HashMap<i64, (u32, Option<String>, String)> =
+        collect_rows::<_, _, _, StorageError>(rows)?;
 
     let mut hits: Vec<VecHit> = best
         .into_iter()
