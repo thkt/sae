@@ -2,12 +2,12 @@
 
 use std::env;
 use std::ffi;
-use std::io;
 use std::iter;
 use std::process::ExitCode;
 
 use amici::cli::exit_code::{CliError, codes};
 use amici::cli::{exit_error, hint_arrow, try_expand_shorthand};
+use amici::logging::init_subscriber;
 use clap::{Parser, Subcommand};
 use rurico::model_probe;
 use sae::config::Config;
@@ -219,13 +219,7 @@ async fn run(cli: Cli, config: Config) -> Result<String, SaeError> {
 async fn main() -> ExitCode {
     model_probe::handle_probe_if_needed();
 
-    tracing_subscriber::fmt()
-        .with_writer(io::stderr)
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive("sae=info".parse().expect("hardcoded directive is valid")),
-        )
-        .init();
+    init_subscriber("sae=info");
 
     let cli = match parse_cli_args(env::args_os()) {
         Ok(cli) => cli,
