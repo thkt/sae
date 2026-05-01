@@ -203,7 +203,7 @@ pub(crate) fn fts_search(
     let matched = match prepare_match_query(conn, &stripped, "fts_chunks_vocab", &config) {
         Ok(m) => m,
         Err(e) => {
-            tracing::debug!(%e, query, "query produced no searchable terms");
+            warn!(%e, query, "FTS query produced no searchable terms");
             return Ok(Vec::new());
         }
     };

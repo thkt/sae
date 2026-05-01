@@ -1,18 +1,12 @@
 use std::sync::{Arc, OnceLock};
 
-use amici::model::embedder::{DegradedReason, try_load_embedder_with};
-use rurico::embed::{Embed, ModelId, cached_artifacts};
+use amici::model::embedder::{DegradedReason, try_load_embedder_default_logging};
+use rurico::embed::Embed;
 
 static EMBEDDER: OnceLock<Result<Arc<dyn Embed>, DegradedReason>> = OnceLock::new();
 
 pub(crate) fn try_load_embedder() -> &'static Result<Arc<dyn Embed>, DegradedReason> {
-    EMBEDDER.get_or_init(|| {
-        try_load_embedder_with(
-            || cached_artifacts(ModelId::default()),
-            |e| tracing::warn!(error = %e, "failed to delete corrupt embedder model files"),
-            |_| {},
-        )
-    })
+    EMBEDDER.get_or_init(try_load_embedder_default_logging)
 }
 
 #[cfg(test)]

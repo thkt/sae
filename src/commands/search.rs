@@ -4,8 +4,7 @@ use std::process::{Command, Stdio};
 
 use crate::config::Config;
 use crate::storage;
-use amici::model::ModelLoad;
-use amici::model::embedder::degraded_reason_user_note;
+use amici::model::{ModelLoad, record_degraded};
 use rurico::embed::ChunkedEmbedding;
 use rurico::reranker::Rerank;
 
@@ -55,7 +54,7 @@ where
 
 fn spawn_background_harvest(team: &str) {
     let Ok(exe) = env::current_exe() else {
-        tracing::debug!("background harvest skipped: current_exe() failed");
+        tracing::warn!("background harvest skipped: current_exe() failed");
         return;
     };
     if let Err(e) = Command::new(exe)
@@ -65,7 +64,7 @@ fn spawn_background_harvest(team: &str) {
         .stderr(Stdio::null())
         .spawn()
     {
-        tracing::debug!(error = %e, "background harvest spawn failed");
+        tracing::warn!(error = %e, "background harvest spawn failed");
     }
 }
 
@@ -89,10 +88,8 @@ pub(crate) fn run_search(
         None
     } else {
         let result = try_load_embedder();
-        if let Err(reason) = result
-            && let Some(note) = degraded_reason_user_note(*reason)
-        {
-            tracing::warn!("{note}");
+        if let Err(reason) = result {
+            record_degraded(*reason, "search: embedder load");
         }
         result.as_ref().ok()
     };
