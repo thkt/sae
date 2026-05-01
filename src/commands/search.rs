@@ -78,6 +78,7 @@ pub(crate) fn run_search(
     after: Option<&str>,
     before: Option<&str>,
     no_embed: bool,
+    rerank_enabled: bool,
     json: bool,
 ) -> Result<String, SaeError> {
     let updated_after = parse_date_arg(after, "after")?;
@@ -124,7 +125,6 @@ pub(crate) fn run_search(
     } else {
         None
     };
-    let rerank_enabled = env::var("SAE_RERANK").as_deref() == Ok("1");
     let reranker: Option<ModelLoad<Box<dyn Rerank>>> = rerank_enabled.then(try_load_reranker);
     if let Some(ref r) = reranker {
         r.emit_load_hint(

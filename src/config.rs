@@ -1,8 +1,8 @@
-use std::env;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
 
+use amici::cli::env_lookup;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -78,29 +78,30 @@ impl Config {
 }
 
 pub(crate) fn data_dir() -> Result<PathBuf, ConfigError> {
-    data_dir_with(|k| env::var(k))
+    data_dir_with(env_lookup())
 }
 
-fn data_dir_with(
-    get_var: impl Fn(&str) -> Result<String, env::VarError>,
-) -> Result<PathBuf, ConfigError> {
-    let base = get_var("XDG_DATA_HOME").map(PathBuf::from).or_else(|_| {
-        get_var("HOME")
-            .map(|h| PathBuf::from(h).join(".local").join("share"))
-            .map_err(|_| ConfigError::HomeDirNotFound)
-    })?;
+fn data_dir_with(get_var: impl Fn(&str) -> Option<String>) -> Result<PathBuf, ConfigError> {
+    let base = match get_var("XDG_DATA_HOME") {
+        Some(v) => PathBuf::from(v),
+        None => {
+            let home = get_var("HOME").ok_or(ConfigError::HomeDirNotFound)?;
+            PathBuf::from(home).join(".local").join("share")
+        }
+    };
     Ok(base.join("sae"))
 }
 
 fn config_dir() -> Result<PathBuf, ConfigError> {
-    let base = env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|_| dirs_fallback_config_home())?;
-    Ok(base.join("sae"))
+    config_dir_with(env_lookup())
 }
 
-fn dirs_fallback_config_home() -> Result<PathBuf, ConfigError> {
-    Ok(home_dir()?.join(".config"))
+fn config_dir_with(get_var: impl Fn(&str) -> Option<String>) -> Result<PathBuf, ConfigError> {
+    let base = match get_var("XDG_CONFIG_HOME") {
+        Some(v) => PathBuf::from(v),
+        None => home_dir_with(&get_var)?.join(".config"),
+    };
+    Ok(base.join("sae"))
 }
 
 /// esa team name: lowercase alphanumeric + hyphen, must start with alphanumeric.
@@ -122,10 +123,10 @@ pub fn validate_team_name(name: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
-fn home_dir() -> Result<PathBuf, ConfigError> {
-    env::var("HOME")
+fn home_dir_with(get_var: impl Fn(&str) -> Option<String>) -> Result<PathBuf, ConfigError> {
+    get_var("HOME")
         .map(PathBuf::from)
-        .map_err(|_| ConfigError::HomeDirNotFound)
+        .ok_or(ConfigError::HomeDirNotFound)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -152,7 +153,6 @@ pub enum ConfigError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::env::VarError;
 
     // T-218: Config::default has empty teams, no default_team, and embed_budget=50
     #[test]
@@ -248,8 +248,8 @@ mod tests {
     #[test]
     fn data_dir_respects_xdg() {
         let dir = data_dir_with(|key| match key {
-            "XDG_DATA_HOME" => Ok("/tmp/test-xdg".into()),
-            _ => Err(VarError::NotPresent),
+            "XDG_DATA_HOME" => Some("/tmp/test-xdg".into()),
+            _ => None,
         })
         .unwrap();
         assert_eq!(dir, PathBuf::from("/tmp/test-xdg/sae"));
@@ -259,11 +259,40 @@ mod tests {
     #[test]
     fn data_dir_falls_back_to_home() {
         let dir = data_dir_with(|key| match key {
-            "HOME" => Ok("/home/testuser".into()),
-            _ => Err(VarError::NotPresent),
+            "HOME" => Some("/home/testuser".into()),
+            _ => None,
         })
         .unwrap();
         assert_eq!(dir, PathBuf::from("/home/testuser/.local/share/sae"));
+    }
+
+    // T-234: data_dir returns HomeDirNotFound when neither XDG_DATA_HOME nor HOME is set
+    #[test]
+    fn data_dir_missing_home_errors() {
+        let err = data_dir_with(|_| None).unwrap_err();
+        assert!(matches!(err, ConfigError::HomeDirNotFound));
+    }
+
+    // T-235: config_dir uses XDG_CONFIG_HOME when that environment variable is set
+    #[test]
+    fn config_dir_respects_xdg() {
+        let dir = config_dir_with(|key| match key {
+            "XDG_CONFIG_HOME" => Some("/tmp/test-config".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(dir, PathBuf::from("/tmp/test-config/sae"));
+    }
+
+    // T-236: config_dir falls back to $HOME/.config/sae when XDG_CONFIG_HOME is unset
+    #[test]
+    fn config_dir_falls_back_to_home() {
+        let dir = config_dir_with(|key| match key {
+            "HOME" => Some("/home/testuser".into()),
+            _ => None,
+        })
+        .unwrap();
+        assert_eq!(dir, PathBuf::from("/home/testuser/.config/sae"));
     }
 
     // T-229: validate_team_name accepts lowercase alphanumeric names with hyphens
