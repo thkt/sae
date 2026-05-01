@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use amici::storage::{
-    filter::{append_eq_filter, append_timestamp_day_cutoff_filter},
+    fetch_by_in_clause,
+    filter::{append_eq_filter, append_in_filter, append_timestamp_day_cutoff_filter},
     fts::clean_for_trigram,
 };
 use chrono::{DateTime, Utc};
@@ -13,7 +14,7 @@ use rusqlite::Connection;
 use rusqlite::types::ToSql;
 use tracing::warn;
 
-use super::{StorageError, collect_rows, fetch_by_in_clause};
+use super::{StorageError, collect_storage_rows};
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -231,9 +232,7 @@ pub(crate) fn fts_search(
             content: row.get(2)?,
         })
     })?;
-    let hits: Vec<FtsHit> = collect_rows::<_, _, _, StorageError>(rows)?;
-
-    Ok(hits)
+    collect_storage_rows(rows)
 }
 
 const VEC_MAXSIM_OVERSAMPLE: u32 = 10;
@@ -258,7 +257,7 @@ pub(crate) fn vec_search(
         let rows = stmt.query_map(rusqlite::params![bytes, oversample], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })?;
-        collect_rows::<_, _, _, StorageError>(rows)?
+        collect_storage_rows(rows)?
     };
 
     if knn_rows.is_empty() {
@@ -279,17 +278,14 @@ pub(crate) fn vec_search(
 
     // Step 2: batch-fetch chunk metadata for the deduplicated chunk_ids
     let chunk_ids: Vec<i64> = best.keys().copied().collect();
-    let mut sql = format!(
+    let mut sql = String::from(
         "SELECT c.id, c.post_number, c.section_title, c.content \
          FROM chunks c \
          JOIN posts p ON p.number = c.post_number \
-         WHERE c.id IN ({})",
-        super::anon_placeholders(chunk_ids.len())
+         WHERE 1 = 1",
     );
-    let mut params: Vec<Box<dyn ToSql>> = chunk_ids
-        .iter()
-        .map(|id| Box::new(*id) as Box<dyn ToSql>)
-        .collect();
+    let mut params: Vec<Box<dyn ToSql>> = Vec::new();
+    append_in_filter(&mut sql, &mut params, "c.id", Some(&chunk_ids));
     append_search_filters(&mut sql, &mut params, filter);
 
     let mut stmt2 = conn.prepare(&sql)?;
@@ -303,8 +299,7 @@ pub(crate) fn vec_search(
             ),
         ))
     })?;
-    let meta: HashMap<i64, (u32, Option<String>, String)> =
-        collect_rows::<_, _, _, StorageError>(rows)?;
+    let meta: HashMap<i64, (u32, Option<String>, String)> = collect_storage_rows(rows)?;
 
     let mut hits: Vec<VecHit> = best
         .into_iter()

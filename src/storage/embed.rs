@@ -4,7 +4,9 @@ use rurico::embed::ChunkedEmbedding;
 use rurico::storage::f32_as_bytes;
 use rusqlite::Connection;
 
-use super::{StorageError, collect_rows, fetch_by_in_clause};
+use amici::storage::fetch_by_in_clause;
+
+use super::{StorageError, collect_storage_rows};
 
 pub fn add_chunked_embeddings(
     conn: &Connection,
@@ -86,8 +88,7 @@ pub fn get_unembedded_chunks(
          LIMIT ?1",
     )?;
     let rows = stmt.query_map([limit], |row| Ok((row.get(0)?, row.get(1)?)))?;
-    let collected: Vec<(i64, String)> = collect_rows::<_, _, _, StorageError>(rows)?;
-    Ok(collected)
+    collect_storage_rows(rows)
 }
 
 pub fn count_unembedded_chunks(conn: &Connection) -> Result<u32, StorageError> {
