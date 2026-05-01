@@ -5,8 +5,8 @@ use std::process::ExitCode;
 use amici::cli::embed_with_spinners;
 use amici::cli::env_lookup;
 use amici::cli::exit_code::{CliError, codes};
-use amici::model::download_and_verify_model;
 use amici::model::embedder::{DegradedReason, try_load_embedder_with};
+use amici::model::{ModelDownloadError, download_and_verify_model};
 use rurico::embed::{Artifacts, ModelId, cached_artifacts};
 
 use crate::client::{ClientError, EsaClient};
@@ -189,7 +189,7 @@ impl Sae {
     }
 
     pub fn model_download(json: bool) -> Result<String, SaeError> {
-        download_and_verify_model().map_err(|e| SaeError::Other(e.to_string()))?;
+        download_and_verify_model()?;
         output::model_download(json)
     }
 
@@ -265,6 +265,8 @@ pub enum SaeError {
     Json(#[from] serde_json::Error),
     #[error(transparent)]
     Io(#[from] io::Error),
+    #[error(transparent)]
+    ModelDownload(#[from] ModelDownloadError),
     /// User action required (e.g., run harvest or model download first)
     #[error("{0}")]
     Input(String),
@@ -317,6 +319,14 @@ impl CliError for SaeError {
                 ExitCode::from(codes::SOFTWARE)
             }
             Self::Io(_) => ExitCode::from(codes::IO_ERR),
+            // HTTP download failures are transient (retry); backend/verification failures are not.
+            // Explicit arms (no wildcard) so future amici variants force a compile-time review here.
+            Self::ModelDownload(ModelDownloadError::DownloadFailed(_)) => {
+                ExitCode::from(codes::TEMP_FAIL)
+            }
+            Self::ModelDownload(
+                ModelDownloadError::BackendUnavailable | ModelDownloadError::ProbeFailed(_),
+            ) => ExitCode::from(codes::SOFTWARE),
             // Remaining Client/Sync paths (Network connect/timeout, MaxRetries) are retry-eligible.
             Self::Client(_) | Self::Sync(_) => ExitCode::from(codes::TEMP_FAIL),
         }
@@ -404,6 +414,35 @@ mod tests {
     fn exit_code_client_api_is_software() {
         assert_code(
             &SaeError::Client(ClientError::Api("404 Not Found".into())),
+            codes::SOFTWARE,
+        );
+    }
+
+    // T-303: ModelDownload(DownloadFailed) maps to TEMP_FAIL (sysexits 75) — transient HTTP failure
+    #[test]
+    fn exit_code_model_download_failed_is_temp_fail() {
+        assert_code(
+            &SaeError::ModelDownload(ModelDownloadError::DownloadFailed(
+                "connection reset".into(),
+            )),
+            codes::TEMP_FAIL,
+        );
+    }
+
+    // T-304: ModelDownload(BackendUnavailable) maps to SOFTWARE (sysexits 70) — non-retryable hardware mismatch
+    #[test]
+    fn exit_code_model_download_backend_unavailable_is_software() {
+        assert_code(
+            &SaeError::ModelDownload(ModelDownloadError::BackendUnavailable),
+            codes::SOFTWARE,
+        );
+    }
+
+    // T-305: ModelDownload(ProbeFailed) maps to SOFTWARE (sysexits 70) — verification failure, retry won't help
+    #[test]
+    fn exit_code_model_download_probe_failed_is_software() {
+        assert_code(
+            &SaeError::ModelDownload(ModelDownloadError::ProbeFailed("hash mismatch".into())),
             codes::SOFTWARE,
         );
     }

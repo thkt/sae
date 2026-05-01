@@ -115,14 +115,14 @@ sae --json status
 
 [sysexits.h](https://man.openbsd.org/sysexits.3) 慣例に準拠（amici #34 で全 CLI 共通化）。LLM / shell script はこの数値で retry policy を判別できる。
 
-| Code | 名前       | 意味             | 例                                       | 推奨 retry  |
-| ---- | ---------- | ---------------- | ---------------------------------------- | ----------- |
-| 0    | SUCCESS    | 正常終了         |                                          |             |
-| 64   | USAGE      | 入力エラー       | 不明なチーム、トークン未設定、未 harvest | しない      |
-| 70   | SOFTWARE   | 内部エラー       | JSON parse 失敗、想定外の例外            | しない      |
-| 73   | CANT_CREAT | データ層エラー   | DB open 失敗、ファイル作成不可           | 状況による  |
-| 74   | IO_ERR     | I/O エラー       | ファイル読み書き失敗                     | 状況による  |
-| 75   | TEMP_FAIL  | 一時的エラー     | esa API rate limit、ネットワーク障害     | する        |
+| Code | 名前       | 意味             | 例                                                       | 推奨 retry  |
+| ---- | ---------- | ---------------- | -------------------------------------------------------- | ----------- |
+| 0    | SUCCESS    | 正常終了         |                                                          |             |
+| 64   | USAGE      | 入力エラー       | 不明なチーム、トークン未設定、未 harvest                 | しない      |
+| 70   | SOFTWARE   | 内部エラー       | JSON parse 失敗、想定外の例外、model 検証失敗            | しない      |
+| 73   | CANT_CREAT | データ層エラー   | DB open 失敗、ファイル作成不可                           | 状況による  |
+| 74   | IO_ERR     | I/O エラー       | ファイル読み書き失敗                                     | 状況による  |
+| 75   | TEMP_FAIL  | 一時的エラー     | esa API rate limit、ネットワーク障害、model download 一時的失敗 (429, 5xx, timeout) | する  |
 
 > ⚠️ 破壊的変更（issue #91 / amici #34 migration）: 旧 schema (`1` / `2` / `4`) からの切り替え。スクリプト / CI で specific number に branch している場合は更新が必要。
 
