@@ -4,7 +4,7 @@ use rurico::embed::ChunkedEmbedding;
 use rurico::storage::f32_as_bytes;
 use rusqlite::Connection;
 
-use super::{StorageError, collect_rows};
+use super::{StorageError, collect_rows, fetch_by_in_clause};
 
 pub fn add_chunked_embeddings(
     conn: &Connection,
@@ -67,16 +67,12 @@ fn existing_embedded_ids(
     conn: &Connection,
     chunk_ids: &[i64],
 ) -> Result<HashSet<i64>, StorageError> {
-    let sql = format!(
-        "SELECT chunk_id FROM embedded_chunk_ids WHERE chunk_id IN ({})",
-        super::in_placeholders(chunk_ids.len())
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let params = super::as_sql_params(chunk_ids);
-    let ids = stmt
-        .query_map(params.as_slice(), |row| row.get::<_, i64>(0))?
-        .collect::<Result<HashSet<_>, _>>()?;
-    Ok(ids)
+    fetch_by_in_clause(
+        conn,
+        chunk_ids,
+        "SELECT chunk_id FROM embedded_chunk_ids WHERE chunk_id IN ({placeholders})",
+        |row| row.get::<_, i64>(0),
+    )
 }
 
 pub fn get_unembedded_chunks(
@@ -130,6 +126,17 @@ mod tests {
 
     fn make_multi_chunked(vals: &[f32]) -> ChunkedEmbedding {
         ChunkedEmbedding::new(vals.iter().map(|&v| vec![v; EMBEDDING_DIMS]).collect())
+    }
+
+    // T-300: existing_embedded_ids does not error on empty input (regression for IN () syntax)
+    #[test]
+    fn existing_embedded_ids_empty_input_returns_empty_set() {
+        let db = Db::open_memory().unwrap();
+        let ids = existing_embedded_ids(db.conn(), &[]).unwrap();
+        assert!(
+            ids.is_empty(),
+            "empty input should return empty set without SQL syntax error"
+        );
     }
 
     // T-173: add_chunked_embeddings stores embedding and clears unembedded queue

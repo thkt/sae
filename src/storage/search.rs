@@ -13,7 +13,7 @@ use rusqlite::Connection;
 use rusqlite::types::ToSql;
 use tracing::warn;
 
-use super::{StorageError, collect_rows};
+use super::{StorageError, collect_rows, fetch_by_in_clause};
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -137,38 +137,21 @@ fn batch_fetch_post_meta(
     conn: &Connection,
     post_numbers: &[u32],
 ) -> Result<HashMap<u32, PostMeta>, StorageError> {
-    if post_numbers.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let sql = format!(
-        "SELECT number, name, url, updated_at FROM posts WHERE number IN ({})",
-        super::in_placeholders(post_numbers.len())
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let params = super::as_sql_params(post_numbers);
-    let rows = stmt
-        .query_map(params.as_slice(), |row| {
+    fetch_by_in_clause(
+        conn,
+        post_numbers,
+        "SELECT number, name, url, updated_at FROM posts WHERE number IN ({placeholders})",
+        |row| {
             Ok((
                 row.get::<_, u32>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(rows
-        .into_iter()
-        .map(|(n, name, url, updated_at)| {
-            (
-                n,
                 PostMeta {
-                    name,
-                    url,
-                    updated_at,
+                    name: row.get::<_, String>(1)?,
+                    url: row.get::<_, String>(2)?,
+                    updated_at: row.get::<_, String>(3)?,
                 },
-            )
-        })
-        .collect())
+            ))
+        },
+    )
 }
 
 const RECENCY_HALF_LIFE: f64 = 30.0;

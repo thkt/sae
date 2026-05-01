@@ -18,7 +18,9 @@ use rurico::embed::EMBEDDING_DIMS;
 use rurico::storage as rurico_storage;
 use rurico::storage::{QueryNormalizationConfig, normalize_for_fts};
 
-pub(crate) use amici::storage::{anon_placeholders, as_sql_params, collect_rows, in_placeholders};
+pub(crate) use amici::storage::{
+    anon_placeholders, as_sql_params, collect_rows, fetch_by_in_clause, in_placeholders,
+};
 
 /// Shared `normalize_for_fts` configuration for index- and query-side calls.
 /// Divergence between sides makes FTS5 token streams disagree and silently
