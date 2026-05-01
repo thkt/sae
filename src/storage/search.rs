@@ -1,7 +1,8 @@
 use std::collections::HashMap;
 
 use amici::storage::{
-    filter::{append_eq_filter, append_timestamp_day_cutoff_filter},
+    fetch_by_in_clause,
+    filter::{append_eq_filter, append_in_filter, append_timestamp_day_cutoff_filter},
     fts::clean_for_trigram,
 };
 use chrono::{DateTime, Utc};
@@ -13,7 +14,7 @@ use rusqlite::Connection;
 use rusqlite::types::ToSql;
 use tracing::warn;
 
-use super::StorageError;
+use super::{StorageError, collect_storage_rows};
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -137,38 +138,21 @@ fn batch_fetch_post_meta(
     conn: &Connection,
     post_numbers: &[u32],
 ) -> Result<HashMap<u32, PostMeta>, StorageError> {
-    if post_numbers.is_empty() {
-        return Ok(HashMap::new());
-    }
-    let sql = format!(
-        "SELECT number, name, url, updated_at FROM posts WHERE number IN ({})",
-        super::in_placeholders(post_numbers.len())
-    );
-    let mut stmt = conn.prepare(&sql)?;
-    let params = super::as_sql_params(post_numbers);
-    let rows = stmt
-        .query_map(params.as_slice(), |row| {
+    fetch_by_in_clause(
+        conn,
+        post_numbers,
+        "SELECT number, name, url, updated_at FROM posts WHERE number IN ({placeholders})",
+        |row| {
             Ok((
                 row.get::<_, u32>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
-            ))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(rows
-        .into_iter()
-        .map(|(n, name, url, updated_at)| {
-            (
-                n,
                 PostMeta {
-                    name,
-                    url,
-                    updated_at,
+                    name: row.get::<_, String>(1)?,
+                    url: row.get::<_, String>(2)?,
+                    updated_at: row.get::<_, String>(3)?,
                 },
-            )
-        })
-        .collect())
+            ))
+        },
+    )
 }
 
 const RECENCY_HALF_LIFE: f64 = 30.0;
@@ -241,17 +225,14 @@ pub(crate) fn fts_search(
     params.push(Box::new(limit));
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<FtsHit> = stmt
-        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok(FtsHit {
-                post_number: row.get(0)?,
-                section_title: row.get(1)?,
-                content: row.get(2)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(rows)
+    let rows = stmt.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok(FtsHit {
+            post_number: row.get(0)?,
+            section_title: row.get(1)?,
+            content: row.get(2)?,
+        })
+    })?;
+    collect_storage_rows(rows)
 }
 
 const VEC_MAXSIM_OVERSAMPLE: u32 = 10;
@@ -273,10 +254,10 @@ pub(crate) fn vec_search(
              WHERE embedding MATCH ?1 AND k = ?2 \
              ORDER BY distance",
         )?;
-        stmt.query_map(rusqlite::params![bytes, oversample], |row| {
+        let rows = stmt.query_map(rusqlite::params![bytes, oversample], |row| {
             Ok((row.get(0)?, row.get(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?
+        })?;
+        collect_storage_rows(rows)?
     };
 
     if knn_rows.is_empty() {
@@ -297,32 +278,28 @@ pub(crate) fn vec_search(
 
     // Step 2: batch-fetch chunk metadata for the deduplicated chunk_ids
     let chunk_ids: Vec<i64> = best.keys().copied().collect();
-    let mut sql = format!(
+    let mut sql = String::from(
         "SELECT c.id, c.post_number, c.section_title, c.content \
          FROM chunks c \
          JOIN posts p ON p.number = c.post_number \
-         WHERE c.id IN ({})",
-        super::anon_placeholders(chunk_ids.len())
+         WHERE 1 = 1",
     );
-    let mut params: Vec<Box<dyn ToSql>> = chunk_ids
-        .iter()
-        .map(|id| Box::new(*id) as Box<dyn ToSql>)
-        .collect();
+    let mut params: Vec<Box<dyn ToSql>> = Vec::new();
+    append_in_filter(&mut sql, &mut params, "c.id", Some(&chunk_ids));
     append_search_filters(&mut sql, &mut params, filter);
 
     let mut stmt2 = conn.prepare(&sql)?;
-    let meta: HashMap<i64, (u32, Option<String>, String)> = stmt2
-        .query_map(rusqlite::params_from_iter(params.iter()), |row| {
-            Ok((
-                row.get::<_, i64>(0)?,
-                (
-                    row.get::<_, u32>(1)?,
-                    row.get::<_, Option<String>>(2)?,
-                    row.get::<_, String>(3)?,
-                ),
-            ))
-        })?
-        .collect::<Result<HashMap<_, _>, _>>()?;
+    let rows = stmt2.query_map(rusqlite::params_from_iter(params.iter()), |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            (
+                row.get::<_, u32>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, String>(3)?,
+            ),
+        ))
+    })?;
+    let meta: HashMap<i64, (u32, Option<String>, String)> = collect_storage_rows(rows)?;
 
     let mut hits: Vec<VecHit> = best
         .into_iter()

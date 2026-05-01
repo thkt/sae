@@ -20,6 +20,20 @@ use rurico::storage::{QueryNormalizationConfig, normalize_for_fts};
 
 pub(crate) use amici::storage::{anon_placeholders, as_sql_params, in_placeholders};
 
+use amici::storage::collect_rows;
+
+/// `collect_rows` wrapper that fixes `E = StorageError`, removing the
+/// `::<_, _, _, StorageError>` turbofish that the bare helper would otherwise
+/// require at every `?`-binding callsite (both `rusqlite::Error` and
+/// `StorageError` satisfy `From<rusqlite::Error>`, leaving `E` ambiguous).
+pub(crate) fn collect_storage_rows<I, T, C>(rows: I) -> Result<C, StorageError>
+where
+    I: Iterator<Item = Result<T, rusqlite::Error>>,
+    C: FromIterator<T>,
+{
+    collect_rows(rows)
+}
+
 /// Shared `normalize_for_fts` configuration for index- and query-side calls.
 /// Divergence between sides makes FTS5 token streams disagree and silently
 /// misses matches, so callers must funnel through this single helper.
@@ -308,7 +322,7 @@ pub fn rechunk_post(
     let chunk_ids: Vec<i64> = {
         let mut stmt = conn.prepare_cached("SELECT id FROM chunks WHERE post_number = ?1")?;
         let rows = stmt.query_map([post_number], |row| row.get(0))?;
-        rows.collect::<Result<_, _>>()?
+        collect_storage_rows(rows)?
     };
 
     // SAVEPOINT works both standalone and within an outer transaction (sync).
