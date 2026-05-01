@@ -1,7 +1,7 @@
-use std::env;
 use std::fmt;
 use std::time::Duration;
 
+use amici::cli::env_lookup;
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::de::DeserializeOwned;
@@ -155,13 +155,13 @@ impl EsaClient {
     }
 
     pub fn from_env() -> Result<Self, ClientError> {
-        Self::from_env_with(|k| env::var(k))
+        Self::from_env_with(env_lookup())
     }
 
     pub(crate) fn from_env_with(
-        get_var: impl Fn(&str) -> Result<String, env::VarError>,
+        get_var: impl Fn(&str) -> Option<String>,
     ) -> Result<Self, ClientError> {
-        let token = get_var("ESA_ACCESS_TOKEN").map_err(|_| ClientError::TokenNotSet)?;
+        let token = get_var("ESA_ACCESS_TOKEN").ok_or(ClientError::TokenNotSet)?;
         if token.is_empty() {
             return Err(ClientError::TokenNotSet);
         }
@@ -510,7 +510,7 @@ mod tests {
     // T-153: EsaClient::from_env returns TokenNotSet when ESA_ACCESS_TOKEN is absent
     #[test]
     fn from_env_missing_token() {
-        let err = EsaClient::from_env_with(|_| Err(env::VarError::NotPresent)).unwrap_err();
+        let err = EsaClient::from_env_with(|_| None).unwrap_err();
         assert!(matches!(err, ClientError::TokenNotSet));
     }
 
@@ -518,8 +518,8 @@ mod tests {
     #[test]
     fn from_env_empty_token() {
         let err = EsaClient::from_env_with(|key| match key {
-            "ESA_ACCESS_TOKEN" => Ok("".into()),
-            _ => Err(env::VarError::NotPresent),
+            "ESA_ACCESS_TOKEN" => Some("".into()),
+            _ => None,
         })
         .unwrap_err();
         assert!(matches!(err, ClientError::TokenNotSet));

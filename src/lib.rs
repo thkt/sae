@@ -8,4 +8,4 @@ pub mod storage;
 pub mod sync;
 pub mod tools;
 
-pub use tools::{Sae, SaeError, exit_code_for};
+pub use tools::{Sae, SaeError};

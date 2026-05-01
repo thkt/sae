@@ -6,11 +6,12 @@ use std::io;
 use std::iter;
 use std::process::ExitCode;
 
+use amici::cli::exit_code::{CliError, codes};
 use amici::cli::{exit_error, hint_arrow, try_expand_shorthand};
 use clap::{Parser, Subcommand};
 use rurico::model_probe;
 use sae::config::Config;
-use sae::tools::{CreateArgs, Sae, SaeError, SearchArgs, UpdateArgs, exit_code_for};
+use sae::tools::{CreateArgs, Sae, SaeError, SearchArgs, UpdateArgs};
 
 #[derive(Parser)]
 #[command(name = "sae", about = "esa semantic search CLI")]
@@ -226,12 +227,22 @@ async fn main() -> ExitCode {
         )
         .init();
 
-    let cli = parse_cli_args(env::args_os()).unwrap_or_else(|e| e.exit());
+    let cli = match parse_cli_args(env::args_os()) {
+        Ok(cli) => cli,
+        Err(e) => {
+            let _ = e.print();
+            return ExitCode::from(if e.use_stderr() {
+                codes::USAGE
+            } else {
+                codes::SUCCESS
+            });
+        }
+    };
     let config = match Config::load() {
         Ok(c) => c,
         Err(e) => {
             exit_error(&e.to_string());
-            return exit_code_for(&e.into());
+            return SaeError::from(e).exit_code();
         }
     };
     match run(cli, config).await {
@@ -243,7 +254,7 @@ async fn main() -> ExitCode {
         }
         Err(e) => {
             exit_error(&e.to_string());
-            exit_code_for(&e)
+            e.exit_code()
         }
     }
 }

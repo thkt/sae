@@ -3,6 +3,8 @@ use std::io;
 use std::process::ExitCode;
 
 use amici::cli::embed_with_spinners;
+use amici::cli::env_lookup;
+use amici::cli::exit_code::{CliError, codes};
 use amici::model::download_and_verify_model;
 use amici::model::embedder::{DegradedReason, try_load_embedder_with};
 use rurico::embed::{Artifacts, ModelId, cached_artifacts};
@@ -94,11 +96,20 @@ pub struct UpdateArgs {
 
 pub struct Sae {
     config: Config,
+    rerank_enabled: bool,
 }
 
 impl Sae {
     pub fn new(config: Config) -> Self {
-        Self { config }
+        Self::with_env(config, env_lookup())
+    }
+
+    pub(crate) fn with_env(config: Config, get_var: impl Fn(&str) -> Option<String>) -> Self {
+        let rerank_enabled = get_var("SAE_RERANK").as_deref() == Some("1");
+        Self {
+            config,
+            rerank_enabled,
+        }
     }
 
     pub fn config(&self) -> &Config {
@@ -230,6 +241,7 @@ impl Sae {
             args.after.as_deref(),
             args.before.as_deref(),
             args.no_embed,
+            self.rerank_enabled,
             json,
         )
     }
@@ -280,16 +292,33 @@ pub(crate) fn require_db(config: &Config, team: &str) -> Result<Db, SaeError> {
     Ok(Db::open(&db_path)?)
 }
 
-pub fn exit_code_for(e: &SaeError) -> ExitCode {
-    match e {
-        SaeError::Input(_) | SaeError::Config(_) => ExitCode::from(2),
-        SaeError::Client(ClientError::TokenNotSet) => ExitCode::from(2),
-        SaeError::Sync(SyncError::Client(ClientError::TokenNotSet)) => ExitCode::from(2),
-        SaeError::Storage(_) | SaeError::Sync(SyncError::Storage(_)) | SaeError::Json(_) => {
-            ExitCode::from(4)
-        }
-        SaeError::Client(_) | SaeError::Sync(_) | SaeError::Io(_) | SaeError::Other(_) => {
-            ExitCode::FAILURE
+impl CliError for SaeError {
+    fn exit_code(&self) -> ExitCode {
+        match self {
+            Self::Input(_) | Self::Config(_) => ExitCode::from(codes::USAGE),
+            Self::Client(ClientError::TokenNotSet)
+            | Self::Sync(SyncError::Client(ClientError::TokenNotSet)) => {
+                ExitCode::from(codes::USAGE)
+            }
+            Self::Storage(_) | Self::Sync(SyncError::Storage(_)) => {
+                ExitCode::from(codes::CANT_CREAT)
+            }
+            // Api(_) is non-retryable (HTTP 4xx after retry_wait returned None).
+            // Json/Other are internal/data shape errors. All map to SOFTWARE (no retry).
+            Self::Json(_)
+            | Self::Other(_)
+            | Self::Client(ClientError::Api(_))
+            | Self::Sync(SyncError::Client(ClientError::Api(_))) => ExitCode::from(codes::SOFTWARE),
+            // reqwest decode failures are schema/payload issues, not transient network.
+            Self::Client(ClientError::Network(e))
+            | Self::Sync(SyncError::Client(ClientError::Network(e)))
+                if e.is_decode() =>
+            {
+                ExitCode::from(codes::SOFTWARE)
+            }
+            Self::Io(_) => ExitCode::from(codes::IO_ERR),
+            // Remaining Client/Sync paths (Network connect/timeout, MaxRetries) are retry-eligible.
+            Self::Client(_) | Self::Sync(_) => ExitCode::from(codes::TEMP_FAIL),
         }
     }
 }
@@ -301,5 +330,149 @@ fn require_embed_model() -> Result<Artifacts, SaeError> {
             "Model not found. Run 'sae model download' first.".to_owned(),
         )),
         Err(e) => Err(SaeError::Other(format!("Failed to check model cache: {e}"))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn assert_code(err: &SaeError, expected: u8) {
+        assert_eq!(err.exit_code(), ExitCode::from(expected));
+    }
+
+    // T-237: Input variant maps to USAGE (sysexits 64)
+    #[test]
+    fn exit_code_input_is_usage() {
+        assert_code(&SaeError::Input("bad".into()), codes::USAGE);
+    }
+
+    // T-238: Config variant maps to USAGE (sysexits 64)
+    #[test]
+    fn exit_code_config_is_usage() {
+        assert_code(
+            &SaeError::Config(ConfigError::NoTeamSpecified),
+            codes::USAGE,
+        );
+    }
+
+    // T-239: Client(TokenNotSet) maps to USAGE (sysexits 64)
+    #[test]
+    fn exit_code_token_not_set_is_usage() {
+        assert_code(&SaeError::Client(ClientError::TokenNotSet), codes::USAGE);
+    }
+
+    // T-240: Storage variant maps to CANT_CREAT (sysexits 73)
+    #[test]
+    fn exit_code_storage_is_cant_creat() {
+        assert_code(
+            &SaeError::Storage(StorageError::Open("missing".into())),
+            codes::CANT_CREAT,
+        );
+    }
+
+    // T-241: Json variant maps to SOFTWARE (sysexits 70)
+    #[test]
+    fn exit_code_json_is_software() {
+        let err: serde_json::Error = serde_json::from_str::<i32>("not json").unwrap_err();
+        assert_code(&SaeError::Json(err), codes::SOFTWARE);
+    }
+
+    // T-242: Other variant maps to SOFTWARE (sysexits 70)
+    #[test]
+    fn exit_code_other_is_software() {
+        assert_code(&SaeError::Other("unexpected".into()), codes::SOFTWARE);
+    }
+
+    // T-243: Io variant maps to IO_ERR (sysexits 74)
+    #[test]
+    fn exit_code_io_is_io_err() {
+        assert_code(&SaeError::Io(io::Error::other("disk full")), codes::IO_ERR);
+    }
+
+    // T-244: Client(MaxRetries) maps to TEMP_FAIL (sysexits 75) for retry
+    #[test]
+    fn exit_code_client_max_retries_is_temp_fail() {
+        assert_code(
+            &SaeError::Client(ClientError::MaxRetries(5)),
+            codes::TEMP_FAIL,
+        );
+    }
+
+    // T-245: Client(Api) maps to SOFTWARE (sysexits 70) — non-retryable HTTP 4xx
+    #[test]
+    fn exit_code_client_api_is_software() {
+        assert_code(
+            &SaeError::Client(ClientError::Api("404 Not Found".into())),
+            codes::SOFTWARE,
+        );
+    }
+
+    // T-246: Sync(Client(TokenNotSet)) maps to USAGE (sysexits 64)
+    #[test]
+    fn exit_code_sync_token_not_set_is_usage() {
+        assert_code(
+            &SaeError::Sync(SyncError::Client(ClientError::TokenNotSet)),
+            codes::USAGE,
+        );
+    }
+
+    // T-247: Sync(Storage) maps to CANT_CREAT (sysexits 73)
+    #[test]
+    fn exit_code_sync_storage_is_cant_creat() {
+        assert_code(
+            &SaeError::Sync(SyncError::Storage(StorageError::Open("missing".into()))),
+            codes::CANT_CREAT,
+        );
+    }
+
+    // T-248: Sync(Client(Api)) maps to SOFTWARE (sysexits 70) — non-retryable HTTP 4xx
+    #[test]
+    fn exit_code_sync_client_api_is_software() {
+        assert_code(
+            &SaeError::Sync(SyncError::Client(ClientError::Api("404 Not Found".into()))),
+            codes::SOFTWARE,
+        );
+    }
+
+    // T-249: Sync(Client(MaxRetries)) maps to TEMP_FAIL (sysexits 75) for retry
+    #[test]
+    fn exit_code_sync_client_max_retries_is_temp_fail() {
+        assert_code(
+            &SaeError::Sync(SyncError::Client(ClientError::MaxRetries(5))),
+            codes::TEMP_FAIL,
+        );
+    }
+
+    // T-300: Sae::with_env enables rerank when SAE_RERANK="1"
+    #[test]
+    fn with_env_enables_rerank_when_one() {
+        let sae = Sae::with_env(Config::default(), |key| match key {
+            "SAE_RERANK" => Some("1".into()),
+            _ => None,
+        });
+        assert!(sae.rerank_enabled);
+    }
+
+    // T-301: Sae::with_env disables rerank when SAE_RERANK is absent
+    #[test]
+    fn with_env_disables_rerank_when_absent() {
+        let sae = Sae::with_env(Config::default(), |_| None);
+        assert!(!sae.rerank_enabled);
+    }
+
+    // T-302: Sae::with_env disables rerank for any non-"1" value (e.g. "0", "true")
+    #[test]
+    fn with_env_disables_rerank_for_non_one_values() {
+        for value in ["0", "true", "yes", ""] {
+            let sae = Sae::with_env(Config::default(), |key| match key {
+                "SAE_RERANK" => Some(value.into()),
+                _ => None,
+            });
+            assert!(
+                !sae.rerank_enabled,
+                "SAE_RERANK={value:?} should not enable rerank"
+            );
+        }
     }
 }
