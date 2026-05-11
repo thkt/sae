@@ -4,7 +4,7 @@ use std::process::ExitCode;
 
 use amici::cli::embed_with_spinners;
 use amici::cli::env_lookup;
-use amici::cli::exit_code::{CliError, codes};
+use amici::cli::exit_code::CliError;
 use amici::model::embedder::{DegradedReason, try_load_embedder_with};
 use amici::model::{ModelDownloadError, download_and_verify_model};
 use rurico::embed::{Artifacts, ModelId, cached_artifacts};
@@ -12,6 +12,7 @@ use rurico::embed::{Artifacts, ModelId, cached_artifacts};
 use crate::client::{ClientError, EsaClient};
 use crate::commands;
 use crate::config::{Config, ConfigError};
+use crate::envelope::ErrorCode;
 use crate::output;
 use crate::storage::{Db, EmbedResult, StorageError, count_unembedded_chunks};
 use crate::sync::{self, SyncError};
@@ -275,6 +276,111 @@ pub enum SaeError {
     Other(String),
 }
 
+impl SaeError {
+    /// Builds the `Input` variant for "no data for team". Production sites
+    /// MUST use this constructor (not `SaeError::Input(format!(...))`) so
+    /// the canonical prefix `next_step()` keys off stays in sync.
+    pub fn input_no_data_for_team(team: &str) -> Self {
+        Self::Input(format!(
+            "No data for team '{team}'. Run `sae harvest {team}` first."
+        ))
+    }
+
+    /// Builds the `Input` variant for "model not found". Production sites
+    /// MUST use this constructor (not `SaeError::Input(...)`) so the
+    /// canonical prefix `next_step()` keys off stays in sync.
+    pub fn input_model_not_found() -> Self {
+        Self::Input("Model not found. Run 'sae model download' first.".to_owned())
+    }
+
+    /// Returns the [`ErrorCode`] classification per ADR-0060.
+    ///
+    /// [`CliError::exit_code`] delegates here so the mapping is single-sourced.
+    pub(crate) fn error_code(&self) -> ErrorCode {
+        match self {
+            Self::Input(_) | Self::Config(_) => ErrorCode::UsageError,
+            Self::Client(ClientError::TokenNotSet)
+            | Self::Sync(SyncError::Client(ClientError::TokenNotSet)) => ErrorCode::UsageError,
+            Self::Storage(_) | Self::Sync(SyncError::Storage(_)) => ErrorCode::CantCreat,
+            Self::Json(_)
+            | Self::Other(_)
+            | Self::Client(ClientError::Api(_))
+            | Self::Sync(SyncError::Client(ClientError::Api(_))) => ErrorCode::Software,
+            Self::Client(ClientError::Network(e))
+            | Self::Sync(SyncError::Client(ClientError::Network(e)))
+                if e.is_decode() =>
+            {
+                ErrorCode::Software
+            }
+            Self::Io(_) => ErrorCode::IoError,
+            Self::ModelDownload(ModelDownloadError::DownloadFailed(_)) => ErrorCode::TempFailure,
+            Self::ModelDownload(
+                ModelDownloadError::BackendUnavailable | ModelDownloadError::ProbeFailed(_),
+            ) => ErrorCode::Software,
+            // Remaining Client/Sync (Network connect/timeout, MaxRetries) are retry-eligible.
+            // Explicit arms (no wildcard) so future amici variants force a compile-time review.
+            Self::Client(_) | Self::Sync(_) => ErrorCode::TempFailure,
+        }
+    }
+
+    /// Returns the structured next-step suggestion per ADR-0060.
+    ///
+    /// Phase 2.1 returns template strings (`Run \`sae harvest <team>\``). The
+    /// template form ships now; concrete values (`Run \`sae harvest gaji\``)
+    /// would require parsing the message back, which is fragile, and the
+    /// agent-facing template is unambiguous.
+    pub fn next_step(&self) -> Option<&'static str> {
+        match self {
+            Self::Input(s) if s.starts_with("No data for team ") => {
+                Some("Run `sae harvest <team>` to fetch posts.")
+            }
+            Self::Input(s) if s.starts_with("Model not found") => {
+                Some("Run `sae model download` to fetch the embedding model.")
+            }
+            Self::Config(ConfigError::NoTeamSpecified) => {
+                Some("Pass --team <name> or set `SAE_TEAM=<name>`.")
+            }
+            Self::Client(ClientError::TokenNotSet)
+            | Self::Sync(SyncError::Client(ClientError::TokenNotSet)) => {
+                Some("Set `ESA_ACCESS_TOKEN=<token>` and retry.")
+            }
+            Self::Sync(SyncError::Client(ClientError::MaxRetries(_))) => {
+                Some("Retry after the rate-limit window resets.")
+            }
+            Self::ModelDownload(ModelDownloadError::DownloadFailed(_)) => {
+                Some("Retry `sae model download`; the failure is transient.")
+            }
+            // Explicit catch-all arms per variant. Adding a new SaeError variant
+            // must force a compile-time review (no wildcard).
+            Self::Input(_)
+            | Self::Config(_)
+            | Self::Client(_)
+            | Self::Storage(_)
+            | Self::Sync(_)
+            | Self::Json(_)
+            | Self::Io(_)
+            | Self::ModelDownload(_)
+            | Self::Other(_) => None,
+        }
+    }
+
+    /// Returns candidate suggestions for the user (e.g., known team names).
+    ///
+    /// Phase 2.1 always returns empty. Phase 2.2 may populate config-derived
+    /// candidates for `NoTeamSpecified`/`UnknownTeam` once `Config` is
+    /// available at the call site.
+    pub fn candidates(&self) -> Vec<String> {
+        Vec::new()
+    }
+
+    /// Returns whether retrying the operation can plausibly succeed.
+    ///
+    /// Mirrors the `TempFailure` classification from [`Self::error_code`].
+    pub fn retryable(&self) -> bool {
+        matches!(self.error_code(), ErrorCode::TempFailure)
+    }
+}
+
 pub(crate) fn resolve_client<'a>(
     config: &'a Config,
     team: Option<&'a str>,
@@ -287,64 +393,29 @@ pub(crate) fn resolve_client<'a>(
 pub(crate) fn require_db(config: &Config, team: &str) -> Result<Db, SaeError> {
     let db_path = config.team_db_path(team)?;
     if !db_path.exists() {
-        return Err(SaeError::Input(format!(
-            "No data for team '{team}'. Run `sae harvest {team}` first."
-        )));
+        return Err(SaeError::input_no_data_for_team(team));
     }
     Ok(Db::open(&db_path)?)
 }
 
 impl CliError for SaeError {
     fn exit_code(&self) -> ExitCode {
-        match self {
-            Self::Input(_) | Self::Config(_) => ExitCode::from(codes::USAGE),
-            Self::Client(ClientError::TokenNotSet)
-            | Self::Sync(SyncError::Client(ClientError::TokenNotSet)) => {
-                ExitCode::from(codes::USAGE)
-            }
-            Self::Storage(_) | Self::Sync(SyncError::Storage(_)) => {
-                ExitCode::from(codes::CANT_CREAT)
-            }
-            // Api(_) is non-retryable (HTTP 4xx after retry_wait returned None).
-            // Json/Other are internal/data shape errors. All map to SOFTWARE (no retry).
-            Self::Json(_)
-            | Self::Other(_)
-            | Self::Client(ClientError::Api(_))
-            | Self::Sync(SyncError::Client(ClientError::Api(_))) => ExitCode::from(codes::SOFTWARE),
-            // reqwest decode failures are schema/payload issues, not transient network.
-            Self::Client(ClientError::Network(e))
-            | Self::Sync(SyncError::Client(ClientError::Network(e)))
-                if e.is_decode() =>
-            {
-                ExitCode::from(codes::SOFTWARE)
-            }
-            Self::Io(_) => ExitCode::from(codes::IO_ERR),
-            // HTTP download failures are transient (retry); backend/verification failures are not.
-            // Explicit arms (no wildcard) so future amici variants force a compile-time review here.
-            Self::ModelDownload(ModelDownloadError::DownloadFailed(_)) => {
-                ExitCode::from(codes::TEMP_FAIL)
-            }
-            Self::ModelDownload(
-                ModelDownloadError::BackendUnavailable | ModelDownloadError::ProbeFailed(_),
-            ) => ExitCode::from(codes::SOFTWARE),
-            // Remaining Client/Sync paths (Network connect/timeout, MaxRetries) are retry-eligible.
-            Self::Client(_) | Self::Sync(_) => ExitCode::from(codes::TEMP_FAIL),
-        }
+        ExitCode::from(self.error_code().exit_code())
     }
 }
 
 fn require_embed_model() -> Result<Artifacts, SaeError> {
     match cached_artifacts(ModelId::default()) {
         Ok(Some(p)) => Ok(p),
-        Ok(None) => Err(SaeError::Input(
-            "Model not found. Run 'sae model download' first.".to_owned(),
-        )),
+        Ok(None) => Err(SaeError::input_model_not_found()),
         Err(e) => Err(SaeError::Other(format!("Failed to check model cache: {e}"))),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use amici::cli::exit_code::codes;
+
     use super::*;
 
     fn assert_code(err: &SaeError, expected: u8) {
@@ -511,6 +582,144 @@ mod tests {
             assert!(
                 !sae.rerank_enabled,
                 "SAE_RERANK={value:?} should not enable rerank"
+            );
+        }
+    }
+
+    // T-310: input_no_data_for_team_pins_next_step_harvest_hint
+    #[test]
+    fn input_no_data_for_team_pins_next_step_harvest_hint() {
+        let err = SaeError::input_no_data_for_team("gaji");
+        assert_eq!(
+            err.next_step(),
+            Some("Run `sae harvest <team>` to fetch posts."),
+            "constructor and next_step must stay in sync"
+        );
+    }
+
+    // T-311: input_model_not_found_pins_next_step_download_hint
+    #[test]
+    fn input_model_not_found_pins_next_step_download_hint() {
+        let err = SaeError::input_model_not_found();
+        assert_eq!(
+            err.next_step(),
+            Some("Run `sae model download` to fetch the embedding model."),
+            "constructor and next_step must stay in sync"
+        );
+    }
+
+    // T-312: next_step_config_no_team_specified
+    #[test]
+    fn next_step_config_no_team_specified() {
+        let err = SaeError::Config(ConfigError::NoTeamSpecified);
+        assert_eq!(
+            err.next_step(),
+            Some("Pass --team <name> or set `SAE_TEAM=<name>`.")
+        );
+    }
+
+    // T-313: next_step_client_token_not_set
+    #[test]
+    fn next_step_client_token_not_set() {
+        let err = SaeError::Client(ClientError::TokenNotSet);
+        assert_eq!(
+            err.next_step(),
+            Some("Set `ESA_ACCESS_TOKEN=<token>` and retry.")
+        );
+    }
+
+    // T-314: next_step_sync_client_token_not_set
+    #[test]
+    fn next_step_sync_client_token_not_set() {
+        let err = SaeError::Sync(SyncError::Client(ClientError::TokenNotSet));
+        assert_eq!(
+            err.next_step(),
+            Some("Set `ESA_ACCESS_TOKEN=<token>` and retry.")
+        );
+    }
+
+    // T-315: next_step_sync_client_max_retries
+    #[test]
+    fn next_step_sync_client_max_retries() {
+        let err = SaeError::Sync(SyncError::Client(ClientError::MaxRetries(5)));
+        assert_eq!(
+            err.next_step(),
+            Some("Retry after the rate-limit window resets.")
+        );
+    }
+
+    // T-316: next_step_model_download_failed
+    #[test]
+    fn next_step_model_download_failed() {
+        let err = SaeError::ModelDownload(ModelDownloadError::DownloadFailed("HTTP 503".into()));
+        assert_eq!(
+            err.next_step(),
+            Some("Retry `sae model download`; the failure is transient.")
+        );
+    }
+
+    // T-317: next_step_input_without_recognized_prefix_returns_none
+    #[test]
+    fn next_step_input_without_recognized_prefix_returns_none() {
+        let err = SaeError::Input(
+            "Invalid date '--from 2025-xx-xx': expected YYYY-MM-DD (e.g. 2025-01-01)".into(),
+        );
+        assert_eq!(err.next_step(), None);
+    }
+
+    // T-318: next_step_other_returns_none
+    #[test]
+    fn next_step_other_returns_none() {
+        let err = SaeError::Other("internal".into());
+        assert_eq!(err.next_step(), None);
+    }
+
+    // T-319: next_step_storage_returns_none
+    #[test]
+    fn next_step_storage_returns_none() {
+        let err = SaeError::Storage(StorageError::Open("missing".into()));
+        assert_eq!(err.next_step(), None);
+    }
+
+    // T-320: retryable_true_for_model_download_failed
+    #[test]
+    fn retryable_true_for_model_download_failed() {
+        let err = SaeError::ModelDownload(ModelDownloadError::DownloadFailed("HTTP 503".into()));
+        assert!(err.retryable(), "DownloadFailed must be retryable");
+    }
+
+    // T-321: retryable_true_for_sync_max_retries
+    #[test]
+    fn retryable_true_for_sync_max_retries() {
+        let err = SaeError::Sync(SyncError::Client(ClientError::MaxRetries(5)));
+        assert!(err.retryable(), "MaxRetries must be retryable");
+    }
+
+    // T-322: retryable_false_for_storage
+    #[test]
+    fn retryable_false_for_storage() {
+        let err = SaeError::Storage(StorageError::Open("missing".into()));
+        assert!(!err.retryable(), "Storage must not be retryable");
+    }
+
+    // T-323: retryable_false_for_input
+    #[test]
+    fn retryable_false_for_input() {
+        let err = SaeError::Input("bad".into());
+        assert!(!err.retryable(), "Input must not be retryable");
+    }
+
+    // T-324: candidates_returns_empty_in_phase_2_1
+    #[test]
+    fn candidates_returns_empty_in_phase_2_1() {
+        for err in [
+            SaeError::Input("anything".into()),
+            SaeError::Config(ConfigError::NoTeamSpecified),
+            SaeError::Other("internal".into()),
+        ] {
+            assert!(
+                err.candidates().is_empty(),
+                "Phase 2.1 returns empty Vec for every variant"
             );
         }
     }
