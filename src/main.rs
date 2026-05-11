@@ -2,6 +2,7 @@
 
 use std::env;
 use std::ffi;
+use std::io::{ErrorKind, stdout};
 use std::iter;
 use std::process::ExitCode;
 
@@ -10,6 +11,7 @@ use amici::cli::{exit_error, hint_arrow, try_expand_shorthand};
 use amici::logging::init_subscriber;
 use clap::{Parser, Subcommand};
 use sae::config::Config;
+use sae::io::write_output;
 use sae::tools::{CreateArgs, Sae, SaeError, SearchArgs, UpdateArgs};
 
 #[derive(Parser)]
@@ -240,10 +242,19 @@ async fn main() -> ExitCode {
     };
     match run(cli, config).await {
         Ok(output) => {
-            if !output.is_empty() {
-                println!("{output}");
+            if output.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                let mut handle = stdout().lock();
+                match write_output(&mut handle, &output) {
+                    Ok(()) => ExitCode::SUCCESS,
+                    Err(e) if e.kind() == ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+                    Err(e) => {
+                        exit_error(&format!("write to stdout failed: {e}"));
+                        ExitCode::from(codes::IO_ERR)
+                    }
+                }
             }
-            ExitCode::SUCCESS
         }
         Err(e) => {
             exit_error(&e.to_string());
