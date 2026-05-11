@@ -9,7 +9,6 @@ use amici::cli::exit_code::{CliError, codes};
 use amici::cli::{exit_error, hint_arrow, try_expand_shorthand};
 use amici::logging::init_subscriber;
 use clap::{Parser, Subcommand};
-use rurico::model_probe;
 use sae::config::Config;
 use sae::tools::{CreateArgs, Sae, SaeError, SearchArgs, UpdateArgs};
 
@@ -217,7 +216,7 @@ async fn run(cli: Cli, config: Config) -> Result<String, SaeError> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    model_probe::handle_probe_if_needed();
+    rurico::handle_probe_if_needed();
 
     init_subscriber("sae=info");
 
