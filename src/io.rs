@@ -15,7 +15,7 @@ mod tests {
 
     use super::write_output;
 
-    /// T-W001: write_output appends newline when output lacks trailing newline
+    // T-W001: write_output_appends_newline_when_missing
     #[test]
     fn write_output_appends_newline_when_missing() {
         let mut buf = Vec::new();
@@ -23,7 +23,7 @@ mod tests {
         assert_eq!(&buf, b"hello\n");
     }
 
-    /// T-W002: write_output preserves single trailing newline
+    // T-W002: write_output_preserves_existing_newline (does not double it)
     #[test]
     fn write_output_preserves_existing_newline() {
         let mut buf = Vec::new();
@@ -31,7 +31,7 @@ mod tests {
         assert_eq!(&buf, b"hello\n");
     }
 
-    /// T-W003: write_output propagates BrokenPipe error from writer
+    // T-W003: write_output_propagates_broken_pipe
     #[test]
     fn write_output_propagates_broken_pipe() {
         struct BrokenPipeWriter;
