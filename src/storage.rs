@@ -41,6 +41,13 @@ pub(crate) fn query_norm_config() -> QueryNormalizationConfig {
     QueryNormalizationConfig::default()
 }
 
+/// Zero-copy `&[f32] → &[u8]` for binding embedding vectors to sqlite-vec.
+/// Replaces `rurico::storage::f32_as_bytes` after its removal upstream;
+/// rurico's `compile_error!` for non-little-endian targets is transitive.
+pub(crate) fn f32_as_bytes(v: &[f32]) -> &[u8] {
+    bytemuck::cast_slice(v)
+}
+
 const DDL_FTS: &str = "\
     CREATE VIRTUAL TABLE IF NOT EXISTS fts_chunks USING fts5(\
         section_title, content, tokenize='trigram'\

@@ -34,8 +34,9 @@ dependencies = [
 [[package]]
 name = "amici"
 version = "0.1.0"
-source = "git+https://github.com/thkt/amici?rev=79f837f#79f837fed35f25ae675ddcdb76bbafb0604be02b"
+source = "git+https://github.com/thkt/amici?rev=48bc7ea#48bc7eacfb80eb18f5be3900ca058260ff54d246"
 dependencies = [
+ "bytemuck",
  "rand 0.10.1",
  "rand_chacha 0.10.0",
  "rurico",
@@ -2308,7 +2309,7 @@ dependencies = [
 [[package]]
 name = "rurico"
 version = "0.2.0"
-source = "git+https://github.com/thkt/rurico?rev=0c0e0f6#0c0e0f6c93c2705d1d76304a15fc8549da07052b"
+source = "git+https://github.com/thkt/rurico?rev=73c5b69#73c5b691e341e4068f04ec75a72cbf79208ca856"
 dependencies = [
  "bytemuck",
  "hf-hub",
@@ -2328,7 +2329,7 @@ dependencies = [
 [[package]]
 name = "rurico-ffi"
 version = "0.1.0"
-source = "git+https://github.com/thkt/rurico?rev=0c0e0f6#0c0e0f6c93c2705d1d76304a15fc8549da07052b"
+source = "git+https://github.com/thkt/rurico?rev=73c5b69#73c5b691e341e4068f04ec75a72cbf79208ca856"
 dependencies = [
  "mlx-sys",
  "rusqlite",
@@ -2478,6 +2479,7 @@ name = "sae"
 version = "0.1.0"
 dependencies = [
  "amici",
+ "bytemuck",
  "chrono",
  "clap",
  "reqwest 0.13.3",

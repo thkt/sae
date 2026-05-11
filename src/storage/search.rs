@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::f64::consts::LN_2;
 
 use amici::storage::{
     fetch_by_in_clause,
@@ -7,14 +8,12 @@ use amici::storage::{
 };
 use chrono::{DateTime, Utc};
 use rurico::reranker::Rerank;
-use rurico::storage::{
-    f32_as_bytes, normalize_for_fts, prepare_match_query, recency_decay, rrf_merge,
-};
+use rurico::storage::{normalize_for_fts, prepare_match_query};
 use rusqlite::Connection;
 use rusqlite::types::ToSql;
 use tracing::warn;
 
-use super::{StorageError, collect_storage_rows};
+use super::{StorageError, collect_storage_rows, f32_as_bytes};
 
 #[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -158,6 +157,37 @@ fn batch_fetch_post_meta(
 const RECENCY_HALF_LIFE: f64 = 30.0;
 const RECENCY_WEIGHT: f64 = 0.2;
 const SECS_PER_DAY: f64 = 86_400.0;
+const RRF_K: f64 = 60.0;
+
+/// Reciprocal Rank Fusion: rank-only merge of two ranked lists.
+/// Replaces `rurico::storage::rrf_merge` after its removal upstream
+/// (folded into `retrieval::WeightedRrf::default()`). sae keeps the
+/// pre-rerank rank-only fusion here because applying recency in the
+/// merge step would change the recency-after-rerank semantics.
+fn rrf_merge(fts_hits: &[(u32, f64)], vec_hits: &[(u32, f64)]) -> Vec<(u32, f64)> {
+    let mut scores: HashMap<u32, f64> = HashMap::new();
+    for (rank, (key, _)) in fts_hits.iter().enumerate() {
+        *scores.entry(*key).or_default() += 1.0 / (RRF_K + rank as f64);
+    }
+    for (rank, (key, _)) in vec_hits.iter().enumerate() {
+        *scores.entry(*key).or_default() += 1.0 / (RRF_K + rank as f64);
+    }
+    let mut results: Vec<(u32, f64)> = scores.into_iter().collect();
+    results.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    results
+}
+
+/// Exponential recency decay: 1.0 at age=0, 0.5 at one half-life.
+/// Replaces `rurico::storage::recency_decay` after it was demoted to
+/// `pub(crate)` upstream. Applied after the cross-encoder rerank, so
+/// `WeightedRrf::merge_with_recency` (which acts pre-rerank) cannot
+/// be substituted without changing observable ranking.
+fn recency_decay(age_days: f64, half_life_days: f64) -> f64 {
+    if half_life_days <= 0.0 {
+        return 0.0;
+    }
+    (-LN_2 * age_days.max(0.0) / half_life_days).exp()
+}
 
 fn apply_recency_boost(
     merged: Vec<(u32, f64)>,

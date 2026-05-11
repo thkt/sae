@@ -10,11 +10,12 @@ license = "MIT"
 test-support = ["rurico/test-support"]
 
 [dependencies]
-amici = { git = "https://github.com/thkt/amici", rev = "79f837f" }
+amici = { git = "https://github.com/thkt/amici", rev = "48bc7ea" }
+bytemuck = "1"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 clap = { version = "4.6", features = ["derive"] }
 reqwest = { version = "0.13", features = ["json"] }
-rurico = { git = "https://github.com/thkt/rurico", rev = "0c0e0f6" }
+rurico = { git = "https://github.com/thkt/rurico", rev = "73c5b69" }
 rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -23,7 +24,7 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 
 [dev-dependencies]
-rurico = { git = "https://github.com/thkt/rurico", rev = "0c0e0f6", features = ["test-support"] }
+rurico = { git = "https://github.com/thkt/rurico", rev = "73c5b69", features = ["test-support"] }
 serial_test = "3"
 tempfile = "3"
 wiremock = "0.6"

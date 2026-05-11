@@ -1,12 +1,11 @@
 use std::collections::HashSet;
 
 use rurico::embed::ChunkedEmbedding;
-use rurico::storage::f32_as_bytes;
 use rusqlite::Connection;
 
 use amici::storage::fetch_by_in_clause;
 
-use super::{StorageError, collect_storage_rows};
+use super::{StorageError, collect_storage_rows, f32_as_bytes};
 
 pub fn add_chunked_embeddings(
     conn: &Connection,
