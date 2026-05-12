@@ -277,25 +277,21 @@ pub enum SaeError {
 }
 
 impl SaeError {
-    /// Builds the `Input` variant for "no data for team". Production sites
-    /// MUST use this constructor (not `SaeError::Input(format!(...))`) so
-    /// the canonical prefix `next_step()` keys off stays in sync.
-    pub fn input_no_data_for_team(team: &str) -> Self {
+    /// Production sites MUST use this constructor (not `SaeError::Input(format!(...))`)
+    /// so the canonical prefix `next_step()` keys off stays in sync.
+    pub(crate) fn input_no_data_for_team(team: &str) -> Self {
         Self::Input(format!(
             "No data for team '{team}'. Run `sae harvest {team}` first."
         ))
     }
 
-    /// Builds the `Input` variant for "model not found". Production sites
-    /// MUST use this constructor (not `SaeError::Input(...)`) so the
-    /// canonical prefix `next_step()` keys off stays in sync.
-    pub fn input_model_not_found() -> Self {
+    /// Production sites MUST use this constructor (not `SaeError::Input(...)`)
+    /// so the canonical prefix `next_step()` keys off stays in sync.
+    pub(crate) fn input_model_not_found() -> Self {
         Self::Input("Model not found. Run 'sae model download' first.".to_owned())
     }
 
-    /// Returns the [`ErrorCode`] classification per ADR-0060.
-    ///
-    /// [`CliError::exit_code`] delegates here so the mapping is single-sourced.
+    /// [`CliError::exit_code`] delegates here so the sysexits mapping is single-sourced.
     pub(crate) fn error_code(&self) -> ErrorCode {
         match self {
             Self::Input(_) | Self::Config(_) => ErrorCode::UsageError,
@@ -323,13 +319,11 @@ impl SaeError {
         }
     }
 
-    /// Returns the structured next-step suggestion per ADR-0060.
-    ///
-    /// Phase 2.1 returns template strings (`Run \`sae harvest <team>\``). The
-    /// template form ships now; concrete values (`Run \`sae harvest gaji\``)
-    /// would require parsing the message back, which is fragile, and the
-    /// agent-facing template is unambiguous.
-    pub fn next_step(&self) -> Option<&'static str> {
+    /// Phase 2.1 returns template strings (`Run \`sae harvest <team>\``).
+    /// Concrete values (`Run \`sae harvest gaji\``) would require parsing the
+    /// message back, which is fragile; the agent-facing template is unambiguous.
+    #[allow(dead_code)] // Phase 2.2 wires this through the JSON error renderer.
+    pub(crate) fn next_step(&self) -> Option<&'static str> {
         match self {
             Self::Input(s) if s.starts_with("No data for team ") => {
                 Some("Run `sae harvest <team>` to fetch posts.")
@@ -344,7 +338,11 @@ impl SaeError {
             | Self::Sync(SyncError::Client(ClientError::TokenNotSet)) => {
                 Some("Set `ESA_ACCESS_TOKEN=<token>` and retry.")
             }
-            Self::Sync(SyncError::Client(ClientError::MaxRetries(_))) => {
+            // Direct API commands (get/create/update/archive/ship) bubble
+            // ClientError::MaxRetries as Self::Client(_); harvest wraps it
+            // under Sync. Both share the same retry guidance.
+            Self::Client(ClientError::MaxRetries(_))
+            | Self::Sync(SyncError::Client(ClientError::MaxRetries(_))) => {
                 Some("Retry after the rate-limit window resets.")
             }
             Self::ModelDownload(ModelDownloadError::DownloadFailed(_)) => {
@@ -364,19 +362,17 @@ impl SaeError {
         }
     }
 
-    /// Returns candidate suggestions for the user (e.g., known team names).
-    ///
     /// Phase 2.1 always returns empty. Phase 2.2 may populate config-derived
     /// candidates for `NoTeamSpecified`/`UnknownTeam` once `Config` is
     /// available at the call site.
-    pub fn candidates(&self) -> Vec<String> {
+    #[allow(dead_code)] // Phase 2.2 wires this through the JSON error renderer.
+    pub(crate) fn candidates(&self) -> Vec<String> {
         Vec::new()
     }
 
-    /// Returns whether retrying the operation can plausibly succeed.
-    ///
     /// Mirrors the `TempFailure` classification from [`Self::error_code`].
-    pub fn retryable(&self) -> bool {
+    #[allow(dead_code)] // Phase 2.2 wires this through the JSON error renderer.
+    pub(crate) fn retryable(&self) -> bool {
         matches!(self.error_code(), ErrorCode::TempFailure)
     }
 }
@@ -648,6 +644,18 @@ mod tests {
         );
     }
 
+    // T-325: next_step_client_max_retries_matches_sync_variant
+    // Direct API commands (get/create/update/archive/ship) surface MaxRetries
+    // as Self::Client; harvest wraps it under Sync. Both must give the same hint.
+    #[test]
+    fn next_step_client_max_retries_matches_sync_variant() {
+        let err = SaeError::Client(ClientError::MaxRetries(5));
+        assert_eq!(
+            err.next_step(),
+            Some("Retry after the rate-limit window resets.")
+        );
+    }
+
     // T-316: next_step_model_download_failed
     #[test]
     fn next_step_model_download_failed() {
@@ -717,9 +725,10 @@ mod tests {
             SaeError::Config(ConfigError::NoTeamSpecified),
             SaeError::Other("internal".into()),
         ] {
-            assert!(
-                err.candidates().is_empty(),
-                "Phase 2.1 returns empty Vec for every variant"
+            assert_eq!(
+                err.candidates(),
+                Vec::<String>::new(),
+                "Phase 2.1 returns empty Vec for {err:?}"
             );
         }
     }

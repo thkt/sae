@@ -9,14 +9,15 @@
 //! Phase 2.2 wires them; remove the allow when wiring lands.
 #![allow(dead_code)]
 
+use amici::cli::exit_code::codes;
 use serde::Serialize;
 
 /// JSON-serializable error classification per ADR-0060.
 ///
-/// The variant set covers the 5 sysexits codes `SaeError` currently produces.
-/// `DATA_ERROR (65)` and `NOT_FOUND (66)` are absent because no sae operation
-/// maps to them today; they will be reconsidered when this type lifts into
-/// amici alongside yomu / recall (ADR-0060 Phase 3).
+/// Covers every sysexits code `SaeError` currently produces. `DATA_ERROR (65)`
+/// and `NOT_FOUND (66)` are absent because no sae operation maps to them today;
+/// they will be reconsidered when this type lifts into amici alongside yomu /
+/// recall (ADR-0060 Phase 3).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum ErrorCode {
@@ -28,19 +29,20 @@ pub(crate) enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// sysexits.h exit code mapped per ADR-0060.
+    /// Delegates to `amici::cli::exit_code::codes::*` so the sysexits numbers
+    /// are single-sourced in amici; T-EN002 still pins them as a regression net.
     pub(crate) fn exit_code(self) -> u8 {
         match self {
-            Self::UsageError => 64,
-            Self::Software => 70,
-            Self::CantCreat => 73,
-            Self::IoError => 74,
-            Self::TempFailure => 75,
+            Self::UsageError => codes::USAGE,
+            Self::Software => codes::SOFTWARE,
+            Self::CantCreat => codes::CANT_CREAT,
+            Self::IoError => codes::IO_ERR,
+            Self::TempFailure => codes::TEMP_FAIL,
         }
     }
 }
 
-/// Success envelope per ADR-0060 (`{ data, degraded, notes }`).
+/// Serialized to stdout when `--json` is set (Phase 2.2).
 #[derive(Debug, Serialize)]
 pub(crate) struct SuccessEnvelope {
     pub data: serde_json::Value,
@@ -48,7 +50,8 @@ pub(crate) struct SuccessEnvelope {
     pub notes: Vec<String>,
 }
 
-/// Error envelope per ADR-0060 (`{ error: { code, message, ... } }`).
+/// Serialized to stderr when `--json` is set and the command failed (Phase 2.2).
+/// Wrapping the payload under `error` lets consumers branch on root key.
 #[derive(Debug, Serialize)]
 pub(crate) struct ErrorEnvelope {
     pub error: ErrorPayload,
