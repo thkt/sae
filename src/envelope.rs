@@ -1,13 +1,14 @@
 //! Output envelopes per ADR-0060.
 //!
-//! Phase 2.1 introduces the type definitions and `SaeError` accessor methods
-//! (`error_code`, `next_step`, `candidates`, `retryable`). Phase 2.2 wires the
-//! renderers (`render_json_success` / `render_json_error`) through the `--json`
-//! path. This module exposes no observable behavior change on its own.
+//! `CommandOutput` is the canonical return type for every command runner.
+//! It carries both the default-mode rendering (`markdown`) and a machine
+//! payload (`data`), plus a `degraded` flag and `notes` describing why
+//! the result diverged from the ideal path (e.g. semantic search fell
+//! back to FTS).
 //!
-//! `#![allow(dead_code)]` covers the envelope structs that are unused until
-//! Phase 2.2 wires them; remove the allow when wiring lands.
-#![allow(dead_code)]
+//! `render_json_success` / `render_json_error` map these into the wire
+//! envelopes ([`SuccessEnvelope`] / [`ErrorEnvelope`]) emitted when
+//! `--json` is set.
 
 use amici::cli::exit_code::codes;
 use serde::Serialize;
@@ -42,7 +43,45 @@ impl ErrorCode {
     }
 }
 
-/// Serialized to stdout when `--json` is set (Phase 2.2).
+/// Canonical return type for command runners.
+///
+/// `markdown` is the human-facing rendering surfaced when `--json` is absent.
+/// `data` is the machine payload mirrored into [`SuccessEnvelope::data`] when
+/// `--json` is set. `degraded` + `notes` surface deviations from the ideal
+/// path (e.g. semantic search unavailable → FTS fallback) so agents can react.
+pub struct CommandOutput {
+    pub markdown: String,
+    pub data: serde_json::Value,
+    pub degraded: bool,
+    pub notes: Vec<String>,
+}
+
+impl CommandOutput {
+    pub(crate) fn ok(markdown: String, data: serde_json::Value) -> Self {
+        Self {
+            markdown,
+            data,
+            degraded: false,
+            notes: Vec::new(),
+        }
+    }
+
+    pub(crate) fn with_notes(
+        markdown: String,
+        data: serde_json::Value,
+        degraded: bool,
+        notes: Vec<String>,
+    ) -> Self {
+        Self {
+            markdown,
+            data,
+            degraded,
+            notes,
+        }
+    }
+}
+
+/// Serialized to stdout when `--json` is set.
 #[derive(Debug, Serialize)]
 pub(crate) struct SuccessEnvelope {
     pub data: serde_json::Value,
@@ -50,7 +89,7 @@ pub(crate) struct SuccessEnvelope {
     pub notes: Vec<String>,
 }
 
-/// Serialized to stderr when `--json` is set and the command failed (Phase 2.2).
+/// Serialized to stderr when `--json` is set and the command failed.
 /// Wrapping the payload under `error` lets consumers branch on root key.
 #[derive(Debug, Serialize)]
 pub(crate) struct ErrorEnvelope {
@@ -70,6 +109,24 @@ pub(crate) struct ErrorPayload {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub candidates: Vec<String>,
     pub retryable: bool,
+}
+
+/// Serializes a successful result to the wire envelope.
+pub(crate) fn render_json_success(out: &CommandOutput) -> String {
+    let env = SuccessEnvelope {
+        data: out.data.clone(),
+        degraded: out.degraded,
+        notes: out.notes.clone(),
+    };
+    serde_json::to_string(&env).expect("SuccessEnvelope is always serializable")
+}
+
+/// Serializes a prepared error envelope to the wire format.
+///
+/// The caller assembles [`ErrorEnvelope`] via `SaeError::to_error_envelope` so
+/// this module stays free of a `SaeError` import (avoids a tools↔envelope cycle).
+pub(crate) fn render_json_error(env: &ErrorEnvelope) -> String {
+    serde_json::to_string(env).expect("ErrorEnvelope is always serializable")
 }
 
 #[cfg(test)]
@@ -214,5 +271,50 @@ mod tests {
             json.contains(r#""notes":["semantic search unavailable, falling back to FTS"]"#),
             "got: {json}"
         );
+    }
+
+    // T-EN009: render_json_success_serializes_command_output
+    #[test]
+    fn render_json_success_serializes_command_output() {
+        let out = CommandOutput::ok("hello".into(), serde_json::json!({"posts": 5}));
+        let json = render_json_success(&out);
+        assert!(json.contains(r#""data":{"posts":5}"#), "got: {json}");
+        assert!(json.contains(r#""degraded":false"#), "got: {json}");
+        assert!(json.contains(r#""notes":[]"#), "got: {json}");
+    }
+
+    // T-EN010: render_json_success_surfaces_notes
+    #[test]
+    fn render_json_success_surfaces_notes() {
+        let out = CommandOutput::with_notes(
+            "result".into(),
+            serde_json::json!([]),
+            true,
+            vec!["semantic search unavailable, falling back to FTS".into()],
+        );
+        let json = render_json_success(&out);
+        assert!(json.contains(r#""degraded":true"#), "got: {json}");
+        assert!(
+            json.contains(r#""semantic search unavailable, falling back to FTS""#),
+            "got: {json}"
+        );
+    }
+
+    // T-EN011: render_json_error_wraps_payload
+    #[test]
+    fn render_json_error_wraps_payload() {
+        let env = ErrorEnvelope {
+            error: ErrorPayload {
+                code: ErrorCode::TempFailure,
+                message: "rate limited".into(),
+                next_step: Some("Retry after the rate-limit window resets.".into()),
+                candidates: vec![],
+                retryable: true,
+            },
+        };
+        let json = render_json_error(&env);
+        assert!(json.starts_with(r#"{"error":"#), "got: {json}");
+        assert!(json.contains(r#""code":"TEMP_FAILURE""#), "got: {json}");
+        assert!(json.contains(r#""retryable":true"#), "got: {json}");
     }
 }

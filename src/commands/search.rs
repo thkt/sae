@@ -3,6 +3,7 @@ use std::io::{self, IsTerminal, Read};
 use std::process::{Command, Stdio};
 
 use crate::config::Config;
+use crate::envelope::CommandOutput;
 use crate::storage;
 use amici::model::{ModelLoad, record_degraded};
 use rurico::embed::ChunkedEmbedding;
@@ -78,20 +79,22 @@ pub(crate) fn run_search(
     before: Option<&str>,
     no_embed: bool,
     rerank_enabled: bool,
-    json: bool,
-) -> Result<String, SaeError> {
+) -> Result<CommandOutput, SaeError> {
     let updated_after = parse_date_arg(after, "after")?;
     let updated_before = parse_date_arg(before, "before")?;
     let team = config.resolve_team(team)?;
     let db = require_db(config, team)?;
-    let embedder = if no_embed {
-        None
+    // `embedder_load_failed` distinguishes intentional FTS (`no_embed`) from
+    // a silent fallback (loader returned `DegradedReason`). Only the latter
+    // populates `degraded=true` + notes in the success envelope.
+    let (embedder, embedder_load_failed) = if no_embed {
+        (None, false)
     } else {
         let result = try_load_embedder();
         if let Err(reason) = result {
             record_degraded(*reason, "search: embedder load");
         }
-        result.as_ref().ok()
+        (result.as_ref().ok(), result.is_err())
     };
     let embed_info = if let Some(emb) = embedder {
         match auto_embed_pending_with(&db, SEARCH_EMBED_BUDGET, |texts| {
@@ -151,7 +154,13 @@ pub(crate) fn run_search(
         tracing::warn!("{w}");
     }
     let semantic = query_embedding.is_some();
-    let output = output::search(&search_output.results, query, json, semantic, embed_info)?;
+    let output = output::search(
+        &search_output.results,
+        query,
+        semantic,
+        embedder_load_failed,
+        embed_info,
+    )?;
     const PREFETCH_TTL_SECS: u64 = 5 * 60;
     if !storage::sync_harvested_within(db.conn(), PREFETCH_TTL_SECS) {
         spawn_background_harvest(team);

@@ -1,16 +1,13 @@
 use std::path::Path;
 
 use crate::config::{Config, validate_team_name};
+use crate::envelope::CommandOutput;
 use crate::output;
 use crate::storage;
 use crate::storage::TeamStatus;
 use crate::tools::SaeError;
 
-pub(crate) fn run_status(
-    config: &Config,
-    team: Option<&str>,
-    json: bool,
-) -> Result<String, SaeError> {
+pub(crate) fn run_status(config: &Config, team: Option<&str>) -> Result<CommandOutput, SaeError> {
     let target_teams: Vec<&str> = if let Some(t) = team {
         vec![config.resolve_team(Some(t))?]
     } else {
@@ -28,7 +25,7 @@ pub(crate) fn run_status(
             .collect()
     };
     let statuses = collect_team_statuses(config, &target_teams);
-    output::status(&statuses, json)
+    output::status(&statuses)
 }
 
 fn collect_team_statuses(config: &Config, teams: &[&str]) -> Vec<TeamStatus> {

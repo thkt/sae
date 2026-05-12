@@ -12,7 +12,7 @@ use rurico::embed::{Artifacts, ModelId, cached_artifacts};
 use crate::client::{ClientError, EsaClient};
 use crate::commands;
 use crate::config::{Config, ConfigError};
-use crate::envelope::ErrorCode;
+use crate::envelope::{CommandOutput, ErrorCode, ErrorEnvelope, ErrorPayload};
 use crate::output;
 use crate::storage::{Db, EmbedResult, StorageError, count_unembedded_chunks};
 use crate::sync::{self, SyncError};
@@ -117,15 +117,15 @@ impl Sae {
         &self.config
     }
 
-    pub async fn harvest(&self, team: &str, full: bool, json: bool) -> Result<String, SaeError> {
+    pub async fn harvest(&self, team: &str, full: bool) -> Result<CommandOutput, SaeError> {
         let (team, client) = resolve_client(&self.config, Some(team))?;
         let db_path = self.config.team_db_path(team)?;
         let db = Db::open(&db_path)?;
         let result = sync::harvest(&client, &db, team, full).await?;
-        output::harvest(&result, json)
+        output::harvest(&result)
     }
 
-    pub fn embed(&self, team: &str, json: bool) -> Result<String, SaeError> {
+    pub fn embed(&self, team: &str) -> Result<CommandOutput, SaeError> {
         let team = self.config.resolve_team(Some(team))?;
         let db = require_db(&self.config, team)?;
         let paths = require_embed_model()?;
@@ -182,16 +182,15 @@ impl Sae {
                         chunks_embedded: all.added,
                     },
                     all.total_chunks,
-                    json,
                 )
             }
-            None => output::embed(&EmbedResult { chunks_embedded: 0 }, 0, json),
+            None => output::embed(&EmbedResult { chunks_embedded: 0 }, 0),
         }
     }
 
-    pub fn model_download(json: bool) -> Result<String, SaeError> {
+    pub fn model_download() -> Result<CommandOutput, SaeError> {
         download_and_verify_model()?;
-        output::model_download(json)
+        output::model_download()
     }
 
     pub async fn get(
@@ -199,17 +198,16 @@ impl Sae {
         number: u32,
         team: Option<&str>,
         with_body: bool,
-        json: bool,
-    ) -> Result<String, SaeError> {
-        commands::post::run_get(&self.config, number, team, with_body, json).await
+    ) -> Result<CommandOutput, SaeError> {
+        commands::post::run_get(&self.config, number, team, with_body).await
     }
 
-    pub async fn create(&self, args: CreateArgs, json: bool) -> Result<String, SaeError> {
-        commands::post::run_create(&self.config, args, json).await
+    pub async fn create(&self, args: CreateArgs) -> Result<CommandOutput, SaeError> {
+        commands::post::run_create(&self.config, args).await
     }
 
-    pub async fn update(&self, args: UpdateArgs, json: bool) -> Result<String, SaeError> {
-        commands::post::run_update(&self.config, args, json).await
+    pub async fn update(&self, args: UpdateArgs) -> Result<CommandOutput, SaeError> {
+        commands::post::run_update(&self.config, args).await
     }
 
     pub async fn archive(
@@ -217,9 +215,8 @@ impl Sae {
         number: u32,
         team: Option<&str>,
         dry_run: bool,
-        json: bool,
-    ) -> Result<String, SaeError> {
-        commands::archive::run_archive(&self.config, number, team, dry_run, json).await
+    ) -> Result<CommandOutput, SaeError> {
+        commands::archive::run_archive(&self.config, number, team, dry_run).await
     }
 
     pub async fn ship(
@@ -227,12 +224,11 @@ impl Sae {
         number: u32,
         team: Option<&str>,
         dry_run: bool,
-        json: bool,
-    ) -> Result<String, SaeError> {
-        commands::archive::run_ship(&self.config, number, team, dry_run, json).await
+    ) -> Result<CommandOutput, SaeError> {
+        commands::archive::run_ship(&self.config, number, team, dry_run).await
     }
 
-    pub fn search(&self, args: SearchArgs, json: bool) -> Result<String, SaeError> {
+    pub fn search(&self, args: SearchArgs) -> Result<CommandOutput, SaeError> {
         let query = resolve_search_query(args.query)?;
         commands::search::run_search(
             &self.config,
@@ -243,12 +239,11 @@ impl Sae {
             args.before.as_deref(),
             args.no_embed,
             self.rerank_enabled,
-            json,
         )
     }
 
-    pub fn status(&self, team: Option<&str>, json: bool) -> Result<String, SaeError> {
-        commands::status::run_status(&self.config, team, json)
+    pub fn status(&self, team: Option<&str>) -> Result<CommandOutput, SaeError> {
+        commands::status::run_status(&self.config, team)
     }
 }
 
@@ -319,10 +314,9 @@ impl SaeError {
         }
     }
 
-    /// Phase 2.1 returns template strings (`Run \`sae harvest <team>\``).
+    /// Returns template strings (`Run \`sae harvest <team>\``).
     /// Concrete values (`Run \`sae harvest gaji\``) would require parsing the
     /// message back, which is fragile; the agent-facing template is unambiguous.
-    #[allow(dead_code)] // Phase 2.2 wires this through the JSON error renderer.
     pub(crate) fn next_step(&self) -> Option<&'static str> {
         match self {
             Self::Input(s) if s.starts_with("No data for team ") => {
@@ -362,18 +356,32 @@ impl SaeError {
         }
     }
 
-    /// Phase 2.1 always returns empty. Phase 2.2 may populate config-derived
-    /// candidates for `NoTeamSpecified`/`UnknownTeam` once `Config` is
-    /// available at the call site.
-    #[allow(dead_code)] // Phase 2.2 wires this through the JSON error renderer.
+    /// Always returns empty for now. Future revisions may populate
+    /// config-derived candidates for `NoTeamSpecified`/`UnknownTeam` once
+    /// `Config` is threaded into the call site.
     pub(crate) fn candidates(&self) -> Vec<String> {
         Vec::new()
     }
 
     /// Mirrors the `TempFailure` classification from [`Self::error_code`].
-    #[allow(dead_code)] // Phase 2.2 wires this through the JSON error renderer.
     pub(crate) fn retryable(&self) -> bool {
         matches!(self.error_code(), ErrorCode::TempFailure)
+    }
+
+    /// Bundles [`Self::error_code`], [`Self::next_step`], [`Self::candidates`],
+    /// [`Self::retryable`], and the formatted message into an [`ErrorEnvelope`]
+    /// for `--json` rendering. Kept here so the envelope module avoids a
+    /// dependency on `SaeError` (which would form a cycle).
+    pub(crate) fn to_error_envelope(&self) -> ErrorEnvelope {
+        ErrorEnvelope {
+            error: ErrorPayload {
+                code: self.error_code(),
+                message: self.to_string(),
+                next_step: self.next_step().map(String::from),
+                candidates: self.candidates(),
+                retryable: self.retryable(),
+            },
+        }
     }
 }
 

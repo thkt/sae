@@ -1,5 +1,6 @@
 use crate::client::UpdatePostParams;
 use crate::config::Config;
+use crate::envelope::CommandOutput;
 use crate::output;
 use crate::tools::{SaeError, resolve_client};
 
@@ -20,8 +21,7 @@ pub(crate) async fn run_archive(
     number: u32,
     team: Option<&str>,
     dry_run: bool,
-    json: bool,
-) -> Result<String, SaeError> {
+) -> Result<CommandOutput, SaeError> {
     let (team, client) = resolve_client(config, team)?;
     let post = client.get_post(team, number).await?;
     let new_category = match archive_category(post.category.as_deref()) {
@@ -34,7 +34,7 @@ pub(crate) async fn run_archive(
             }));
         }
         None => {
-            return output::action_result("Already archived", &post, json);
+            return output::action_result("Already archived", &post);
         }
     };
     if dry_run {
@@ -49,7 +49,7 @@ pub(crate) async fn run_archive(
         ..Default::default()
     };
     let post = client.update_post(team, number, &params).await?;
-    output::action_result("Archived", &post, json)
+    output::action_result("Archived", &post)
 }
 
 pub(crate) async fn run_ship(
@@ -57,8 +57,7 @@ pub(crate) async fn run_ship(
     number: u32,
     team: Option<&str>,
     dry_run: bool,
-    json: bool,
-) -> Result<String, SaeError> {
+) -> Result<CommandOutput, SaeError> {
     if dry_run {
         return output::dry_run(&serde_json::json!({
             "number": number,
@@ -71,7 +70,7 @@ pub(crate) async fn run_ship(
         ..Default::default()
     };
     let post = client.update_post(team, number, &params).await?;
-    output::action_result("Shipped", &post, json)
+    output::action_result("Shipped", &post)
 }
 
 #[cfg(test)]

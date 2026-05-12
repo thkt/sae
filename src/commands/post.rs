@@ -3,6 +3,7 @@ use std::io::{self, Read};
 
 use crate::client::{CreatePostParams, UpdatePostParams};
 use crate::config::Config;
+use crate::envelope::CommandOutput;
 
 use crate::output;
 use crate::tools::{CreateArgs, SaeError, UpdateArgs, resolve_client};
@@ -12,18 +13,16 @@ pub(crate) async fn run_get(
     number: u32,
     team: Option<&str>,
     with_body: bool,
-    json: bool,
-) -> Result<String, SaeError> {
+) -> Result<CommandOutput, SaeError> {
     let (team, client) = resolve_client(config, team)?;
     let post = client.get_post(team, number).await?;
-    output::get(&post, json, with_body)
+    output::get(&post, with_body)
 }
 
 pub(crate) async fn run_create(
     config: &Config,
     args: CreateArgs,
-    json: bool,
-) -> Result<String, SaeError> {
+) -> Result<CommandOutput, SaeError> {
     let resolved_body = resolve_body(args.body.as_deref(), args.body_file.as_deref())?;
     if args.dry_run {
         return output::dry_run(&serde_json::json!({
@@ -43,14 +42,13 @@ pub(crate) async fn run_create(
         wip: args.wip,
     };
     let post = client.create_post(team, &params).await?;
-    output::action_result("Created", &post, json)
+    output::action_result("Created", &post)
 }
 
 pub(crate) async fn run_update(
     config: &Config,
     args: UpdateArgs,
-    json: bool,
-) -> Result<String, SaeError> {
+) -> Result<CommandOutput, SaeError> {
     let resolved_body = resolve_body(args.body.as_deref(), args.body_file.as_deref())?;
     let tags: Option<Vec<String>> = if args.tag.is_empty() {
         None
@@ -75,7 +73,7 @@ pub(crate) async fn run_update(
         ..Default::default()
     };
     let post = client.update_post(team, args.number, &params).await?;
-    output::action_result("Updated", &post, json)
+    output::action_result("Updated", &post)
 }
 
 pub(crate) fn resolve_body(
