@@ -13,6 +13,7 @@ use clap::{Parser, Subcommand};
 use sae::config::Config;
 use sae::io::write_output;
 use sae::tools::{CreateArgs, Sae, SaeError, SearchArgs, UpdateArgs};
+use sae::{CommandOutput, render_error, render_parse_error, render_success};
 
 #[derive(Parser)]
 #[command(name = "sae", about = "esa semantic search CLI")]
@@ -182,38 +183,87 @@ where
     Cli::try_parse_from(args)
 }
 
-async fn run(cli: Cli, config: Config) -> Result<String, SaeError> {
-    let json = cli.json;
+/// Returns true if argv contains `--json`. Scanned before clap parse so the
+/// flag survives clap parse failures and gates the error rendering path.
+fn json_mode_from_argv<I, T>(args: I) -> bool
+where
+    I: IntoIterator<Item = T>,
+    T: AsRef<ffi::OsStr>,
+{
+    args.into_iter().any(|a| a.as_ref() == "--json")
+}
+
+async fn run(cli: Cli, config: Config) -> Result<CommandOutput, SaeError> {
     if let Command::Model { command } = cli.command {
         return match command {
-            ModelCommand::Download => Sae::model_download(json),
+            ModelCommand::Download => Sae::model_download(),
         };
     }
     let sae = Sae::new(config);
     match cli.command {
-        Command::Harvest { team, full } => sae.harvest(&team, full, json).await,
-        Command::Search { args } => sae.search(args, json),
+        Command::Harvest { team, full } => sae.harvest(&team, full).await,
+        Command::Search { args } => sae.search(args),
         Command::Get {
             number,
             team,
             with_body,
-        } => sae.get(number, team.as_deref(), with_body, json).await,
-        Command::Create { args } => sae.create(args, json).await,
-        Command::Update { args } => sae.update(args, json).await,
-        Command::Embed { team } => sae.embed(&team, json),
+        } => sae.get(number, team.as_deref(), with_body).await,
+        Command::Create { args } => sae.create(args).await,
+        Command::Update { args } => sae.update(args).await,
+        Command::Embed { team } => sae.embed(&team),
         Command::Archive {
             number,
             team,
             dry_run,
-        } => sae.archive(number, team.as_deref(), dry_run, json).await,
+        } => sae.archive(number, team.as_deref(), dry_run).await,
         Command::Ship {
             number,
             team,
             dry_run,
-        } => sae.ship(number, team.as_deref(), dry_run, json).await,
-        Command::Status { team } => sae.status(team.as_deref(), json),
+        } => sae.ship(number, team.as_deref(), dry_run).await,
+        Command::Status { team } => sae.status(team.as_deref()),
         Command::Model { .. } => unreachable!("handled before Sae::new()"),
     }
+}
+
+fn emit_success(out: &CommandOutput, json_mode: bool) -> ExitCode {
+    let body = render_success(out, json_mode);
+    if body.is_empty() {
+        return ExitCode::SUCCESS;
+    }
+    let mut handle = stdout().lock();
+    match write_output(&mut handle, &body) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) if e.kind() == ErrorKind::BrokenPipe => ExitCode::SUCCESS,
+        Err(e) => {
+            exit_error(&format!("write to stdout failed: {e}"));
+            ExitCode::from(codes::IO_ERR)
+        }
+    }
+}
+
+fn emit_error(err: &SaeError, json_mode: bool) {
+    if json_mode {
+        eprintln!("{}", render_error(err, true));
+    } else {
+        exit_error(&err.to_string());
+    }
+}
+
+fn handle_parse_error(e: &clap::Error, json_mode: bool) -> ExitCode {
+    // `--help` / `--version` come back as `Err` with `use_stderr() == false`.
+    // Print them as-is regardless of `--json` so the exit code (SUCCESS) and
+    // the rendered payload (help text) agree.
+    if !e.use_stderr() {
+        let _ = e.print();
+        return ExitCode::SUCCESS;
+    }
+    if json_mode {
+        eprintln!("{}", render_parse_error(e, true));
+    } else {
+        let _ = e.print();
+    }
+    ExitCode::from(codes::USAGE)
 }
 
 #[tokio::main]
@@ -222,42 +272,26 @@ async fn main() -> ExitCode {
 
     init_subscriber("sae=info");
 
+    // Pre-scan argv so `--json` survives a clap parse failure (e.g. missing
+    // required arg). Otherwise the error renderer can't pick the JSON path.
+    let json_mode = json_mode_from_argv(env::args_os().skip(1));
+
     let cli = match parse_cli_args(env::args_os()) {
         Ok(cli) => cli,
-        Err(e) => {
-            let _ = e.print();
-            return ExitCode::from(if e.use_stderr() {
-                codes::USAGE
-            } else {
-                codes::SUCCESS
-            });
-        }
+        Err(e) => return handle_parse_error(&e, json_mode),
     };
     let config = match Config::load() {
         Ok(c) => c,
         Err(e) => {
-            exit_error(&e.to_string());
-            return SaeError::from(e).exit_code();
+            let err: SaeError = e.into();
+            emit_error(&err, json_mode);
+            return err.exit_code();
         }
     };
     match run(cli, config).await {
-        Ok(output) => {
-            if output.is_empty() {
-                ExitCode::SUCCESS
-            } else {
-                let mut handle = stdout().lock();
-                match write_output(&mut handle, &output) {
-                    Ok(()) => ExitCode::SUCCESS,
-                    Err(e) if e.kind() == ErrorKind::BrokenPipe => ExitCode::SUCCESS,
-                    Err(e) => {
-                        exit_error(&format!("write to stdout failed: {e}"));
-                        ExitCode::from(codes::IO_ERR)
-                    }
-                }
-            }
-        }
+        Ok(out) => emit_success(&out, json_mode),
         Err(e) => {
-            exit_error(&e.to_string());
+            emit_error(&e, json_mode);
             e.exit_code()
         }
     }
@@ -698,5 +732,21 @@ mod tests {
                 "subcommand '{cmd}' should not be rewritten as Search shorthand"
             );
         }
+    }
+
+    // T-300: json_mode_from_argv detects --json flag
+    #[test]
+    fn json_mode_detects_flag_in_argv() {
+        assert!(json_mode_from_argv(["--json", "status"]));
+        assert!(json_mode_from_argv(["status", "--json"]));
+        assert!(json_mode_from_argv(["search", "--json", "query"]));
+    }
+
+    // T-301: json_mode_from_argv returns false when --json absent
+    #[test]
+    fn json_mode_returns_false_when_absent() {
+        assert!(!json_mode_from_argv(["status"]));
+        assert!(!json_mode_from_argv(["search", "query"]));
+        assert!(!json_mode_from_argv::<[&str; 0], _>([]));
     }
 }
