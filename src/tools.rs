@@ -203,11 +203,21 @@ impl Sae {
     }
 
     pub async fn create(&self, args: CreateArgs) -> Result<CommandOutput, SaeError> {
-        commands::post::run_create(&self.config, args).await
+        let db = if args.dry_run {
+            None
+        } else {
+            try_open_team_db(&self.config, args.team.as_deref())
+        };
+        commands::post::run_create(&self.config, db.as_ref(), args).await
     }
 
     pub async fn update(&self, args: UpdateArgs) -> Result<CommandOutput, SaeError> {
-        commands::post::run_update(&self.config, args).await
+        let db = if args.dry_run {
+            None
+        } else {
+            try_open_team_db(&self.config, args.team.as_deref())
+        };
+        commands::post::run_update(&self.config, db.as_ref(), args).await
     }
 
     pub async fn archive(
@@ -216,7 +226,12 @@ impl Sae {
         team: Option<&str>,
         dry_run: bool,
     ) -> Result<CommandOutput, SaeError> {
-        commands::archive::run_archive(&self.config, number, team, dry_run).await
+        let db = if dry_run {
+            None
+        } else {
+            try_open_team_db(&self.config, team)
+        };
+        commands::archive::run_archive(&self.config, db.as_ref(), number, team, dry_run).await
     }
 
     pub async fn ship(
@@ -225,7 +240,12 @@ impl Sae {
         team: Option<&str>,
         dry_run: bool,
     ) -> Result<CommandOutput, SaeError> {
-        commands::archive::run_ship(&self.config, number, team, dry_run).await
+        let db = if dry_run {
+            None
+        } else {
+            try_open_team_db(&self.config, team)
+        };
+        commands::archive::run_ship(&self.config, db.as_ref(), number, team, dry_run).await
     }
 
     pub fn search(&self, args: SearchArgs) -> Result<CommandOutput, SaeError> {
@@ -400,6 +420,29 @@ pub(crate) fn require_db(config: &Config, team: &str) -> Result<Db, SaeError> {
         return Err(SaeError::input_no_data_for_team(team));
     }
     Ok(Db::open(&db_path)?)
+}
+
+/// Best-effort DB open for mutation commands. Returns `None` when the team
+/// cannot be resolved, the DB file does not yet exist (no prior harvest), or
+/// the DB fails to open — letting the API call proceed regardless. Only the
+/// open failure logs a warning; the other paths are silent.
+pub(crate) fn try_open_team_db(config: &Config, team: Option<&str>) -> Option<Db> {
+    let team = config.resolve_team(team).ok()?;
+    let db_path = config.team_db_path(team).ok()?;
+    if !db_path.exists() {
+        return None;
+    }
+    match Db::open(&db_path) {
+        Ok(db) => Some(db),
+        Err(e) => {
+            tracing::warn!(
+                team,
+                error = %e,
+                "failed to open local DB; write-through skipped"
+            );
+            None
+        }
+    }
 }
 
 impl CliError for SaeError {

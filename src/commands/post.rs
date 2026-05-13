@@ -1,11 +1,12 @@
 use std::fs;
 use std::io::{self, Read};
 
-use crate::client::{CreatePostParams, UpdatePostParams};
+use crate::client::{CreatePostParams, EsaClient, UpdatePostParams};
 use crate::config::Config;
 use crate::envelope::CommandOutput;
-
 use crate::output;
+use crate::storage::Db;
+use crate::sync;
 use crate::tools::{CreateArgs, SaeError, UpdateArgs, resolve_client};
 
 pub(crate) async fn run_get(
@@ -21,6 +22,7 @@ pub(crate) async fn run_get(
 
 pub(crate) async fn run_create(
     config: &Config,
+    db: Option<&Db>,
     args: CreateArgs,
 ) -> Result<CommandOutput, SaeError> {
     let resolved_body = resolve_body(args.body.as_deref(), args.body_file.as_deref())?;
@@ -34,26 +36,38 @@ pub(crate) async fn run_create(
         }));
     }
     let (team, client) = resolve_client(config, args.team.as_deref())?;
+    create_via_client(team, &client, db, &args, resolved_body.as_deref()).await
+}
+
+pub(crate) async fn create_via_client(
+    team: &str,
+    client: &EsaClient,
+    db: Option<&Db>,
+    args: &CreateArgs,
+    body_md: Option<&str>,
+) -> Result<CommandOutput, SaeError> {
     let params = CreatePostParams {
         name: &args.name,
-        body_md: resolved_body.as_deref(),
+        body_md,
         category: args.category.as_deref(),
-        tags: args.tag,
+        tags: args.tag.clone(),
         wip: args.wip,
     };
     let post = client.create_post(team, &params).await?;
+    sync::try_upsert_post_locally(db, &post);
     output::action_result("Created", &post)
 }
 
 pub(crate) async fn run_update(
     config: &Config,
+    db: Option<&Db>,
     args: UpdateArgs,
 ) -> Result<CommandOutput, SaeError> {
     let resolved_body = resolve_body(args.body.as_deref(), args.body_file.as_deref())?;
     let tags: Option<Vec<String>> = if args.tag.is_empty() {
         None
     } else {
-        Some(args.tag)
+        Some(args.tag.clone())
     };
     if args.dry_run {
         return output::dry_run(&serde_json::json!({
@@ -65,14 +79,26 @@ pub(crate) async fn run_update(
         }));
     }
     let (team, client) = resolve_client(config, args.team.as_deref())?;
+    update_via_client(team, &client, db, &args, resolved_body.as_deref(), tags).await
+}
+
+pub(crate) async fn update_via_client(
+    team: &str,
+    client: &EsaClient,
+    db: Option<&Db>,
+    args: &UpdateArgs,
+    body_md: Option<&str>,
+    tags: Option<Vec<String>>,
+) -> Result<CommandOutput, SaeError> {
     let params = UpdatePostParams {
         name: args.name.as_deref(),
-        body_md: resolved_body.as_deref(),
+        body_md,
         category: args.category.as_deref(),
         tags,
         ..Default::default()
     };
     let post = client.update_post(team, args.number, &params).await?;
+    sync::try_upsert_post_locally(db, &post);
     output::action_result("Updated", &post)
 }
 
@@ -179,5 +205,141 @@ mod tests {
             Some("# Hello\nBody from stdin\n"),
             "body should contain stdin contents as-is"
         );
+    }
+
+    use crate::sync::tests::esa_post_fixture;
+
+    fn esa_post_json(
+        number: u32,
+        name: &str,
+        body_md: &str,
+        updated_at: &str,
+    ) -> serde_json::Value {
+        esa_post_fixture(number, name, body_md, Some("dev"), false, updated_at)
+    }
+
+    fn create_args(name: &str) -> CreateArgs {
+        CreateArgs {
+            name: name.into(),
+            body: None,
+            body_file: None,
+            category: None,
+            tag: vec![],
+            wip: false,
+            team: None,
+            dry_run: false,
+        }
+    }
+
+    fn update_args(number: u32) -> UpdateArgs {
+        UpdateArgs {
+            number,
+            name: None,
+            body: None,
+            body_file: None,
+            category: None,
+            tag: vec![],
+            team: None,
+            dry_run: false,
+        }
+    }
+
+    // T-310: create_via_client reflects API response into local DB
+    #[tokio::test]
+    async fn create_via_client_writes_through_to_local_db() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/myteam/posts"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(esa_post_json(
+                42,
+                "Created Post",
+                "# Hello",
+                "2025-06-01T00:00:00+09:00",
+            )))
+            .mount(&server)
+            .await;
+
+        let client = EsaClient::with_base_url("tok".into(), server.uri());
+        let db = Db::open_memory().unwrap();
+        let args = create_args("Created Post");
+
+        let out = create_via_client("myteam", &client, Some(&db), &args, Some("# Hello"))
+            .await
+            .expect("create should succeed");
+        assert!(out.markdown.contains("Created"));
+
+        let name: String = db
+            .conn()
+            .query_row("SELECT name FROM posts WHERE number = 42", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "Created Post", "post should be persisted locally");
+    }
+
+    // T-311: update_via_client overwrites local row with the API response
+    #[tokio::test]
+    async fn update_via_client_overwrites_local_post() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("PATCH"))
+            .and(path("/teams/myteam/posts/7"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(esa_post_json(
+                7,
+                "Renamed",
+                "# Updated body",
+                "2025-07-01T00:00:00+09:00",
+            )))
+            .mount(&server)
+            .await;
+
+        let client = EsaClient::with_base_url("tok".into(), server.uri());
+        let db = Db::open_memory().unwrap();
+        let args = update_args(7);
+
+        update_via_client(
+            "myteam",
+            &client,
+            Some(&db),
+            &args,
+            Some("# Updated body"),
+            None,
+        )
+        .await
+        .expect("update should succeed");
+
+        let name: String = db
+            .conn()
+            .query_row("SELECT name FROM posts WHERE number = 7", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(name, "Renamed");
+    }
+
+    // T-312: create_via_client succeeds even when db=None (write-through skipped)
+    #[tokio::test]
+    async fn create_via_client_works_without_db() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/teams/myteam/posts"))
+            .respond_with(ResponseTemplate::new(201).set_body_json(esa_post_json(
+                1,
+                "No DB",
+                "",
+                "2025-06-01T00:00:00+09:00",
+            )))
+            .mount(&server)
+            .await;
+
+        let client = EsaClient::with_base_url("tok".into(), server.uri());
+        let args = create_args("No DB");
+        create_via_client("myteam", &client, None, &args, None)
+            .await
+            .expect("create should still succeed without a DB");
     }
 }

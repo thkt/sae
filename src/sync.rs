@@ -222,6 +222,41 @@ fn resolve_start(full: bool, state: &Option<storage::SyncState>) -> (u32, Option
     (page, q)
 }
 
+/// Write-through: reflect a single `EsaPost` from a mutation API response
+/// into the local DB (posts table + chunks + FTS) atomically.
+///
+/// Does NOT touch `sync_state.latest_updated_at`. Advancing the harvest cursor
+/// from a single post would skip concurrent remote updates whose `updated_at`
+/// falls between the last harvest and this post — only a full paginated
+/// harvest can prove that range is fully covered.
+pub(crate) fn upsert_post_locally(db: &Db, post: &EsaPost) -> Result<(), SyncError> {
+    let row = post_to_row(post);
+    let tx = db
+        .conn()
+        .unchecked_transaction()
+        .map_err(StorageError::Db)?;
+    storage::upsert_post(&tx, &row)?;
+    let enriched_body = storage::enrich_body(&row);
+    storage::rechunk_post(&tx, row.number, &enriched_body)?;
+    tx.commit().map_err(StorageError::Db)?;
+    Ok(())
+}
+
+/// Best-effort wrapper for [`upsert_post_locally`]: when `db` is `None`,
+/// or when the write fails, log a warning and continue — never propagate.
+/// Used by mutation commands (create/update/archive/ship) to reflect their
+/// API response into the local DB without disrupting the user-visible result.
+pub(crate) fn try_upsert_post_locally(db: Option<&Db>, post: &EsaPost) {
+    let Some(db) = db else { return };
+    if let Err(e) = upsert_post_locally(db, post) {
+        tracing::warn!(
+            error = %e,
+            post = post.number,
+            "local DB write-through failed; next harvest will reconcile"
+        );
+    }
+}
+
 fn post_to_row(post: &EsaPost) -> EsaPostRow {
     EsaPostRow {
         number: post.number,
@@ -242,21 +277,51 @@ fn post_to_row(post: &EsaPost) -> EsaPostRow {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::client::EsaUser;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
-    fn api_post(number: u32, name: &str, updated_at: &str) -> serde_json::Value {
+    fn make_esa_post(number: u32, name: &str, body_md: &str, updated_at: &str) -> EsaPost {
+        EsaPost {
+            number,
+            name: name.into(),
+            full_name: format!("dev/{name}"),
+            body_md: Some(body_md.into()),
+            category: Some("dev".into()),
+            tags: vec!["rust".into()],
+            wip: false,
+            kind: "stock".into(),
+            url: format!("https://example.esa.io/posts/{number}"),
+            created_at: "2025-01-01T00:00:00+09:00".into(),
+            updated_at: updated_at.into(),
+            created_by: EsaUser {
+                screen_name: "alice".into(),
+            },
+            updated_by: EsaUser {
+                screen_name: "bob".into(),
+            },
+            revision_number: 1,
+        }
+    }
+
+    pub(crate) fn esa_post_fixture(
+        number: u32,
+        name: &str,
+        body_md: &str,
+        category: Option<&str>,
+        wip: bool,
+        updated_at: &str,
+    ) -> serde_json::Value {
         serde_json::json!({
             "number": number,
             "name": name,
             "full_name": format!("dev/{name}"),
-            "body_md": format!("# {name}"),
-            "category": "dev",
+            "body_md": body_md,
+            "category": category,
             "tags": ["test"],
-            "wip": false,
+            "wip": wip,
             "kind": "stock",
             "url": format!("https://example.esa.io/posts/{number}"),
             "created_at": "2025-01-01T00:00:00+09:00",
@@ -265,6 +330,17 @@ mod tests {
             "updated_by": {"screen_name": "bob"},
             "revision_number": 1
         })
+    }
+
+    fn api_post(number: u32, name: &str, updated_at: &str) -> serde_json::Value {
+        esa_post_fixture(
+            number,
+            name,
+            &format!("# {name}"),
+            Some("dev"),
+            false,
+            updated_at,
+        )
     }
 
     fn posts_response(
@@ -668,5 +744,96 @@ mod tests {
             "should fetch posts across window narrowing"
         );
         assert_eq!(storage::count_posts(db.conn()).unwrap(), 3);
+    }
+
+    // T-300: upsert_post_locally inserts a post into an empty DB
+    #[test]
+    fn upsert_post_locally_inserts_new_post() {
+        let db = Db::open_memory().unwrap();
+        let post = make_esa_post(42, "Hello", "# Body", "2025-06-01T00:00:00+09:00");
+        upsert_post_locally(&db, &post).unwrap();
+
+        let name: String = db
+            .conn()
+            .query_row("SELECT name FROM posts WHERE number = 42", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "Hello");
+        let chunks = storage::count_chunks(db.conn()).unwrap();
+        assert!(chunks > 0, "expected at least one chunk to be created");
+    }
+
+    // T-301: upsert_post_locally replaces an existing post and re-chunks
+    #[test]
+    fn upsert_post_locally_replaces_existing() {
+        let db = Db::open_memory().unwrap();
+        upsert_post_locally(
+            &db,
+            &make_esa_post(7, "Original", "# Old", "2025-01-01T00:00:00+09:00"),
+        )
+        .unwrap();
+        upsert_post_locally(
+            &db,
+            &make_esa_post(7, "Renamed", "# New body", "2025-02-01T00:00:00+09:00"),
+        )
+        .unwrap();
+
+        let name: String = db
+            .conn()
+            .query_row("SELECT name FROM posts WHERE number = 7", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(name, "Renamed", "later upsert should win");
+        let total: u32 = db
+            .conn()
+            .query_row("SELECT COUNT(*) FROM posts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 1, "no duplicate row should be created");
+    }
+
+    // T-302: upsert_post_locally must NOT touch sync_state so that the harvest
+    //        cursor only advances after a full paginated harvest proves the
+    //        intervening updated_at range was fully covered. Single-post
+    //        write-through would otherwise skip concurrent remote updates.
+    #[test]
+    fn upsert_post_locally_does_not_advance_sync_state() {
+        let db = Db::open_memory().unwrap();
+        storage::save_sync_state_at(
+            db.conn(),
+            &storage::SyncStateUpdate {
+                latest_updated_at: Some("2025-01-01T00:00:00+09:00"),
+                total_count: 5,
+                local_count: 5,
+                last_page: None,
+            },
+            1_700_000_000,
+        )
+        .unwrap();
+        let before = storage::get_sync_state(db.conn()).unwrap().unwrap();
+
+        let post = make_esa_post(1, "A", "# x", "2025-06-01T00:00:00+09:00");
+        upsert_post_locally(&db, &post).unwrap();
+
+        let after = storage::get_sync_state(db.conn()).unwrap().unwrap();
+        assert_eq!(after.latest_updated_at, before.latest_updated_at);
+        assert_eq!(after.total_count, before.total_count);
+        assert_eq!(after.local_count, before.local_count);
+        assert_eq!(after.updated_at, before.updated_at);
+    }
+
+    // T-304: upsert_post_locally without prior sync_state leaves it absent
+    #[test]
+    fn upsert_post_locally_skips_sync_state_when_absent() {
+        let db = Db::open_memory().unwrap();
+        let post = make_esa_post(1, "A", "# x", "2025-06-01T00:00:00+09:00");
+        upsert_post_locally(&db, &post).unwrap();
+
+        assert!(
+            storage::get_sync_state(db.conn()).unwrap().is_none(),
+            "sync_state should not be created when previously absent"
+        );
+        assert_eq!(storage::count_posts(db.conn()).unwrap(), 1);
     }
 }
