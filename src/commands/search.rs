@@ -6,6 +6,9 @@ use crate::config::Config;
 use crate::envelope::CommandOutput;
 use crate::storage;
 use amici::model::{ModelLoad, record_degraded};
+use jiff::Timestamp;
+use jiff::civil::Date;
+use jiff::tz::TimeZone;
 use rurico::embed::ChunkedEmbedding;
 use rurico::reranker::Rerank;
 
@@ -16,20 +19,19 @@ use crate::tools::{SaeError, require_db};
 
 const SEARCH_EMBED_BUDGET: u32 = 128;
 
-fn parse_date_arg(
-    s: Option<&str>,
-    flag: &str,
-) -> Result<Option<chrono::DateTime<chrono::Utc>>, SaeError> {
+fn parse_date_arg(s: Option<&str>, flag: &str) -> Result<Option<Timestamp>, SaeError> {
     let Some(s) = s else {
         return Ok(None);
     };
-    chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .map_err(|_| {
-            SaeError::Input(format!(
-                "Invalid date '--{flag} {s}': expected YYYY-MM-DD (e.g. 2025-01-01)"
-            ))
-        })
-        .map(|d| Some(d.and_time(chrono::NaiveTime::MIN).and_utc()))
+    let date = Date::strptime("%Y-%m-%d", s).map_err(|_| {
+        SaeError::Input(format!(
+            "Invalid date '--{flag} {s}': expected YYYY-MM-DD (e.g. 2025-01-01)"
+        ))
+    })?;
+    let zoned = date
+        .to_zoned(TimeZone::UTC)
+        .map_err(|e| SaeError::Other(format!("failed to zone date to UTC: {e}")))?;
+    Ok(Some(zoned.timestamp()))
 }
 
 /// Embeds up to `budget` pending chunks in one batch.
@@ -146,7 +148,7 @@ pub(crate) fn run_search(
         query,
         query_embedding.as_deref(),
         limit,
-        chrono::Utc::now(),
+        Timestamp::now(),
         &filter,
         reranker_ref,
     )?;
@@ -425,7 +427,7 @@ mod tests {
         let dt = parse_date_arg(Some("2025-06-30"), "after")
             .unwrap()
             .unwrap();
-        assert_eq!(dt.format("%Y-%m-%d").to_string(), "2025-06-30");
+        assert_eq!(dt.strftime("%Y-%m-%d").to_string(), "2025-06-30");
     }
 
     // T-072: parse_date_arg returns Input error for non-ISO8601 date

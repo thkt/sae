@@ -6,7 +6,7 @@ use amici::storage::{
     filter::{append_eq_filter, append_in_filter, append_timestamp_day_cutoff_filter},
     fts::clean_for_trigram,
 };
-use chrono::{DateTime, Utc};
+use jiff::Timestamp;
 use rurico::reranker::Rerank;
 use rurico::storage::{normalize_for_fts, prepare_match_query};
 use rusqlite::Connection;
@@ -44,8 +44,8 @@ pub struct SearchFilter<'a> {
     pub tags: Option<&'a [&'a str]>,
     pub category: Option<&'a str>,
     pub created_by: Option<&'a str>,
-    pub updated_after: Option<DateTime<Utc>>,
-    pub updated_before: Option<DateTime<Utc>>,
+    pub updated_after: Option<Timestamp>,
+    pub updated_before: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone)]
@@ -118,10 +118,10 @@ fn append_search_filters(
     append_eq_filter(sql, params, "p.created_by", filter.created_by);
     let after = filter
         .updated_after
-        .map(|dt| dt.format("%Y-%m-%d").to_string());
+        .map(|ts| ts.strftime("%Y-%m-%d").to_string());
     let before = filter
         .updated_before
-        .map(|dt| dt.format("%Y-%m-%d").to_string());
+        .map(|ts| ts.strftime("%Y-%m-%d").to_string());
     append_timestamp_day_cutoff_filter(sql, params, "p.updated_at", false, after.as_deref());
     append_timestamp_day_cutoff_filter(sql, params, "p.updated_at", true, before.as_deref());
 }
@@ -192,7 +192,7 @@ fn recency_decay(age_days: f64, half_life_days: f64) -> f64 {
 fn apply_recency_boost(
     merged: Vec<(u32, f64)>,
     post_meta: &HashMap<u32, PostMeta>,
-    now: DateTime<Utc>,
+    now: Timestamp,
 ) -> Vec<(u32, f64)> {
     let mut scored: Vec<(u32, f64)> = merged
         .into_iter()
@@ -201,13 +201,13 @@ fn apply_recency_boost(
                 .get(&post_number)
                 .and_then(|meta| {
                     let updated_at = &meta.updated_at;
-                    DateTime::parse_from_rfc3339(updated_at)
+                    updated_at
+                        .parse::<Timestamp>()
                         .map_err(|e| warn!(%e, %updated_at, "unparseable updated_at, decay=0.0"))
                         .ok()
                 })
                 .map(|updated| {
-                    let age_days =
-                        (now - updated.with_timezone(&Utc)).num_seconds() as f64 / SECS_PER_DAY;
+                    let age_days = now.duration_since(updated).as_secs_f64() / SECS_PER_DAY;
                     recency_decay(age_days, RECENCY_HALF_LIFE)
                 })
                 .unwrap_or(0.0);
@@ -355,7 +355,7 @@ pub fn hybrid_search(
     query: &str,
     query_embedding: Option<&[f32]>,
     limit: u32,
-    now: DateTime<Utc>,
+    now: Timestamp,
     filter: &SearchFilter<'_>,
     reranker: Option<&dyn Rerank>,
 ) -> Result<SearchOutput, StorageError> {
@@ -478,7 +478,8 @@ pub fn hybrid_search(
 mod tests {
     use super::*;
     use crate::storage::{self, Db};
-    use chrono::{NaiveDate, NaiveTime};
+    use jiff::civil::Date;
+    use jiff::tz::TimeZone;
     use std::collections::HashSet;
 
     fn test_post(number: u32, name: &str, body_md: &str) -> storage::EsaPostRow {
@@ -566,7 +567,7 @@ mod tests {
             "認証の仕組み",
             None,
             10,
-            Utc::now(),
+            Timestamp::now(),
             &SearchFilter::default(),
             None,
         )
@@ -589,7 +590,7 @@ mod tests {
             "",
             None,
             10,
-            Utc::now(),
+            Timestamp::now(),
             &SearchFilter::default(),
             None,
         )
@@ -762,9 +763,7 @@ mod tests {
             storage::rechunk_post(db.conn(), *num, shared_body).unwrap();
         }
 
-        let now = DateTime::parse_from_rfc3339("2025-02-01T00:00:00+00:00")
-            .unwrap()
-            .with_timezone(&Utc);
+        let now: Timestamp = "2025-02-01T00:00:00+00:00".parse().unwrap();
         let results = hybrid_search(
             db.conn(),
             "認証の仕組み",
@@ -798,9 +797,7 @@ mod tests {
         storage::upsert_post(db.conn(), &post).unwrap();
         storage::rechunk_post(db.conn(), 1, body).unwrap();
 
-        let now = DateTime::parse_from_rfc3339("2025-02-01T00:00:00+00:00")
-            .unwrap()
-            .with_timezone(&Utc);
+        let now: Timestamp = "2025-02-01T00:00:00+00:00".parse().unwrap();
         let results = hybrid_search(
             db.conn(),
             "認証の仕組み",
@@ -982,7 +979,7 @@ mod tests {
             "認証",
             Some(&query_emb),
             10,
-            Utc::now(),
+            Timestamp::now(),
             &SearchFilter::default(),
             None,
         )
@@ -1029,7 +1026,7 @@ mod tests {
             "認証",
             Some(&query_emb),
             10,
-            Utc::now(),
+            Timestamp::now(),
             &SearchFilter::default(),
             None,
         )
@@ -1087,7 +1084,7 @@ mod tests {
             "認証",
             Some(&query_emb),
             10,
-            Utc::now(),
+            Timestamp::now(),
             &SearchFilter::default(),
             None,
         )
@@ -1317,7 +1314,7 @@ mod tests {
             "認証の仕組み",
             None,
             10,
-            Utc::now(),
+            Timestamp::now(),
             &SearchFilter {
                 category: Some("backend"),
                 ..Default::default()
@@ -1355,11 +1352,12 @@ mod tests {
         }
     }
 
-    fn date_utc(s: &str) -> DateTime<Utc> {
-        NaiveDate::parse_from_str(s, "%Y-%m-%d")
+    fn date_utc(s: &str) -> Timestamp {
+        Date::strptime("%Y-%m-%d", s)
             .unwrap()
-            .and_time(NaiveTime::MIN)
-            .and_utc()
+            .to_zoned(TimeZone::UTC)
+            .unwrap()
+            .timestamp()
     }
 
     // T-108: updated_after filters out posts with updated_at before threshold
@@ -1372,9 +1370,17 @@ mod tests {
             updated_after: Some(date_utc("2025-03-01")),
             ..Default::default()
         };
-        let results = hybrid_search(db.conn(), "ガイド", None, 10, Utc::now(), &filter, None)
-            .unwrap()
-            .results;
+        let results = hybrid_search(
+            db.conn(),
+            "ガイド",
+            None,
+            10,
+            Timestamp::now(),
+            &filter,
+            None,
+        )
+        .unwrap()
+        .results;
 
         assert_eq!(results.len(), 1, "only the newer post should be returned");
         assert_eq!(results[0].post_number, 2);
@@ -1390,9 +1396,17 @@ mod tests {
             updated_before: Some(date_utc("2025-03-01")),
             ..Default::default()
         };
-        let results = hybrid_search(db.conn(), "ガイド", None, 10, Utc::now(), &filter, None)
-            .unwrap()
-            .results;
+        let results = hybrid_search(
+            db.conn(),
+            "ガイド",
+            None,
+            10,
+            Timestamp::now(),
+            &filter,
+            None,
+        )
+        .unwrap()
+        .results;
 
         assert_eq!(results.len(), 1, "only the older post should be returned");
         assert_eq!(results[0].post_number, 1);
@@ -1410,9 +1424,17 @@ mod tests {
             updated_before: Some(date_utc("2025-03-01")),
             ..Default::default()
         };
-        let results = hybrid_search(db.conn(), "ガイド", None, 10, Utc::now(), &filter, None)
-            .unwrap()
-            .results;
+        let results = hybrid_search(
+            db.conn(),
+            "ガイド",
+            None,
+            10,
+            Timestamp::now(),
+            &filter,
+            None,
+        )
+        .unwrap()
+        .results;
 
         assert_eq!(
             results.len(),
@@ -1434,9 +1456,17 @@ mod tests {
             updated_before: Some(date_utc("2025-03-01")),
             ..Default::default()
         };
-        let results = hybrid_search(db.conn(), "ガイド", None, 10, Utc::now(), &filter, None)
-            .unwrap()
-            .results;
+        let results = hybrid_search(
+            db.conn(),
+            "ガイド",
+            None,
+            10,
+            Timestamp::now(),
+            &filter,
+            None,
+        )
+        .unwrap()
+        .results;
         assert_eq!(
             results.len(),
             1,
@@ -1456,9 +1486,17 @@ mod tests {
             updated_after: Some(date_utc("2025-03-01")),
             ..Default::default()
         };
-        let results = hybrid_search(db.conn(), "ガイド", None, 10, Utc::now(), &filter, None)
-            .unwrap()
-            .results;
+        let results = hybrid_search(
+            db.conn(),
+            "ガイド",
+            None,
+            10,
+            Timestamp::now(),
+            &filter,
+            None,
+        )
+        .unwrap()
+        .results;
         assert_eq!(
             results.len(),
             1,
@@ -1480,7 +1518,7 @@ mod tests {
             "認証の仕組み",
             None,
             10,
-            Utc::now(),
+            Timestamp::now(),
             &SearchFilter::default(),
             Some(&reranker),
         )
