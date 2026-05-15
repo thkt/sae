@@ -29,17 +29,21 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Fetch and index esa posts
+    /// Fetch new esa posts incrementally and index them
     #[command(after_help = "\
 Examples:
-  sae harvest myteam
-  sae harvest myteam --full")]
-    Harvest {
+  sae index myteam")]
+    Index {
         /// Team name
         team: String,
-        /// Re-fetch all posts (ignore sync state)
-        #[arg(long)]
-        full: bool,
+    },
+    /// Re-fetch all esa posts and rebuild the index from scratch
+    #[command(after_help = "\
+Examples:
+  sae rebuild myteam")]
+    Rebuild {
+        /// Team name
+        team: String,
     },
     /// Semantic search over indexed posts
     #[command(after_help = "\
@@ -159,8 +163,12 @@ enum ModelCommand {
     Download,
 }
 
+// Includes the deprecated `harvest` (split into `index`/`rebuild` in v0.3.0)
+// so `sae harvest` reaches clap as an unrecognized subcommand instead of being
+// silently rewritten to `sae search harvest` by the shorthand expander.
 const KNOWN_SUBCOMMANDS: &[&str] = &[
-    "harvest", "search", "get", "create", "update", "archive", "ship", "embed", "status", "model",
+    "index", "rebuild", "search", "get", "create", "update", "archive", "ship", "embed", "status",
+    "model", "harvest",
 ];
 const GLOBAL_FLAGS: &[&str] = &["--json"];
 
@@ -201,7 +209,8 @@ async fn run(cli: Cli, config: Config) -> Result<CommandOutput, SaeError> {
     }
     let sae = Sae::new(config);
     match cli.command {
-        Command::Harvest { team, full } => sae.harvest(&team, full).await,
+        Command::Index { team } => sae.index(&team).await,
+        Command::Rebuild { team } => sae.rebuild(&team).await,
         Command::Search { args } => sae.search(args),
         Command::Get {
             number,
@@ -321,7 +330,7 @@ mod tests {
     fn known_subcommand_not_expanded() {
         assert!(
             try_expand_shorthand(
-                &os(&["sae", "harvest", "myteam"]),
+                &os(&["sae", "index", "myteam"]),
                 KNOWN_SUBCOMMANDS,
                 GLOBAL_FLAGS
             )
@@ -414,11 +423,30 @@ mod tests {
         }
     }
 
-    // T-034: `sae harvest` (missing required arg) → clap error via helper
+    // T-034: `sae index` (missing required arg) → clap error via helper
     #[test]
-    fn harvest_missing_arg_is_clap_error() {
+    fn index_missing_arg_is_clap_error() {
+        let result = parse_cli_args(["sae", "index"]);
+        assert!(result.is_err(), "index without team should be clap error");
+    }
+
+    // T-034b: `sae rebuild` (missing required arg) → clap error via helper
+    #[test]
+    fn rebuild_missing_arg_is_clap_error() {
+        let result = parse_cli_args(["sae", "rebuild"]);
+        assert!(result.is_err(), "rebuild without team should be clap error");
+    }
+
+    // T-034c: `sae harvest` (deprecated in v0.3.0) must surface as a clap
+    // error so users see a migration hint, not a silent rewrite to
+    // `sae search harvest`. Guarded by KNOWN_SUBCOMMANDS keeping `harvest`.
+    #[test]
+    fn deprecated_harvest_not_rewritten_as_search() {
         let result = parse_cli_args(["sae", "harvest"]);
-        assert!(result.is_err(), "harvest without team should be clap error");
+        assert!(
+            result.is_err(),
+            "deprecated `harvest` must produce a clap error, not be rewritten as search"
+        );
     }
 
     // T-049: parse_cli_args(["sae", "query"]) → Command::Search (json=false) - regression
@@ -721,7 +749,7 @@ mod tests {
     #[test]
     fn all_subcommands_not_shorthand() {
         for cmd in [
-            "harvest", "get", "update", "ship", "archive", "embed", "status", "model",
+            "index", "rebuild", "get", "update", "ship", "archive", "embed", "status", "model",
         ] {
             let result = parse_cli_args(["sae", cmd]);
             assert!(
