@@ -163,9 +163,12 @@ enum ModelCommand {
     Download,
 }
 
+// Includes the deprecated `harvest` (split into `index`/`rebuild` in v0.3.0)
+// so `sae harvest` reaches clap as an unrecognized subcommand instead of being
+// silently rewritten to `sae search harvest` by the shorthand expander.
 const KNOWN_SUBCOMMANDS: &[&str] = &[
     "index", "rebuild", "search", "get", "create", "update", "archive", "ship", "embed", "status",
-    "model",
+    "model", "harvest",
 ];
 const GLOBAL_FLAGS: &[&str] = &["--json"];
 
@@ -432,6 +435,18 @@ mod tests {
     fn rebuild_missing_arg_is_clap_error() {
         let result = parse_cli_args(["sae", "rebuild"]);
         assert!(result.is_err(), "rebuild without team should be clap error");
+    }
+
+    // T-034c: `sae harvest` (deprecated in v0.3.0) must surface as a clap
+    // error so users see a migration hint, not a silent rewrite to
+    // `sae search harvest`. Guarded by KNOWN_SUBCOMMANDS keeping `harvest`.
+    #[test]
+    fn deprecated_harvest_not_rewritten_as_search() {
+        let result = parse_cli_args(["sae", "harvest"]);
+        assert!(
+            result.is_err(),
+            "deprecated `harvest` must produce a clap error, not be rewritten as search"
+        );
     }
 
     // T-049: parse_cli_args(["sae", "query"]) → Command::Search (json=false) - regression

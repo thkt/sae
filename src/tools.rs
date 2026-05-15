@@ -309,19 +309,23 @@ pub enum SaeError {
     Other(String),
 }
 
+/// Prefixes shared by the constructors below and [`SaeError::next_step`]
+/// lookup. Centralising them removes the implicit contract that constructor
+/// and lookup strings stay in sync by convention.
+const NO_DATA_PREFIX: &str = "No data for team ";
+const MODEL_NOT_FOUND_PREFIX: &str = "Model not found";
+
 impl SaeError {
-    /// Production sites MUST use this constructor (not `SaeError::Input(format!(...))`)
-    /// so the canonical prefix `next_step()` keys off stays in sync.
     pub(crate) fn input_no_data_for_team(team: &str) -> Self {
         Self::Input(format!(
-            "No data for team '{team}'. Run `sae index {team}` first."
+            "{NO_DATA_PREFIX}'{team}'. Run `sae index {team}` first."
         ))
     }
 
-    /// Production sites MUST use this constructor (not `SaeError::Input(...)`)
-    /// so the canonical prefix `next_step()` keys off stays in sync.
     pub(crate) fn input_model_not_found() -> Self {
-        Self::Input("Model not found. Run 'sae model download' first.".to_owned())
+        Self::Input(format!(
+            "{MODEL_NOT_FOUND_PREFIX}. Run 'sae model download' first."
+        ))
     }
 
     /// [`CliError::exit_code`] delegates here so the sysexits mapping is single-sourced.
@@ -365,10 +369,10 @@ impl SaeError {
     /// message back, which is fragile; the agent-facing template is unambiguous.
     pub(crate) fn next_step(&self) -> Option<&'static str> {
         match self {
-            Self::Input(s) if s.starts_with("No data for team ") => {
+            Self::Input(s) if s.starts_with(NO_DATA_PREFIX) => {
                 Some("Run `sae index <team>` to fetch posts.")
             }
-            Self::Input(s) if s.starts_with("Model not found") => {
+            Self::Input(s) if s.starts_with(MODEL_NOT_FOUND_PREFIX) => {
                 Some("Run `sae model download` to fetch the embedding model.")
             }
             Self::Config(ConfigError::NoTeamSpecified) => {
