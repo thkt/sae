@@ -13,20 +13,31 @@
 use amici::cli::exit_code::codes;
 use serde::Serialize;
 
-/// JSON-serializable error classification per ADR-0060.
+/// JSON-serializable error classification per ADR-0060 / ADR-0066 Group 2.
 ///
-/// Covers every sysexits code `SaeError` currently produces. `DATA_ERROR (65)`
-/// and `NOT_FOUND (66)` are absent because no sae operation maps to them today;
-/// they will be reconsidered when this type lifts into amici alongside yomu /
-/// recall (ADR-0060 Phase 3).
+/// `Internal` serializes as `"INTERNAL"` (numerically `EX_SOFTWARE` 70) per
+/// ADR-0066's Group 2 classification table — agent-facing JSON uses the
+/// concept name, not the sysexits label. `Unknown` (`104`) is the project
+/// extension reserved for catch-all paths; sae has no anyhow path today, so
+/// no `SaeError` variant routes here, but the slot is wired so future
+/// unclassified variants pin against ADR-0066. `DATA_ERROR (65)` and
+/// `NOT_FOUND (66)` are absent — `DATA_ERROR` will arrive with #115's full
+/// Group 2 alignment (FTS5 sanitize, query encoding); `NOT_FOUND` stays
+/// Group 1 (external fetch) territory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum ErrorCode {
     UsageError,
-    Software,
+    Internal,
     CantCreat,
     IoError,
     TempFailure,
+    /// Reserved per ADR-0066 Group 2 for catch-all paths. sae currently has
+    /// no anyhow-style fallback (all SaeError variants classify explicitly),
+    /// so no production site emits this. Kept in the enum to keep the JSON
+    /// contract stable when a future unclassifiable variant arrives.
+    #[allow(dead_code)]
+    Unknown,
 }
 
 impl ErrorCode {
@@ -35,10 +46,11 @@ impl ErrorCode {
     pub(crate) fn exit_code(self) -> u8 {
         match self {
             Self::UsageError => codes::USAGE,
-            Self::Software => codes::SOFTWARE,
+            Self::Internal => codes::INTERNAL,
             Self::CantCreat => codes::CANT_CREAT,
             Self::IoError => codes::IO_ERR,
             Self::TempFailure => codes::TEMP_FAIL,
+            Self::Unknown => codes::UNKNOWN,
         }
     }
 }
@@ -138,10 +150,11 @@ mod tests {
     fn error_code_serializes_screaming_snake_case() {
         let pairs = [
             (ErrorCode::UsageError, r#""USAGE_ERROR""#),
-            (ErrorCode::Software, r#""SOFTWARE""#),
+            (ErrorCode::Internal, r#""INTERNAL""#),
             (ErrorCode::CantCreat, r#""CANT_CREAT""#),
             (ErrorCode::IoError, r#""IO_ERROR""#),
             (ErrorCode::TempFailure, r#""TEMP_FAILURE""#),
+            (ErrorCode::Unknown, r#""UNKNOWN""#),
         ];
         for (code, expected) in pairs {
             let actual = serde_json::to_string(&code).unwrap();
@@ -156,10 +169,14 @@ mod tests {
     #[test]
     fn error_code_exit_code_matches_sysexits() {
         assert_eq!(ErrorCode::UsageError.exit_code(), 64);
-        assert_eq!(ErrorCode::Software.exit_code(), 70);
+        // Internal numerically aliases SOFTWARE (70) per ADR-0066; the rename
+        // is a JSON-contract change, not a numeric one.
+        assert_eq!(ErrorCode::Internal.exit_code(), 70);
         assert_eq!(ErrorCode::CantCreat.exit_code(), 73);
         assert_eq!(ErrorCode::IoError.exit_code(), 74);
         assert_eq!(ErrorCode::TempFailure.exit_code(), 75);
+        // Unknown is the ADR-0066 project-extension catch-all (104).
+        assert_eq!(ErrorCode::Unknown.exit_code(), 104);
     }
 
     // T-EN003: error_payload_omits_optional_next_step_when_none
