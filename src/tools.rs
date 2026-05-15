@@ -8,6 +8,8 @@ use amici::cli::exit_code::CliError;
 use amici::model::embedder::{DegradedReason, try_load_embedder_with};
 use amici::model::{ModelDownloadError, download_and_verify_model};
 use rurico::embed::{Artifacts, ModelId, cached_artifacts};
+use rurico::model_init::ModelInitError;
+use rurico::model_probe::ProbeError;
 
 use crate::client::{ClientError, EsaClient};
 use crate::commands;
@@ -134,24 +136,28 @@ impl Sae {
         let result = embed_with_spinners(
             pending,
             |_| {
-                let mut embed_err: Option<String> = None;
+                // Ok = typed probe variant; Err = fallback Display for the
+                // non-ProbeError path; None = callback never fired.
+                let mut captured: Option<Result<ProbeError, String>> = None;
                 match try_load_embedder_with(
                     || Ok::<_, Infallible>(Some(paths)),
                     |e| tracing::warn!(error = %e, "failed to delete corrupt model files"),
                     |e| {
-                        embed_err = Some(e.to_string());
+                        let display = e.to_string();
+                        captured = Some(extract_probe_error(e).ok_or(display));
                     },
                 ) {
                     Ok(e) => Ok(e),
                     Err(DegradedReason::BackendUnavailable) => {
                         Err(SaeError::Other("MLX backend is unavailable".to_owned()))
                     }
-                    Err(reason) => {
-                        let detail = embed_err.map(|e| format!(": {e}")).unwrap_or_default();
-                        Err(SaeError::Other(format!(
-                            "Model probe failed: {reason:?}{detail}"
-                        )))
-                    }
+                    Err(reason) => match captured {
+                        Some(Ok(probe)) => Err(SaeError::Probe(probe)),
+                        Some(Err(detail)) => Err(SaeError::Other(format!(
+                            "Model probe failed: {reason:?}: {detail}"
+                        ))),
+                        None => Err(SaeError::Other(format!("Model probe failed: {reason:?}"))),
+                    },
                 }
             },
             |r: &commands::embed_batch::EmbedAllResult| {
@@ -283,6 +289,10 @@ pub enum SaeError {
     Io(#[from] io::Error),
     #[error(transparent)]
     ModelDownload(#[from] ModelDownloadError),
+    /// Carries the typed `ProbeError` recovered from `ModelInitError`'s source
+    /// chain so [`Self::error_code`] can classify per-variant (ADR-0066 Group 2).
+    #[error(transparent)]
+    Probe(#[from] ProbeError),
     /// User action required (e.g., run harvest or model download first)
     #[error("{0}")]
     Input(String),
@@ -316,18 +326,26 @@ impl SaeError {
             Self::Json(_)
             | Self::Other(_)
             | Self::Client(ClientError::Api(_))
-            | Self::Sync(SyncError::Client(ClientError::Api(_))) => ErrorCode::Software,
+            | Self::Sync(SyncError::Client(ClientError::Api(_))) => ErrorCode::Internal,
             Self::Client(ClientError::Network(e))
             | Self::Sync(SyncError::Client(ClientError::Network(e)))
                 if e.is_decode() =>
             {
-                ErrorCode::Software
+                ErrorCode::Internal
             }
             Self::Io(_) => ErrorCode::IoError,
             Self::ModelDownload(ModelDownloadError::DownloadFailed(_)) => ErrorCode::TempFailure,
             Self::ModelDownload(
                 ModelDownloadError::BackendUnavailable | ModelDownloadError::ProbeFailed(_),
-            ) => ErrorCode::Software,
+            ) => ErrorCode::Internal,
+            // PROBE_EXIT_* (3–8) wire codes stay sealed inside ProbeError;
+            // only the sysexits classification reaches the process exit code.
+            Self::Probe(
+                ProbeError::HandlerNotInstalled
+                | ProbeError::ModelLoadFailed { .. }
+                | ProbeError::SetupRejected { .. },
+            ) => ErrorCode::Internal,
+            Self::Probe(ProbeError::SubprocessFailed(_)) => ErrorCode::IoError,
             // Remaining Client/Sync (Network connect/timeout, MaxRetries) are retry-eligible.
             // Explicit arms (no wildcard) so future amici variants force a compile-time review.
             Self::Client(_) | Self::Sync(_) => ErrorCode::TempFailure,
@@ -372,6 +390,7 @@ impl SaeError {
             | Self::Json(_)
             | Self::Io(_)
             | Self::ModelDownload(_)
+            | Self::Probe(_)
             | Self::Other(_) => None,
         }
     }
@@ -459,6 +478,25 @@ fn require_embed_model() -> Result<Artifacts, SaeError> {
     }
 }
 
+/// Reverse [`From<ProbeError> for ModelInitError`] so per-variant `ProbeError`
+/// routing in [`SaeError::error_code`] survives amici's collapse boundary.
+/// Returns `None` only when `Backend.source` carries a non-`ProbeError`
+/// payload — left open so a future amici/rurico change does not silently
+/// misclassify.
+fn extract_probe_error(init_err: ModelInitError) -> Option<ProbeError> {
+    match init_err {
+        ModelInitError::ModelCorrupt { reason } => Some(ProbeError::ModelLoadFailed { reason }),
+        ModelInitError::Backend {
+            source: Some(boxed),
+            ..
+        } => boxed.downcast::<ProbeError>().ok().map(|b| *b),
+        ModelInitError::Backend {
+            source: None,
+            message,
+        } => Some(ProbeError::SubprocessFailed(message)),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use amici::cli::exit_code::codes;
@@ -499,17 +537,17 @@ mod tests {
         );
     }
 
-    // T-241: Json variant maps to SOFTWARE (sysexits 70)
+    // T-241: Json variant maps to INTERNAL (sysexits 70)
     #[test]
-    fn exit_code_json_is_software() {
+    fn exit_code_json_is_internal() {
         let err: serde_json::Error = serde_json::from_str::<i32>("not json").unwrap_err();
-        assert_code(&SaeError::Json(err), codes::SOFTWARE);
+        assert_code(&SaeError::Json(err), codes::INTERNAL);
     }
 
-    // T-242: Other variant maps to SOFTWARE (sysexits 70)
+    // T-242: Other variant maps to INTERNAL (sysexits 70)
     #[test]
-    fn exit_code_other_is_software() {
-        assert_code(&SaeError::Other("unexpected".into()), codes::SOFTWARE);
+    fn exit_code_other_is_internal() {
+        assert_code(&SaeError::Other("unexpected".into()), codes::INTERNAL);
     }
 
     // T-243: Io variant maps to IO_ERR (sysexits 74)
@@ -527,12 +565,12 @@ mod tests {
         );
     }
 
-    // T-245: Client(Api) maps to SOFTWARE (sysexits 70) — non-retryable HTTP 4xx
+    // T-245: Client(Api) maps to INTERNAL (sysexits 70) — non-retryable HTTP 4xx
     #[test]
-    fn exit_code_client_api_is_software() {
+    fn exit_code_client_api_is_internal() {
         assert_code(
             &SaeError::Client(ClientError::Api("404 Not Found".into())),
-            codes::SOFTWARE,
+            codes::INTERNAL,
         );
     }
 
@@ -547,21 +585,21 @@ mod tests {
         );
     }
 
-    // T-304: ModelDownload(BackendUnavailable) maps to SOFTWARE (sysexits 70) — non-retryable hardware mismatch
+    // T-304: ModelDownload(BackendUnavailable) maps to INTERNAL (sysexits 70) — non-retryable hardware mismatch
     #[test]
-    fn exit_code_model_download_backend_unavailable_is_software() {
+    fn exit_code_model_download_backend_unavailable_is_internal() {
         assert_code(
             &SaeError::ModelDownload(ModelDownloadError::BackendUnavailable),
-            codes::SOFTWARE,
+            codes::INTERNAL,
         );
     }
 
-    // T-305: ModelDownload(ProbeFailed) maps to SOFTWARE (sysexits 70) — verification failure, retry won't help
+    // T-305: ModelDownload(ProbeFailed) maps to INTERNAL (sysexits 70) — verification failure, retry won't help
     #[test]
-    fn exit_code_model_download_probe_failed_is_software() {
+    fn exit_code_model_download_probe_failed_is_internal() {
         assert_code(
             &SaeError::ModelDownload(ModelDownloadError::ProbeFailed("hash mismatch".into())),
-            codes::SOFTWARE,
+            codes::INTERNAL,
         );
     }
 
@@ -583,12 +621,12 @@ mod tests {
         );
     }
 
-    // T-248: Sync(Client(Api)) maps to SOFTWARE (sysexits 70) — non-retryable HTTP 4xx
+    // T-248: Sync(Client(Api)) maps to INTERNAL (sysexits 70) — non-retryable HTTP 4xx
     #[test]
-    fn exit_code_sync_client_api_is_software() {
+    fn exit_code_sync_client_api_is_internal() {
         assert_code(
             &SaeError::Sync(SyncError::Client(ClientError::Api("404 Not Found".into()))),
-            codes::SOFTWARE,
+            codes::INTERNAL,
         );
     }
 
@@ -782,5 +820,113 @@ mod tests {
                 "Phase 2.1 returns empty Vec for {err:?}"
             );
         }
+    }
+
+    // T-326: every ProbeError variant routes per ADR-0066 Group 2
+    #[test]
+    fn exit_code_probe_variants_route_per_adr_0066() {
+        use rurico::model_probe::SetupReason;
+        let internal_cases = [
+            ProbeError::HandlerNotInstalled,
+            ProbeError::ModelLoadFailed {
+                reason: "weight tensor missing".into(),
+            },
+            ProbeError::SetupRejected {
+                reason: SetupReason::EnvIncomplete,
+            },
+            ProbeError::SetupRejected {
+                reason: SetupReason::CanonicalizeFailed,
+            },
+            ProbeError::SetupRejected {
+                reason: SetupReason::PathOutsideCache,
+            },
+            ProbeError::SetupRejected {
+                reason: SetupReason::CacheRootInvalid,
+            },
+        ];
+        for probe in internal_cases {
+            assert_code(&SaeError::Probe(probe), codes::INTERNAL);
+        }
+        assert_code(
+            &SaeError::Probe(ProbeError::SubprocessFailed(
+                "probe spawn failed: ENOENT".into(),
+            )),
+            codes::IO_ERR,
+        );
+    }
+
+    // T-330: PROBE_EXIT_* wire format (3-8) cannot leak through SaeError::exit_code.
+    // Wire codes encode rurico's internal IPC contract; surfacing them as the
+    // process exit code would confuse agents expecting sysexits classifications.
+    #[test]
+    fn exit_code_probe_setup_rejected_does_not_leak_wire_code() {
+        use rurico::model_probe::SetupReason;
+        let reason = SetupReason::PathOutsideCache;
+        assert_eq!(
+            reason.code(),
+            5,
+            "test premise: PathOutsideCache wire code is 5"
+        );
+        let err = SaeError::Probe(ProbeError::SetupRejected { reason });
+        assert_eq!(
+            err.exit_code(),
+            ExitCode::from(codes::INTERNAL),
+            "wire code 5 must be sealed; exit must be INTERNAL (70)"
+        );
+        assert_ne!(
+            err.exit_code(),
+            ExitCode::from(5),
+            "PROBE_EXIT_PATH_OUTSIDE_CACHE (5) must not leak as the process exit code"
+        );
+    }
+
+    // T-331: extract_probe_error recovers ModelLoadFailed from ModelCorrupt.
+    #[test]
+    fn extract_probe_error_model_corrupt_maps_to_model_load_failed() {
+        let init = ModelInitError::ModelCorrupt {
+            reason: "checksum mismatch".into(),
+        };
+        let probe = extract_probe_error(init).expect("ModelCorrupt yields ProbeError");
+        match probe {
+            ProbeError::ModelLoadFailed { reason } => assert_eq!(reason, "checksum mismatch"),
+            other => panic!("expected ModelLoadFailed, got {other:?}"),
+        }
+    }
+
+    // T-332: extract_probe_error recovers the typed variant from Backend.source
+    #[test]
+    fn extract_probe_error_backend_with_source_recovers_typed_variant() {
+        let init: ModelInitError = ProbeError::HandlerNotInstalled.into();
+        let probe = extract_probe_error(init).expect("Backend with source yields ProbeError");
+        assert!(
+            matches!(probe, ProbeError::HandlerNotInstalled),
+            "expected HandlerNotInstalled, got {probe:?}"
+        );
+    }
+
+    // T-333: extract_probe_error maps source-less Backend to SubprocessFailed
+    // (round-trips From<ProbeError> for ModelInitError on SubprocessFailed).
+    #[test]
+    fn extract_probe_error_backend_without_source_maps_to_subprocess_failed() {
+        let init: ModelInitError = ProbeError::SubprocessFailed("spawn failed".into()).into();
+        let probe = extract_probe_error(init).expect("Backend message yields ProbeError");
+        match probe {
+            ProbeError::SubprocessFailed(msg) => assert_eq!(msg, "spawn failed"),
+            other => panic!("expected SubprocessFailed, got {other:?}"),
+        }
+    }
+
+    // T-334: extract_probe_error returns None for non-ProbeError sources so
+    // the Sae::embed Other fallback runs instead of misclassifying as probe.
+    #[test]
+    fn extract_probe_error_backend_with_non_probe_source_returns_none() {
+        let init = ModelInitError::Backend {
+            message: "MLX kernel launch failed".into(),
+            source: Some(Box::new(io::Error::other("MLX kernel launch failed"))),
+        };
+        assert!(
+            extract_probe_error(init).is_none(),
+            "non-ProbeError source must fall through to None so the Other fallback runs"
+        );
     }
 }
