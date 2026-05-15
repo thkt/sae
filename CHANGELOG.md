@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- **BREAKING**: `sae harvest <team>` および `sae harvest <team> --full` を廃止し、
+  `sae index <team>`（増分）と `sae rebuild <team>`（全件再構築）の 2 サブコマンドに
+  分割。yomu / recall と命名を揃えるため。`--full` の発見性問題も解消する。
+  - 移行: `sae harvest myteam` → `sae index myteam`、
+    `sae harvest myteam --full` → `sae rebuild myteam`。
+  - エラーメッセージの誘導文言（`Run \`sae harvest <team>\` first.`）も
+    `Run \`sae index <team>\` first.` に更新。
+
 ## [0.2.0] - 2026-05-12
 
 ADR-0060 agent-friendly CLI envelope (Phase 1 + 2.1 + 2.2).

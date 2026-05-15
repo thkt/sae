@@ -55,19 +55,19 @@ where
     Ok((result.processed, result.budget_exhausted))
 }
 
-fn spawn_background_harvest(team: &str) {
+fn spawn_background_index(team: &str) {
     let Ok(exe) = env::current_exe() else {
-        tracing::warn!("background harvest skipped: current_exe() failed");
+        tracing::warn!("background index skipped: current_exe() failed");
         return;
     };
     if let Err(e) = Command::new(exe)
-        .args(["harvest", team])
+        .args(["index", team])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
     {
-        tracing::warn!(error = %e, "background harvest spawn failed");
+        tracing::warn!(error = %e, "background index spawn failed");
     }
 }
 
@@ -165,7 +165,7 @@ pub(crate) fn run_search(
     )?;
     const PREFETCH_TTL_SECS: u64 = 5 * 60;
     if !storage::sync_harvested_within(db.conn(), PREFETCH_TTL_SECS) {
-        spawn_background_harvest(team);
+        spawn_background_index(team);
     }
     Ok(output)
 }

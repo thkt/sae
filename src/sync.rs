@@ -174,7 +174,7 @@ pub async fn harvest(
 
     if gap_detected {
         progress_step(&[&format!(
-            "warning: gap detected — {} missing posts (run with --full to re-sync)",
+            "warning: gap detected — {} missing posts (run `sae rebuild {team}` to re-sync)",
             api_total - local_count
         )]);
         info!(

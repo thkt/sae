@@ -34,8 +34,11 @@ export ESA_ACCESS_TOKEN="your-token"
 ### 投稿の取得・検索
 
 ```bash
-# チームの投稿をインデックス
-sae harvest myteam
+# チームの投稿をインデックス（増分）
+sae index myteam
+
+# 全件再構築（差分追従が破綻したときなど）
+sae rebuild myteam
 
 # 検索（shorthand）
 sae "認証"
@@ -118,7 +121,7 @@ sae --json status
 | Code | 名前       | 意味             | 例                                                       | 推奨 retry  |
 | ---- | ---------- | ---------------- | -------------------------------------------------------- | ----------- |
 | 0    | SUCCESS    | 正常終了         |                                                          |             |
-| 64   | USAGE      | 入力エラー       | 不明なチーム、トークン未設定、未 harvest                 | しない      |
+| 64   | USAGE      | 入力エラー       | 不明なチーム、トークン未設定、未 index 実行              | しない      |
 | 70   | SOFTWARE   | 内部エラー       | JSON parse 失敗、想定外の例外、model 検証失敗            | しない      |
 | 73   | CANT_CREAT | データ層エラー   | DB open 失敗、ファイル作成不可                           | 状況による  |
 | 74   | IO_ERR     | I/O エラー       | ファイル読み書き失敗                                     | 状況による  |

@@ -119,7 +119,15 @@ impl Sae {
         &self.config
     }
 
-    pub async fn harvest(&self, team: &str, full: bool) -> Result<CommandOutput, SaeError> {
+    pub async fn index(&self, team: &str) -> Result<CommandOutput, SaeError> {
+        self.fetch_and_index(team, false).await
+    }
+
+    pub async fn rebuild(&self, team: &str) -> Result<CommandOutput, SaeError> {
+        self.fetch_and_index(team, true).await
+    }
+
+    async fn fetch_and_index(&self, team: &str, full: bool) -> Result<CommandOutput, SaeError> {
         let (team, client) = resolve_client(&self.config, Some(team))?;
         let db_path = self.config.team_db_path(team)?;
         let db = Db::open(&db_path)?;
@@ -293,7 +301,7 @@ pub enum SaeError {
     /// chain so [`Self::error_code`] can classify per-variant (ADR-0066 Group 2).
     #[error(transparent)]
     Probe(#[from] ProbeError),
-    /// User action required (e.g., run harvest or model download first)
+    /// User action required (e.g., run `sae index` or `sae model download` first)
     #[error("{0}")]
     Input(String),
     /// Operational failure (e.g., model load, embedding, download)
@@ -306,7 +314,7 @@ impl SaeError {
     /// so the canonical prefix `next_step()` keys off stays in sync.
     pub(crate) fn input_no_data_for_team(team: &str) -> Self {
         Self::Input(format!(
-            "No data for team '{team}'. Run `sae harvest {team}` first."
+            "No data for team '{team}'. Run `sae index {team}` first."
         ))
     }
 
@@ -352,13 +360,13 @@ impl SaeError {
         }
     }
 
-    /// Returns template strings (`Run \`sae harvest <team>\``).
-    /// Concrete values (`Run \`sae harvest gaji\``) would require parsing the
+    /// Returns template strings (`Run \`sae index <team>\``).
+    /// Concrete values (`Run \`sae index gaji\``) would require parsing the
     /// message back, which is fragile; the agent-facing template is unambiguous.
     pub(crate) fn next_step(&self) -> Option<&'static str> {
         match self {
             Self::Input(s) if s.starts_with("No data for team ") => {
-                Some("Run `sae harvest <team>` to fetch posts.")
+                Some("Run `sae index <team>` to fetch posts.")
             }
             Self::Input(s) if s.starts_with("Model not found") => {
                 Some("Run `sae model download` to fetch the embedding model.")
@@ -371,8 +379,8 @@ impl SaeError {
                 Some("Set `ESA_ACCESS_TOKEN=<token>` and retry.")
             }
             // Direct API commands (get/create/update/archive/ship) bubble
-            // ClientError::MaxRetries as Self::Client(_); harvest wraps it
-            // under Sync. Both share the same retry guidance.
+            // ClientError::MaxRetries as Self::Client(_); the index/rebuild
+            // path wraps it under Sync. Both share the same retry guidance.
             Self::Client(ClientError::MaxRetries(_))
             | Self::Sync(SyncError::Client(ClientError::MaxRetries(_))) => {
                 Some("Retry after the rate-limit window resets.")
@@ -442,9 +450,9 @@ pub(crate) fn require_db(config: &Config, team: &str) -> Result<Db, SaeError> {
 }
 
 /// Best-effort DB open for mutation commands. Returns `None` when the team
-/// cannot be resolved, the DB file does not yet exist (no prior harvest), or
-/// the DB fails to open — letting the API call proceed regardless. Only the
-/// open failure logs a warning; the other paths are silent.
+/// cannot be resolved, the DB file does not yet exist (no prior `sae index`
+/// run), or the DB fails to open — letting the API call proceed regardless.
+/// Only the open failure logs a warning; the other paths are silent.
 pub(crate) fn try_open_team_db(config: &Config, team: Option<&str>) -> Option<Db> {
     let team = config.resolve_team(team).ok()?;
     let db_path = config.team_db_path(team).ok()?;
@@ -671,13 +679,13 @@ mod tests {
         }
     }
 
-    // T-310: input_no_data_for_team_pins_next_step_harvest_hint
+    // T-310: input_no_data_for_team_pins_next_step_index_hint
     #[test]
-    fn input_no_data_for_team_pins_next_step_harvest_hint() {
+    fn input_no_data_for_team_pins_next_step_index_hint() {
         let err = SaeError::input_no_data_for_team("gaji");
         assert_eq!(
             err.next_step(),
-            Some("Run `sae harvest <team>` to fetch posts."),
+            Some("Run `sae index <team>` to fetch posts."),
             "constructor and next_step must stay in sync"
         );
     }
@@ -735,7 +743,8 @@ mod tests {
 
     // T-325: next_step_client_max_retries_matches_sync_variant
     // Direct API commands (get/create/update/archive/ship) surface MaxRetries
-    // as Self::Client; harvest wraps it under Sync. Both must give the same hint.
+    // as Self::Client; the index/rebuild path wraps it under Sync. Both must
+    // give the same hint.
     #[test]
     fn next_step_client_max_retries_matches_sync_variant() {
         let err = SaeError::Client(ClientError::MaxRetries(5));
