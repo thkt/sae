@@ -15,15 +15,9 @@ use serde::Serialize;
 
 /// JSON-serializable error classification per ADR-0060 / ADR-0066 Group 2.
 ///
-/// `Internal` serializes as `"INTERNAL"` (numerically `EX_SOFTWARE` 70) per
-/// ADR-0066's Group 2 classification table — agent-facing JSON uses the
-/// concept name, not the sysexits label. `Unknown` (`104`) is the project
-/// extension reserved for catch-all paths; sae has no anyhow path today, so
-/// no `SaeError` variant routes here, but the slot is wired so future
-/// unclassified variants pin against ADR-0066. `DATA_ERROR (65)` and
-/// `NOT_FOUND (66)` are absent — `DATA_ERROR` will arrive with #115's full
-/// Group 2 alignment (FTS5 sanitize, query encoding); `NOT_FOUND` stays
-/// Group 1 (external fetch) territory.
+/// `Internal` serializes as `"INTERNAL"` (numerically `EX_SOFTWARE` 70) so
+/// agent-facing JSON uses the concept name, not the sysexits label.
+/// `Unknown` (`104`) is the project extension reserved for catch-all paths.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum ErrorCode {
@@ -32,10 +26,6 @@ pub(crate) enum ErrorCode {
     CantCreat,
     IoError,
     TempFailure,
-    /// Reserved per ADR-0066 Group 2 for catch-all paths. sae currently has
-    /// no anyhow-style fallback (all SaeError variants classify explicitly),
-    /// so no production site emits this. Kept in the enum to keep the JSON
-    /// contract stable when a future unclassifiable variant arrives.
     #[allow(dead_code)]
     Unknown,
 }
@@ -169,13 +159,10 @@ mod tests {
     #[test]
     fn error_code_exit_code_matches_sysexits() {
         assert_eq!(ErrorCode::UsageError.exit_code(), 64);
-        // Internal numerically aliases SOFTWARE (70) per ADR-0066; the rename
-        // is a JSON-contract change, not a numeric one.
         assert_eq!(ErrorCode::Internal.exit_code(), 70);
         assert_eq!(ErrorCode::CantCreat.exit_code(), 73);
         assert_eq!(ErrorCode::IoError.exit_code(), 74);
         assert_eq!(ErrorCode::TempFailure.exit_code(), 75);
-        // Unknown is the ADR-0066 project-extension catch-all (104).
         assert_eq!(ErrorCode::Unknown.exit_code(), 104);
     }
 

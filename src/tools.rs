@@ -136,34 +136,27 @@ impl Sae {
         let result = embed_with_spinners(
             pending,
             |_| {
-                let mut probe_err: Option<ProbeError> = None;
-                let mut probe_detail: Option<String> = None;
+                // Ok = typed probe variant; Err = fallback Display for the
+                // non-ProbeError path; None = callback never fired.
+                let mut captured: Option<Result<ProbeError, String>> = None;
                 match try_load_embedder_with(
                     || Ok::<_, Infallible>(Some(paths)),
                     |e| tracing::warn!(error = %e, "failed to delete corrupt model files"),
                     |e| {
-                        // Capture Display before move so the non-ProbeError
-                        // path (e.g. MLX kernel failures inside Embedder::new)
-                        // still surfaces the underlying detail to the user.
                         let display = e.to_string();
-                        probe_err = extract_probe_error(e);
-                        if probe_err.is_none() {
-                            probe_detail = Some(display);
-                        }
+                        captured = Some(extract_probe_error(e).ok_or(display));
                     },
                 ) {
                     Ok(e) => Ok(e),
                     Err(DegradedReason::BackendUnavailable) => {
                         Err(SaeError::Other("MLX backend is unavailable".to_owned()))
                     }
-                    Err(reason) => match probe_err {
-                        Some(probe) => Err(SaeError::Probe(probe)),
-                        None => {
-                            let detail = probe_detail.map(|d| format!(": {d}")).unwrap_or_default();
-                            Err(SaeError::Other(format!(
-                                "Model probe failed: {reason:?}{detail}"
-                            )))
-                        }
+                    Err(reason) => match captured {
+                        Some(Ok(probe)) => Err(SaeError::Probe(probe)),
+                        Some(Err(detail)) => Err(SaeError::Other(format!(
+                            "Model probe failed: {reason:?}: {detail}"
+                        ))),
+                        None => Err(SaeError::Other(format!("Model probe failed: {reason:?}"))),
                     },
                 }
             },
@@ -296,10 +289,8 @@ pub enum SaeError {
     Io(#[from] io::Error),
     #[error(transparent)]
     ModelDownload(#[from] ModelDownloadError),
-    /// Probe subprocess failure surfaced through `try_load_embedder_with`'s
-    /// `ModelInitError` source chain. Carries the original `rurico::ProbeError`
-    /// so `error_code()` can classify per-variant (ADR-0066 Group 2: 3 variants
-    /// route to INTERNAL, `SubprocessFailed` routes to IO_ERROR).
+    /// Carries the typed `ProbeError` recovered from `ModelInitError`'s source
+    /// chain so [`Self::error_code`] can classify per-variant (ADR-0066 Group 2).
     #[error(transparent)]
     Probe(#[from] ProbeError),
     /// User action required (e.g., run harvest or model download first)
@@ -347,13 +338,13 @@ impl SaeError {
             Self::ModelDownload(
                 ModelDownloadError::BackendUnavailable | ModelDownloadError::ProbeFailed(_),
             ) => ErrorCode::Internal,
-            // ProbeError per-variant routing per ADR-0066 Group 2. The raw
-            // PROBE_EXIT_* (3–8) wire codes from rurico stay sealed inside
-            // ProbeError; only the classified sysexits value reaches the
-            // process exit code.
-            Self::Probe(ProbeError::HandlerNotInstalled)
-            | Self::Probe(ProbeError::ModelLoadFailed { .. })
-            | Self::Probe(ProbeError::SetupRejected { .. }) => ErrorCode::Internal,
+            // PROBE_EXIT_* (3–8) wire codes stay sealed inside ProbeError;
+            // only the sysexits classification reaches the process exit code.
+            Self::Probe(
+                ProbeError::HandlerNotInstalled
+                | ProbeError::ModelLoadFailed { .. }
+                | ProbeError::SetupRejected { .. },
+            ) => ErrorCode::Internal,
             Self::Probe(ProbeError::SubprocessFailed(_)) => ErrorCode::IoError,
             // Remaining Client/Sync (Network connect/timeout, MaxRetries) are retry-eligible.
             // Explicit arms (no wildcard) so future amici variants force a compile-time review.
@@ -390,10 +381,7 @@ impl SaeError {
                 Some("Retry `sae model download`; the failure is transient.")
             }
             // Explicit catch-all arms per variant. Adding a new SaeError variant
-            // must force a compile-time review (no wildcard). Probe failures
-            // are unactionable from the agent's side (the host binary needs a
-            // fix or the model artifacts need re-download), so no hint is
-            // emitted — the error message itself carries the diagnosis.
+            // must force a compile-time review (no wildcard).
             Self::Input(_)
             | Self::Config(_)
             | Self::Client(_)
@@ -490,22 +478,11 @@ fn require_embed_model() -> Result<Artifacts, SaeError> {
     }
 }
 
-/// Recover the originating [`ProbeError`] from a [`ModelInitError`].
-///
-/// `try_load_embedder_with` collapses every probe failure into one of two
-/// `ModelInitError` variants but preserves the typed source on the chain via
-/// [`rurico::model_init::ModelInitError::backend`]. This walker reverses the
-/// collapse so `SaeError::error_code` can route per ADR-0066 Group 2.
-///
-/// | `ModelInitError`        | Source            | Returned `ProbeError`              |
-/// | ----------------------- | ----------------- | ---------------------------------- |
-/// | `ModelCorrupt { reason }` | (none)          | `ModelLoadFailed { reason }`       |
-/// | `Backend { source: Some }` | downcastable  | `HandlerNotInstalled` / `SetupRejected` |
-/// | `Backend { source: None }` | (none)         | `SubprocessFailed(message)`        |
-///
-/// Returns `None` only when `Backend { source: Some }` carries a non-`ProbeError`
-/// payload — a path that does not exist today in rurico but is left open so a
-/// future amici/rurico change does not silently misclassify.
+/// Reverse [`From<ProbeError> for ModelInitError`] so per-variant `ProbeError`
+/// routing in [`SaeError::error_code`] survives amici's collapse boundary.
+/// Returns `None` only when `Backend.source` carries a non-`ProbeError`
+/// payload — left open so a future amici/rurico change does not silently
+/// misclassify.
 fn extract_probe_error(init_err: ModelInitError) -> Option<ProbeError> {
     match init_err {
         ModelInitError::ModelCorrupt { reason } => Some(ProbeError::ModelLoadFailed { reason }),
@@ -560,17 +537,14 @@ mod tests {
         );
     }
 
-    // T-241: Json variant maps to INTERNAL (sysexits 70, ADR-0066 Group 2)
+    // T-241: Json variant maps to INTERNAL (sysexits 70)
     #[test]
     fn exit_code_json_is_internal() {
         let err: serde_json::Error = serde_json::from_str::<i32>("not json").unwrap_err();
         assert_code(&SaeError::Json(err), codes::INTERNAL);
     }
 
-    // T-242: Other variant maps to INTERNAL (sysexits 70, ADR-0066 Group 2).
-    // Other carries model-related operational failures (MLX backend, probe,
-    // batch embedding, model-cache lookup) — all classified as "model
-    // artifact 不整合" per ADR-0066.
+    // T-242: Other variant maps to INTERNAL (sysexits 70)
     #[test]
     fn exit_code_other_is_internal() {
         assert_code(&SaeError::Other("unexpected".into()), codes::INTERNAL);
@@ -848,53 +822,31 @@ mod tests {
         }
     }
 
-    // T-326: Probe(HandlerNotInstalled) → INTERNAL (70).
-    // Host bin forgot to call `rurico::handle_probe_if_needed()` — an invariant
-    // violation in the sae binary itself, not retryable by the agent.
+    // T-326: every ProbeError variant routes per ADR-0066 Group 2
     #[test]
-    fn exit_code_probe_handler_not_installed_is_internal() {
-        assert_code(
-            &SaeError::Probe(ProbeError::HandlerNotInstalled),
-            codes::INTERNAL,
-        );
-    }
-
-    // T-327: Probe(ModelLoadFailed) → INTERNAL (70).
-    // Model artifact 不整合 (ADR-0066 Group 2).
-    #[test]
-    fn exit_code_probe_model_load_failed_is_internal() {
-        assert_code(
-            &SaeError::Probe(ProbeError::ModelLoadFailed {
-                reason: "weight tensor missing".into(),
-            }),
-            codes::INTERNAL,
-        );
-    }
-
-    // T-328: Probe(SetupRejected) → INTERNAL (70).
-    // env / path invariant violation in the probe child setup phase.
-    #[test]
-    fn exit_code_probe_setup_rejected_is_internal() {
+    fn exit_code_probe_variants_route_per_adr_0066() {
         use rurico::model_probe::SetupReason;
-        for reason in [
-            SetupReason::EnvIncomplete,
-            SetupReason::CanonicalizeFailed,
-            SetupReason::PathOutsideCache,
-            SetupReason::CacheRootInvalid,
-        ] {
-            assert_code(
-                &SaeError::Probe(ProbeError::SetupRejected { reason }),
-                codes::INTERNAL,
-            );
+        let internal_cases = [
+            ProbeError::HandlerNotInstalled,
+            ProbeError::ModelLoadFailed {
+                reason: "weight tensor missing".into(),
+            },
+            ProbeError::SetupRejected {
+                reason: SetupReason::EnvIncomplete,
+            },
+            ProbeError::SetupRejected {
+                reason: SetupReason::CanonicalizeFailed,
+            },
+            ProbeError::SetupRejected {
+                reason: SetupReason::PathOutsideCache,
+            },
+            ProbeError::SetupRejected {
+                reason: SetupReason::CacheRootInvalid,
+            },
+        ];
+        for probe in internal_cases {
+            assert_code(&SaeError::Probe(probe), codes::INTERNAL);
         }
-    }
-
-    // T-329: Probe(SubprocessFailed) → IO_ERR (74).
-    // Subprocess spawn / wait / pipe IO failure — distinct from
-    // ModelLoadFailed because the load itself never ran. Sysexits classifies
-    // this as IO_ERROR.
-    #[test]
-    fn exit_code_probe_subprocess_failed_is_io_err() {
         assert_code(
             &SaeError::Probe(ProbeError::SubprocessFailed(
                 "probe spawn failed: ENOENT".into(),
@@ -904,11 +856,8 @@ mod tests {
     }
 
     // T-330: PROBE_EXIT_* wire format (3-8) cannot leak through SaeError::exit_code.
-    // The raw probe-child exit codes encode rurico's internal IPC contract;
-    // a parent that exits with those numbers would confuse downstream agents
-    // expecting sysexits classifications. This test pins that even when the
-    // ProbeError carries a SetupReason whose `code()` is 5, the wrapping
-    // SaeError emits 70 (INTERNAL), not 5.
+    // Wire codes encode rurico's internal IPC contract; surfacing them as the
+    // process exit code would confuse agents expecting sysexits classifications.
     #[test]
     fn exit_code_probe_setup_rejected_does_not_leak_wire_code() {
         use rurico::model_probe::SetupReason;
@@ -944,8 +893,7 @@ mod tests {
         }
     }
 
-    // T-332: extract_probe_error walks the source chain to recover the
-    // original ProbeError variant from ModelInitError::Backend.
+    // T-332: extract_probe_error recovers the typed variant from Backend.source
     #[test]
     fn extract_probe_error_backend_with_source_recovers_typed_variant() {
         let init: ModelInitError = ProbeError::HandlerNotInstalled.into();
@@ -956,10 +904,8 @@ mod tests {
         );
     }
 
-    // T-333: extract_probe_error maps source-less Backend to SubprocessFailed.
-    // From<ProbeError>::From routes SubprocessFailed → Backend { source: None }
-    // (the only variant whose payload is a bare String); the walker must
-    // round-trip that back to SubprocessFailed using the Backend.message.
+    // T-333: extract_probe_error maps source-less Backend to SubprocessFailed
+    // (round-trips From<ProbeError> for ModelInitError on SubprocessFailed).
     #[test]
     fn extract_probe_error_backend_without_source_maps_to_subprocess_failed() {
         let init: ModelInitError = ProbeError::SubprocessFailed("spawn failed".into()).into();
@@ -970,11 +916,8 @@ mod tests {
         }
     }
 
-    // T-334: extract_probe_error returns None for non-ProbeError sources.
-    // Backend can carry MLX-layer errors from Embedder::new that are not
-    // ProbeError instances. The walker must fall through so the Sae::embed
-    // fallback emits SaeError::Other with the underlying detail preserved
-    // (rather than misclassifying the error as a probe failure).
+    // T-334: extract_probe_error returns None for non-ProbeError sources so
+    // the Sae::embed Other fallback runs instead of misclassifying as probe.
     #[test]
     fn extract_probe_error_backend_with_non_probe_source_returns_none() {
         let init = ModelInitError::Backend {
