@@ -118,3 +118,37 @@ fn help_with_json_exits_success_with_help_text() {
         "help text should land on stdout; got: {stdout}"
     );
 }
+
+// T-CI005: malformed `--after` value exits 65 (DATA_ERROR) with
+// `error.code = "DATA_ERROR"` per ADR-0066 Group 2 baseline.
+// Pins the binary-side contract: process-boundary exit code and JSON
+// envelope code both reach the consumer for the new DATA_ERROR path.
+#[test]
+fn malformed_date_with_json_emits_data_error_envelope() {
+    let dir = tempdir().unwrap();
+    let output = sae_command(dir.path())
+        .args(["--json", "search", "test", "--after", "2025-xx-xx"])
+        .output()
+        .expect("failed to spawn sae binary");
+
+    assert_eq!(
+        output.status.code(),
+        Some(65),
+        "exit code must be 65 (DATA_ERROR); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let env: serde_json::Value = stderr
+        .lines()
+        .find_map(|line| serde_json::from_str(line).ok())
+        .unwrap_or_else(|| panic!("no JSON line on stderr; got: {stderr}"));
+    assert_eq!(env["error"]["code"], "DATA_ERROR");
+    assert_eq!(env["error"]["retryable"], false);
+    let message = env["error"]["message"]
+        .as_str()
+        .expect("error.message must be a string");
+    assert!(
+        message.contains("Invalid date"),
+        "message must describe the date parse failure; got: {message}"
+    );
+}

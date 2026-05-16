@@ -16,6 +16,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `sae harvest myteam --full` → `sae rebuild myteam`。
   - エラーメッセージの誘導文言（`Run \`sae harvest <team>\` first.`）も
     `Run \`sae index <team>\` first.` に更新。
+- **BREAKING**: ADR-0066 Group 2 baseline に整列。`--json` の `error.code` と
+  プロセス exit code が以下のように変化する（amici #102 で `DATA_ERROR` (65)
+  baseline 追加を受けて、sae 側 routing を整理）。
+  - `--after` / `--before` の日付形式不正 (`YYYY-MM-DD` ではない、または
+    UTC 変換失敗): `code: "USAGE_ERROR"` (exit 64) → `code: "DATA_ERROR"`
+    (exit 65)。
+  - 分類不能な内部失敗 (`SaeError::Other`、分類されない catch-all):
+    `code: "INTERNAL"` (exit 70) → `code: "UNKNOWN"` (exit 104)。
+    分類済み `INTERNAL` (70) と区別する ADR-0066 L136 の意図に合わせる。
+  - 公開 API: `SaeError::Input` を `SaeError::InputUsage` / `SaeError::InputData`
+    に分割 (USAGE_ERROR と DATA_ERROR の責務分離)。`SaeError` は `lib.rs` から
+    `pub use` されており、`Input` variant を pattern match で参照していた
+    downstream crate はコンパイルエラーになる (現状 0 件)。同時に
+    `#[non_exhaustive]` を付与し、以後の variant 追加は非破壊変更となる。
 
 ## [0.2.0] - 2026-05-12
 
