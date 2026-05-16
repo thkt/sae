@@ -155,6 +155,29 @@ Examples:
         #[command(subcommand)]
         command: ModelCommand,
     },
+    /// Hidden test seam: force a `SaeError::Other` so
+    /// `tests/cli_integration.rs` can pin the UNKNOWN (104) envelope on a
+    /// hermetic process spawn (#127 OPS-005). Compiled only with
+    /// `--features test-support`; the production binary built with
+    /// `cargo install` never carries this variant.
+    #[cfg(feature = "test-support")]
+    #[command(name = "__test_force_unknown", hide = true)]
+    TestForceUnknown,
+    /// Hidden test seam: force `SaeError::BackendUnavailable` so
+    /// `tests/cli_integration.rs` can pin the INTERNAL (70) envelope for the
+    /// MLX backend missing path on a hermetic spawn (#127 CHX-001).
+    /// `test-support` feature only.
+    #[cfg(feature = "test-support")]
+    #[command(name = "__test_force_backend_unavailable", hide = true)]
+    TestForceBackendUnavailable,
+    /// Hidden test seam: force `SaeError::Internal` so
+    /// `tests/cli_integration.rs` can pin the INTERNAL (70) envelope for the
+    /// programmer-detectable invariant-violation path (e.g., embedder count
+    /// mismatch at `embed_batch.rs::embed_one_batch`) on a hermetic spawn
+    /// (#127 CHX-001 audit follow-up). `test-support` feature only.
+    #[cfg(feature = "test-support")]
+    #[command(name = "__test_force_internal", hide = true)]
+    TestForceInternal,
 }
 
 #[derive(Debug, Subcommand)]
@@ -166,9 +189,25 @@ enum ModelCommand {
 // Includes the deprecated `harvest` (split into `index`/`rebuild` in v0.3.0)
 // so `sae harvest` reaches clap as an unrecognized subcommand instead of being
 // silently rewritten to `sae search harvest` by the shorthand expander.
+// `__test_force_unknown` is the hidden test seam (#127 OPS-005); listing it
+// here keeps the production binary from rewriting it to `sae search
+// __test_force_unknown` so users see clap's "unrecognized subcommand" error.
 const KNOWN_SUBCOMMANDS: &[&str] = &[
-    "index", "rebuild", "search", "get", "create", "update", "archive", "ship", "embed", "status",
-    "model", "harvest",
+    "index",
+    "rebuild",
+    "search",
+    "get",
+    "create",
+    "update",
+    "archive",
+    "ship",
+    "embed",
+    "status",
+    "model",
+    "harvest",
+    "__test_force_unknown",
+    "__test_force_backend_unavailable",
+    "__test_force_internal",
 ];
 const GLOBAL_FLAGS: &[&str] = &["--json"];
 
@@ -231,6 +270,16 @@ async fn run(cli: Cli, config: Config) -> Result<CommandOutput, SaeError> {
             dry_run,
         } => sae.ship(number, team.as_deref(), dry_run).await,
         Command::Status { team } => sae.status(team.as_deref()),
+        #[cfg(feature = "test-support")]
+        Command::TestForceUnknown => Err(SaeError::Other(
+            "synthetic UNKNOWN for cli_integration test (test-support feature)".to_owned(),
+        )),
+        #[cfg(feature = "test-support")]
+        Command::TestForceBackendUnavailable => Err(SaeError::BackendUnavailable),
+        #[cfg(feature = "test-support")]
+        Command::TestForceInternal => Err(SaeError::Internal(
+            "synthetic INTERNAL for cli_integration test (test-support feature)".to_owned(),
+        )),
         Command::Model { .. } => unreachable!("handled before Sae::new()"),
     }
 }
@@ -529,6 +578,12 @@ mod tests {
     fn help_output_contains_examples() {
         let cmd = Cli::command();
         for sub in cmd.get_subcommands() {
+            // Hidden subcommands (e.g. `__test_force_unknown` under
+            // `test-support`) intentionally have no Examples — they are not
+            // user-facing.
+            if sub.is_hide_set() {
+                continue;
+            }
             let after_help = subcommand_after_help(sub.get_name());
             assert!(
                 after_help.contains("Examples"),

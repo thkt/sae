@@ -156,14 +156,22 @@ impl Sae {
                     },
                 ) {
                     Ok(e) => Ok(e),
-                    Err(DegradedReason::BackendUnavailable) => {
-                        Err(SaeError::Other("MLX backend is unavailable".to_owned()))
-                    }
+                    // Mirrors `ModelDownload(BackendUnavailable)` routing via
+                    // `SaeError::BackendUnavailable` so embed and model download
+                    // surface the same INTERNAL signal for hardware mismatch
+                    // (#127 CHX-001; was `Other` → UNKNOWN before).
+                    Err(DegradedReason::BackendUnavailable) => Err(SaeError::BackendUnavailable),
                     Err(reason) => match captured {
                         Some(Ok(probe)) => Err(SaeError::Probe(probe)),
+                        // Other (UNKNOWN): `extract_probe_error` returned a non-`ProbeError`
+                        // payload that we surfaced via `Display`. No typed variant exists
+                        // yet for the remaining `DegradedReason` shapes coming from amici.
                         Some(Err(detail)) => Err(SaeError::Other(format!(
                             "Model probe failed: {reason:?}: {detail}"
                         ))),
+                        // Other (UNKNOWN): probe callback never fired — amici returned a
+                        // `DegradedReason` without invoking the per-error hook. Genuine
+                        // unclassified path.
                         None => Err(SaeError::Other(format!("Model probe failed: {reason:?}"))),
                     },
                 }
@@ -177,6 +185,9 @@ impl Sae {
                     |texts| {
                         embedder
                             .embed_documents_batch(texts)
+                            // Other (UNKNOWN): embedder's runtime error is an opaque
+                            // `anyhow::Error` (no typed variant from amici/rurico).
+                            // Promoting requires upstream type surface first.
                             .map_err(|e| SaeError::Other(format!("Batch embedding failed: {e}")))
                     },
                     |n| update(&format!("Embedding... {n}/{pending} chunks")),
@@ -310,6 +321,18 @@ pub enum SaeError {
     /// Maps to `DATA_ERROR` (sysexits 65) per ADR-0066 Group 2.
     #[error("{0}")]
     InputData(String),
+    /// MLX backend missing in the runtime hardware (e.g., running on a host
+    /// without Apple Silicon). Maps to `INTERNAL` (sysexits 70) so `sae embed`
+    /// and `sae model download` surface the same hardware-mismatch signal
+    /// (was split between 104 and 70 before #127 CHX-001).
+    #[error("MLX backend is unavailable")]
+    BackendUnavailable,
+    /// Programmer-detectable invariant violation (e.g., embedder returned a
+    /// vector count that does not match the requested batch). Maps to
+    /// `INTERNAL` (sysexits 70) so agents distinguish bug signals from the
+    /// `anyhow`-swallow `UNKNOWN` (104) path per ADR-0066 L136 (#127 CHX-001).
+    #[error("{0}")]
+    Internal(String),
     /// Operational failure with no classified variant. Maps to `UNKNOWN`
     /// (104) so the `anyhow`-style catch-all is distinguishable from genuine
     /// `INTERNAL` (70) classifications per ADR-0066 L136.
@@ -322,6 +345,13 @@ pub enum SaeError {
 /// and lookup strings stay in sync by convention.
 const NO_DATA_PREFIX: &str = "No data for team ";
 const MODEL_NOT_FOUND_PREFIX: &str = "Model not found";
+
+/// Shared `next_step` hint for both `SaeError::BackendUnavailable` (embed
+/// path) and `SaeError::ModelDownload(ModelDownloadError::BackendUnavailable)`
+/// (model download path). Lives as a single const so the unit tests, the
+/// integration test, and the production arm cannot drift.
+const BACKEND_UNAVAILABLE_HINT: &str =
+    "Install the MLX backend (Apple Silicon required), or pass `--no-embed` for FTS-only search.";
 
 impl SaeError {
     pub(crate) fn input_no_data_for_team(team: &str) -> Self {
@@ -358,6 +388,13 @@ impl SaeError {
             Self::ModelDownload(
                 ModelDownloadError::BackendUnavailable | ModelDownloadError::ProbeFailed(_),
             ) => ErrorCode::Internal,
+            // Mirrors `ModelDownload(BackendUnavailable)` so the embed path and
+            // model-download path agree on hardware-mismatch routing (#127 CHX-001).
+            Self::BackendUnavailable => ErrorCode::Internal,
+            // Programmer-detectable invariant violation (embedder bug, etc.).
+            // Routed to `INTERNAL` so it stays distinguishable from anyhow-swallow
+            // `Other(=UNKNOWN)` per ADR-0066 L136 (#127).
+            Self::Internal(_) => ErrorCode::Internal,
             // PROBE_EXIT_* (3–8) wire codes stay sealed inside ProbeError;
             // only the sysexits classification reaches the process exit code.
             Self::Probe(
@@ -403,6 +440,13 @@ impl SaeError {
             Self::ModelDownload(ModelDownloadError::DownloadFailed(_)) => {
                 Some("Retry `sae model download`; the failure is transient.")
             }
+            // Mirrors `BackendUnavailable` below so both `sae embed` and
+            // `sae model download` surface the same actionable hint on
+            // hardware mismatch (#127 OPS-007).
+            Self::ModelDownload(ModelDownloadError::BackendUnavailable) => {
+                Some(BACKEND_UNAVAILABLE_HINT)
+            }
+            Self::BackendUnavailable => Some(BACKEND_UNAVAILABLE_HINT),
             // Explicit catch-all arms per variant. Adding a new SaeError variant
             // must force a compile-time review (no wildcard).
             Self::InputUsage(_)
@@ -415,6 +459,7 @@ impl SaeError {
             | Self::Io(_)
             | Self::ModelDownload(_)
             | Self::Probe(_)
+            | Self::Internal(_)
             | Self::Other(_) => None,
         }
     }
@@ -498,6 +543,9 @@ fn require_embed_model() -> Result<Artifacts, SaeError> {
     match cached_artifacts(ModelId::default()) {
         Ok(Some(p)) => Ok(p),
         Ok(None) => Err(SaeError::input_model_not_found()),
+        // Other (UNKNOWN): `cached_artifacts` returns an opaque `anyhow::Error`
+        // covering filesystem / permission / cache-layout edge cases. Promoting
+        // requires typed surface from rurico first.
         Err(e) => Err(SaeError::Other(format!("Failed to check model cache: {e}"))),
     }
 }
@@ -993,6 +1041,86 @@ mod tests {
         assert!(
             extract_probe_error(init).is_none(),
             "non-ProbeError source must fall through to None so the Other fallback runs"
+        );
+    }
+
+    // T-338: BackendUnavailable variant maps to INTERNAL (70) — mirrors
+    // ModelDownload(BackendUnavailable) (T-304) so embed and model download
+    // share the same hardware-mismatch exit code (#127 CHX-001).
+    #[test]
+    fn exit_code_backend_unavailable_is_internal() {
+        assert_code(&SaeError::BackendUnavailable, codes::INTERNAL);
+    }
+
+    // T-339: Internal variant maps to INTERNAL (70) — distinguishes
+    // programmer-detectable invariant violations from anyhow-swallow
+    // Other (UNKNOWN, 104) per ADR-0066 L136 (#127 CHX-001).
+    #[test]
+    fn exit_code_internal_variant_is_internal() {
+        assert_code(
+            &SaeError::Internal("Embedding count mismatch: expected 5, got 4".into()),
+            codes::INTERNAL,
+        );
+    }
+
+    // T-340: BackendUnavailable's next_step points to install / --no-embed.
+    // Constructor and lookup must stay in sync (matches T-310 / T-311 pattern).
+    #[test]
+    fn next_step_backend_unavailable_returns_install_or_no_embed_hint() {
+        assert_eq!(
+            SaeError::BackendUnavailable.next_step(),
+            Some(BACKEND_UNAVAILABLE_HINT)
+        );
+    }
+
+    // T-344: ModelDownload(BackendUnavailable)'s next_step shares the same hint
+    // as the embed-path variant (#127 OPS-007). Constructor and lookup must
+    // stay in sync via the shared `BACKEND_UNAVAILABLE_HINT` const.
+    #[test]
+    fn next_step_model_download_backend_unavailable_returns_shared_hint() {
+        let err = SaeError::ModelDownload(ModelDownloadError::BackendUnavailable);
+        assert_eq!(err.next_step(), Some(BACKEND_UNAVAILABLE_HINT));
+    }
+
+    // T-341: Internal variant returns no structured hint — the message body
+    // already carries the invariant details; no canned next step applies.
+    #[test]
+    fn next_step_internal_variant_returns_none() {
+        assert_eq!(
+            SaeError::Internal("Embedding count mismatch".into()).next_step(),
+            None
+        );
+    }
+
+    // T-342: to_error_envelope(BackendUnavailable) composes the ADR-0060 wire
+    // payload — code=INTERNAL, next_step set, retryable=false. Pins the
+    // composition (T-337 pattern) for the new variant.
+    #[test]
+    fn to_error_envelope_backend_unavailable_composes_internal_payload() {
+        let env = SaeError::BackendUnavailable.to_error_envelope();
+        assert_eq!(env.error.code, ErrorCode::Internal);
+        assert!(!env.error.retryable);
+        assert_eq!(
+            env.error.next_step.as_deref(),
+            Some(BACKEND_UNAVAILABLE_HINT)
+        );
+        assert!(env.error.candidates.is_empty());
+        assert_eq!(env.error.message, "MLX backend is unavailable");
+    }
+
+    // T-343: to_error_envelope(Internal) composes code=INTERNAL with no hint.
+    // Mirrors T-342 so both new variants have their composition pinned.
+    #[test]
+    fn to_error_envelope_internal_variant_composes_internal_payload() {
+        let err = SaeError::Internal("Embedding count mismatch: expected 5, got 4".into());
+        let env = err.to_error_envelope();
+        assert_eq!(env.error.code, ErrorCode::Internal);
+        assert!(!env.error.retryable);
+        assert!(env.error.next_step.is_none());
+        assert!(env.error.candidates.is_empty());
+        assert_eq!(
+            env.error.message,
+            "Embedding count mismatch: expected 5, got 4"
         );
     }
 }

@@ -31,6 +31,16 @@ fn sae_command(home: &Path) -> Command {
     cmd
 }
 
+/// Extracts the first parseable JSON line from `stderr`. Mirror of the
+/// envelope-rendering contract: `--json` failures emit one JSON line on
+/// stderr. Panics on missing JSON to give a readable failure message.
+fn parse_stderr_envelope(stderr: &str) -> serde_json::Value {
+    stderr
+        .lines()
+        .find_map(|line| serde_json::from_str(line).ok())
+        .unwrap_or_else(|| panic!("no JSON line on stderr; got: {stderr}"))
+}
+
 // T-CI001: `sae --json` (missing subcommand) → JSON UsageError envelope on stderr
 #[test]
 fn missing_subcommand_with_json_emits_usage_envelope() {
@@ -42,10 +52,7 @@ fn missing_subcommand_with_json_emits_usage_envelope() {
 
     assert!(!output.status.success(), "should exit non-zero");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let env: serde_json::Value = stderr
-        .lines()
-        .find_map(|line| serde_json::from_str(line).ok())
-        .unwrap_or_else(|| panic!("no JSON line on stderr; got: {stderr}"));
+    let env = parse_stderr_envelope(&stderr);
     assert_eq!(env["error"]["code"], "USAGE_ERROR");
     assert!(
         env["error"]["message"].is_string(),
@@ -138,10 +145,7 @@ fn malformed_date_with_json_emits_data_error_envelope() {
         String::from_utf8_lossy(&output.stderr)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let env: serde_json::Value = stderr
-        .lines()
-        .find_map(|line| serde_json::from_str(line).ok())
-        .unwrap_or_else(|| panic!("no JSON line on stderr; got: {stderr}"));
+    let env = parse_stderr_envelope(&stderr);
     assert_eq!(env["error"]["code"], "DATA_ERROR");
     assert_eq!(env["error"]["retryable"], false);
     let message = env["error"]["message"]
@@ -150,5 +154,119 @@ fn malformed_date_with_json_emits_data_error_envelope() {
     assert!(
         message.contains("Invalid date"),
         "message must describe the date parse failure; got: {message}"
+    );
+}
+
+// T-CI006: synthetic UNKNOWN path exits 104 (UNKNOWN) with
+// `error.code = "UNKNOWN"`. Pins the process-boundary contract for
+// `SaeError::Other` per ADR-0066 L136 (#127 OPS-005). The hidden
+// `__test_force_unknown` subcommand is the only hermetic UNKNOWN trigger;
+// production sites (MLX backend, opaque embedder errors, model cache check)
+// require real hardware / network state we cannot stage in tests.
+#[cfg(feature = "test-support")]
+#[test]
+fn force_unknown_with_json_emits_unknown_envelope() {
+    let dir = tempdir().unwrap();
+    let output = sae_command(dir.path())
+        .args(["--json", "__test_force_unknown"])
+        .output()
+        .expect("failed to spawn sae binary");
+
+    assert_eq!(
+        output.status.code(),
+        Some(104),
+        "exit code must be 104 (UNKNOWN); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let env = parse_stderr_envelope(&stderr);
+    assert_eq!(env["error"]["code"], "UNKNOWN");
+    assert_eq!(env["error"]["retryable"], false);
+    assert!(
+        env["error"]["message"].is_string(),
+        "error.message must be present"
+    );
+}
+
+// T-CI007: synthetic BackendUnavailable path exits 70 (INTERNAL) with
+// `error.code = "INTERNAL"`. Pins the BREAKING `104 → 70` routing for the
+// MLX backend missing path (#127 CHX-001) at the process boundary, mirroring
+// T-CI005's role for DATA_ERROR. Without this pin, the contract only lives in
+// unit tests (T-338 / T-342) and could regress silently across the
+// `error_code()` → `exit_code()` → process exit translation layers.
+#[cfg(feature = "test-support")]
+#[test]
+fn force_backend_unavailable_with_json_emits_internal_envelope() {
+    let dir = tempdir().unwrap();
+    let output = sae_command(dir.path())
+        .args(["--json", "__test_force_backend_unavailable"])
+        .output()
+        .expect("failed to spawn sae binary");
+
+    assert_eq!(
+        output.status.code(),
+        Some(70),
+        "exit code must be 70 (INTERNAL); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let env = parse_stderr_envelope(&stderr);
+    assert_eq!(env["error"]["code"], "INTERNAL");
+    assert_eq!(env["error"]["retryable"], false);
+    assert_eq!(env["error"]["message"], "MLX backend is unavailable");
+    // Exact-equality assertion mirrors T-340 unit test so the wire-level hint
+    // and the in-process hint cannot drift independently. T-340 / T-344 pin
+    // the source-side const; this anchors the binary-boundary surface to the
+    // same literal.
+    assert_eq!(
+        env["error"]["next_step"],
+        "Install the MLX backend (Apple Silicon required), or pass `--no-embed` for FTS-only search."
+    );
+    // `candidates` must be present and empty in the envelope (matches the
+    // `to_error_envelope` composition pinned by T-342).
+    assert!(
+        env["error"].get("candidates").is_none()
+            || env["error"]["candidates"]
+                .as_array()
+                .is_some_and(Vec::is_empty),
+        "candidates must be absent or empty array; got: {}",
+        env["error"]["candidates"]
+    );
+}
+
+// T-CI008: synthetic Internal path exits 70 (INTERNAL) with
+// `error.code = "INTERNAL"`. Pins the `SaeError::Internal` routing at the
+// process boundary, parallel to T-CI007 for `BackendUnavailable` (#127
+// CHX-001 audit follow-up). Without this pin, the `Internal` ↔ `Other` split
+// (70 vs 104) only lives in unit tests (T-339 / T-343) and could regress
+// silently across the `error_code()` → `exit_code()` → process exit chain.
+#[cfg(feature = "test-support")]
+#[test]
+fn force_internal_with_json_emits_internal_envelope() {
+    let dir = tempdir().unwrap();
+    let output = sae_command(dir.path())
+        .args(["--json", "__test_force_internal"])
+        .output()
+        .expect("failed to spawn sae binary");
+
+    assert_eq!(
+        output.status.code(),
+        Some(70),
+        "exit code must be 70 (INTERNAL); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let env = parse_stderr_envelope(&stderr);
+    assert_eq!(env["error"]["code"], "INTERNAL");
+    assert_eq!(env["error"]["retryable"], false);
+    // Internal variant returns no canned next_step (T-341 pins this).
+    assert!(
+        env["error"].get("next_step").is_none() || env["error"]["next_step"].is_null(),
+        "next_step must be absent for Internal; got: {}",
+        env["error"]["next_step"]
+    );
+    assert!(
+        env["error"]["message"].is_string(),
+        "error.message must be present"
     );
 }
