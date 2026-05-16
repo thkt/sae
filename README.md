@@ -34,21 +34,30 @@ export ESA_ACCESS_TOKEN="your-token"
 ### 投稿の取得・検索
 
 ```bash
-# チームの投稿をインデックス（増分）
+# チームの投稿をインデックス（増分。旧 `sae harvest myteam` は v0.3.0 で廃止）
 sae index myteam
 
-# 全件再構築（差分追従が破綻したときなど）
+# 全件再構築（差分追従が破綻したときなど。旧 `sae harvest myteam --full` 相当）
 sae rebuild myteam
 
-# 検索（shorthand）
+# 検索（shorthand: 既知サブコマンド以外の単一 positional は `sae search` に展開され、stderr に `→ sae search ...` のヒントが出る）
 sae "認証"
 
 # オプション付き検索
 sae search "認証" --team myteam --limit 5
 
+# 期間フィルタ（YYYY-MM-DD、updated 基準）
+sae search "認証" --after 2025-01-01 --before 2025-06-30
+
+# stdin から query を読む（pipe / 明示 `-`）
+echo "認証" | sae search
+sae search - < query.txt
+
 # 投稿を取得
 sae get 42
 ```
+
+`--team` を省略した場合は `default_team` → 設定済みチームが1つだけならそれ → どちらでもなければ `USAGE_ERROR` (64) の順で解決される。`index` / `rebuild` / `embed` だけは team が必須 positional。
 
 ### 投稿の作成・更新
 
@@ -62,7 +71,11 @@ sae create --name "タイトル" --body-file draft.md
 # stdin から読み込み
 cat body.md | sae create --name "タイトル" --body-file -
 
-# 更新
+# カテゴリ / タグ / WIP（`--tag` は繰り返し指定で複数）
+sae create --name "タイトル" --body "本文" \
+  --category "design/notes" --tag rfc --tag draft --wip
+
+# 更新（create と同じ content flag が使える。`--tag` は既存タグを置き換え）
 sae update 42 --name "新タイトル"
 
 # アーカイブ / Ship
@@ -73,18 +86,20 @@ sae ship 42
 ### エージェント向け機能
 
 ```bash
-# JSON 出力（全コマンド共通）
+# JSON 出力（global flag、位置自由）
 sae --json search "認証"
 sae --json get 42
 sae --json status
 
-# get の JSON は body_md を省略（--with-body で含める）
+# get の JSON は body_md を省略（--with-body で含める。`--json` 無しでは無視）
 sae --json get 42 --with-body
 
 # dry-run（API を呼ばずにプレビュー）
 sae create --name "タイトル" --body "本文" --dry-run
 sae archive 42 --dry-run
 ```
+
+`--json` 成功 envelope は `{"data": ..., "degraded": bool, "notes": [...]}`。embedder のロード失敗で FTS にフォールバックした場合は `degraded=true` + `notes=["semantic search unavailable, falling back to FTS"]` を返す。意図的な `--no-embed` は `degraded=false` のまま。
 
 ### セマンティック検索
 
@@ -100,12 +115,16 @@ sae search "認証フローの設計方針"
 
 # embedder のロードコストを避けて FTS のみで検索（CI / スクリプト用途）
 sae search "認証" --no-embed
+
+# reranker を有効化（モデル別途キャッシュ必要）
+SAE_RERANK=1 sae search "認証フローの設計方針"
 ```
 
 ### 同期状態の確認
 
 ```bash
-sae status
+sae status                    # 全チーム
+sae status --team myteam      # 単独
 sae --json status
 ```
 
