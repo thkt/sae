@@ -17,16 +17,18 @@ use serde::Serialize;
 ///
 /// `Internal` serializes as `"INTERNAL"` (numerically `EX_SOFTWARE` 70) so
 /// agent-facing JSON uses the concept name, not the sysexits label.
-/// `Unknown` (`104`) is the project extension reserved for catch-all paths.
+/// `Unknown` (`104`) is the project extension reserved for catch-all paths
+/// (`SaeError::Other`) so the `anyhow`-style swallowing surfaces as a
+/// distinct code per ADR-0066 L136.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub(crate) enum ErrorCode {
     UsageError,
+    DataError,
     Internal,
     CantCreat,
     IoError,
     TempFailure,
-    #[allow(dead_code)]
     Unknown,
 }
 
@@ -36,6 +38,7 @@ impl ErrorCode {
     pub(crate) fn exit_code(self) -> u8 {
         match self {
             Self::UsageError => codes::USAGE,
+            Self::DataError => codes::DATA_ERROR,
             Self::Internal => codes::INTERNAL,
             Self::CantCreat => codes::CANT_CREAT,
             Self::IoError => codes::IO_ERR,
@@ -140,6 +143,7 @@ mod tests {
     fn error_code_serializes_screaming_snake_case() {
         let pairs = [
             (ErrorCode::UsageError, r#""USAGE_ERROR""#),
+            (ErrorCode::DataError, r#""DATA_ERROR""#),
             (ErrorCode::Internal, r#""INTERNAL""#),
             (ErrorCode::CantCreat, r#""CANT_CREAT""#),
             (ErrorCode::IoError, r#""IO_ERROR""#),
@@ -159,6 +163,7 @@ mod tests {
     #[test]
     fn error_code_exit_code_matches_sysexits() {
         assert_eq!(ErrorCode::UsageError.exit_code(), 64);
+        assert_eq!(ErrorCode::DataError.exit_code(), 65);
         assert_eq!(ErrorCode::Internal.exit_code(), 70);
         assert_eq!(ErrorCode::CantCreat.exit_code(), 73);
         assert_eq!(ErrorCode::IoError.exit_code(), 74);

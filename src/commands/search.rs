@@ -24,13 +24,13 @@ fn parse_date_arg(s: Option<&str>, flag: &str) -> Result<Option<Timestamp>, SaeE
         return Ok(None);
     };
     let date = Date::strptime("%Y-%m-%d", s).map_err(|_| {
-        SaeError::Input(format!(
+        SaeError::InputData(format!(
             "Invalid date '--{flag} {s}': expected YYYY-MM-DD (e.g. 2025-01-01)"
         ))
     })?;
     let zoned = date
         .to_zoned(TimeZone::UTC)
-        .map_err(|e| SaeError::Other(format!("failed to zone date to UTC: {e}")))?;
+        .map_err(|e| SaeError::InputData(format!("failed to zone date to UTC: {e}")))?;
     Ok(Some(zoned.timestamp()))
 }
 
@@ -180,7 +180,7 @@ fn read_stdin_value(
 
     let value = buf.trim();
     if value.is_empty() {
-        return Err(SaeError::Input(format!(
+        return Err(SaeError::InputUsage(format!(
             "No {label} provided. Pass {placeholder}, pipe it via stdin, or use `-` to read stdin interactively"
         )));
     }
@@ -198,7 +198,7 @@ pub(crate) fn resolve_value_with_reader(
     match value {
         Some(value) if value != "-" => Ok(value),
         Some(_) => read_stdin_value(&mut stdin, label, placeholder),
-        None if stdin_is_terminal => Err(SaeError::Input(format!(
+        None if stdin_is_terminal => Err(SaeError::InputUsage(format!(
             "Missing {label}. Pass {placeholder}, pipe it via stdin, or use `-` to read stdin interactively"
         ))),
         None => read_stdin_value(&mut stdin, label, placeholder),

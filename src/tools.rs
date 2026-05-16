@@ -282,6 +282,7 @@ impl Sae {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum SaeError {
     #[error(transparent)]
     Config(#[from] ConfigError),
@@ -301,10 +302,17 @@ pub enum SaeError {
     /// chain so [`Self::error_code`] can classify per-variant (ADR-0066 Group 2).
     #[error(transparent)]
     Probe(#[from] ProbeError),
-    /// User action required (e.g., run `sae index` or `sae model download` first)
+    /// User action required (e.g., run `sae index` or `sae model download` first,
+    /// or pass a missing flag). Maps to `USAGE_ERROR` (sysexits 64).
     #[error("{0}")]
-    Input(String),
-    /// Operational failure (e.g., model load, embedding, download)
+    InputUsage(String),
+    /// User-supplied data malformed (e.g., date string not `YYYY-MM-DD`).
+    /// Maps to `DATA_ERROR` (sysexits 65) per ADR-0066 Group 2.
+    #[error("{0}")]
+    InputData(String),
+    /// Operational failure with no classified variant. Maps to `UNKNOWN`
+    /// (104) so the `anyhow`-style catch-all is distinguishable from genuine
+    /// `INTERNAL` (70) classifications per ADR-0066 L136.
     #[error("{0}")]
     Other(String),
 }
@@ -317,13 +325,13 @@ const MODEL_NOT_FOUND_PREFIX: &str = "Model not found";
 
 impl SaeError {
     pub(crate) fn input_no_data_for_team(team: &str) -> Self {
-        Self::Input(format!(
+        Self::InputUsage(format!(
             "{NO_DATA_PREFIX}'{team}'. Run `sae index {team}` first."
         ))
     }
 
     pub(crate) fn input_model_not_found() -> Self {
-        Self::Input(format!(
+        Self::InputUsage(format!(
             "{MODEL_NOT_FOUND_PREFIX}. Run 'sae model download' first."
         ))
     }
@@ -331,12 +339,12 @@ impl SaeError {
     /// [`CliError::exit_code`] delegates here so the sysexits mapping is single-sourced.
     pub(crate) fn error_code(&self) -> ErrorCode {
         match self {
-            Self::Input(_) | Self::Config(_) => ErrorCode::UsageError,
+            Self::InputUsage(_) | Self::Config(_) => ErrorCode::UsageError,
+            Self::InputData(_) => ErrorCode::DataError,
             Self::Client(ClientError::TokenNotSet)
             | Self::Sync(SyncError::Client(ClientError::TokenNotSet)) => ErrorCode::UsageError,
             Self::Storage(_) | Self::Sync(SyncError::Storage(_)) => ErrorCode::CantCreat,
             Self::Json(_)
-            | Self::Other(_)
             | Self::Client(ClientError::Api(_))
             | Self::Sync(SyncError::Client(ClientError::Api(_))) => ErrorCode::Internal,
             Self::Client(ClientError::Network(e))
@@ -361,6 +369,9 @@ impl SaeError {
             // Remaining Client/Sync (Network connect/timeout, MaxRetries) are retry-eligible.
             // Explicit arms (no wildcard) so future amici variants force a compile-time review.
             Self::Client(_) | Self::Sync(_) => ErrorCode::TempFailure,
+            // Catch-all: anyhow-style swallowing surfaces as UNKNOWN (104) to
+            // distinguish it from classified INTERNAL (70) per ADR-0066 L136.
+            Self::Other(_) => ErrorCode::Unknown,
         }
     }
 
@@ -369,10 +380,10 @@ impl SaeError {
     /// message back, which is fragile; the agent-facing template is unambiguous.
     pub(crate) fn next_step(&self) -> Option<&'static str> {
         match self {
-            Self::Input(s) if s.starts_with(NO_DATA_PREFIX) => {
+            Self::InputUsage(s) if s.starts_with(NO_DATA_PREFIX) => {
                 Some("Run `sae index <team>` to fetch posts.")
             }
-            Self::Input(s) if s.starts_with(MODEL_NOT_FOUND_PREFIX) => {
+            Self::InputUsage(s) if s.starts_with(MODEL_NOT_FOUND_PREFIX) => {
                 Some("Run `sae model download` to fetch the embedding model.")
             }
             Self::Config(ConfigError::NoTeamSpecified) => {
@@ -394,7 +405,8 @@ impl SaeError {
             }
             // Explicit catch-all arms per variant. Adding a new SaeError variant
             // must force a compile-time review (no wildcard).
-            Self::Input(_)
+            Self::InputUsage(_)
+            | Self::InputData(_)
             | Self::Config(_)
             | Self::Client(_)
             | Self::Storage(_)
@@ -519,10 +531,19 @@ mod tests {
         assert_eq!(err.exit_code(), ExitCode::from(expected));
     }
 
-    // T-237: Input variant maps to USAGE (sysexits 64)
+    // T-237: InputUsage variant maps to USAGE (sysexits 64)
     #[test]
-    fn exit_code_input_is_usage() {
-        assert_code(&SaeError::Input("bad".into()), codes::USAGE);
+    fn exit_code_input_usage_is_usage() {
+        assert_code(&SaeError::InputUsage("bad".into()), codes::USAGE);
+    }
+
+    // T-335: InputData variant maps to DATA_ERROR (sysexits 65) per ADR-0066 Group 2
+    #[test]
+    fn exit_code_input_data_is_data_error() {
+        assert_code(
+            &SaeError::InputData("Invalid date".into()),
+            codes::DATA_ERROR,
+        );
     }
 
     // T-238: Config variant maps to USAGE (sysexits 64)
@@ -556,10 +577,11 @@ mod tests {
         assert_code(&SaeError::Json(err), codes::INTERNAL);
     }
 
-    // T-242: Other variant maps to INTERNAL (sysexits 70)
+    // T-242: Other variant maps to UNKNOWN (104) — anyhow-style catch-all is
+    // distinguished from classified INTERNAL (70) per ADR-0066 L136.
     #[test]
-    fn exit_code_other_is_internal() {
-        assert_code(&SaeError::Other("unexpected".into()), codes::INTERNAL);
+    fn exit_code_other_is_unknown() {
+        assert_code(&SaeError::Other("unexpected".into()), codes::UNKNOWN);
     }
 
     // T-243: Io variant maps to IO_ERR (sysexits 74)
@@ -768,13 +790,39 @@ mod tests {
         );
     }
 
-    // T-317: next_step_input_without_recognized_prefix_returns_none
+    // T-317: next_step_input_data_returns_none
+    // InputData carries malformed user input (date parse, etc.) — no
+    // structured hint is appropriate because the fix is "correct the value".
     #[test]
-    fn next_step_input_without_recognized_prefix_returns_none() {
-        let err = SaeError::Input(
+    fn next_step_input_data_returns_none() {
+        let err = SaeError::InputData(
             "Invalid date '--from 2025-xx-xx': expected YYYY-MM-DD (e.g. 2025-01-01)".into(),
         );
         assert_eq!(err.next_step(), None);
+    }
+
+    // T-336: next_step_input_usage_without_recognized_prefix_returns_none
+    // InputUsage messages with a recognized prefix get a hint; arbitrary
+    // strings (e.g. clap-side messages) fall through to None.
+    #[test]
+    fn next_step_input_usage_without_recognized_prefix_returns_none() {
+        let err = SaeError::InputUsage("Missing search query.".into());
+        assert_eq!(err.next_step(), None);
+    }
+
+    // T-337: to_error_envelope(InputData) composes the ADR-0060 wire payload.
+    // Pins the integration of error_code / next_step / retryable / candidates
+    // for the new variant — each method has its own test (T-335, T-317,
+    // T-323, T-324) but only their composition is the agent-facing contract.
+    #[test]
+    fn to_error_envelope_input_data_composes_data_error_payload() {
+        let err = SaeError::InputData("Invalid date '--after 2025-xx-xx'".into());
+        let env = err.to_error_envelope();
+        assert_eq!(env.error.code, ErrorCode::DataError);
+        assert!(!env.error.retryable);
+        assert!(env.error.next_step.is_none());
+        assert!(env.error.candidates.is_empty());
+        assert_eq!(env.error.message, "Invalid date '--after 2025-xx-xx'");
     }
 
     // T-318: next_step_other_returns_none
@@ -815,15 +863,20 @@ mod tests {
     // T-323: retryable_false_for_input
     #[test]
     fn retryable_false_for_input() {
-        let err = SaeError::Input("bad".into());
-        assert!(!err.retryable(), "Input must not be retryable");
+        for err in [
+            SaeError::InputUsage("bad".into()),
+            SaeError::InputData("bad".into()),
+        ] {
+            assert!(!err.retryable(), "{err:?} must not be retryable");
+        }
     }
 
     // T-324: candidates_returns_empty_in_phase_2_1
     #[test]
     fn candidates_returns_empty_in_phase_2_1() {
         for err in [
-            SaeError::Input("anything".into()),
+            SaeError::InputUsage("anything".into()),
+            SaeError::InputData("anything".into()),
             SaeError::Config(ConfigError::NoTeamSpecified),
             SaeError::Other("internal".into()),
         ] {
