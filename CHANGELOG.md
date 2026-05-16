@@ -30,6 +30,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     `pub use` されており、`Input` variant を pattern match で参照していた
     downstream crate はコンパイルエラーになる (現状 0 件)。同時に
     `#[non_exhaustive]` を付与し、以後の variant 追加は非破壊変更となる。
+- **BREAKING**: `sae embed` で MLX backend が利用不能な場合の exit code が
+  `104` (UNKNOWN) から `70` (INTERNAL) に変化 (#127 CHX-001)。
+  `--json` の `error.code` も `"UNKNOWN"` → `"INTERNAL"`。
+  `sae model download` 側 (`ModelDownloadError::BackendUnavailable` → 70) と
+  routing を一致させ、agent が「ハードウェア / 環境セットアップ問題」シグナル
+  として一貫して検知できるようにする。同様に `sae embed` / `sae search` の
+  embedder バッチ件数不整合 (programmer-detectable invariant 違反) も `104`
+  → `70` に変化。
+  - **net 状態** (#126 catch-all 70 → 104 化との関係): #126 は分類不能な
+    `SaeError::Other` を 70 → 104 に動かし、本変更 #127 は MLX backend 不在と
+    embedder invariant 違反を **104 に流さず 70 のまま固定** する例外を作る。
+    agent retry policy は `error.code` (= `INTERNAL` か `UNKNOWN`) で分岐すれば
+    両変更を吸収できる。
+  - 移行: backend missing / embedder invariant 違反で `UNKNOWN` を branch して
+    いたスクリプト・agent retry policy は `INTERNAL` を見るように更新する。
+
+### Added
+
+- 新 `SaeError::BackendUnavailable` variant (MLX backend 不在) と
+  `SaeError::Internal(String)` variant (programmer-detectable invariant
+  違反 — 例: embedder batch count mismatch)。両方とも `INTERNAL` (70) に
+  routing し、anyhow-swallow `Other` (=UNKNOWN 104) と区別する (#127 CHX-001)。
+
+### Internal
+
+- 残存 `SaeError::Other` 構築サイト 5 箇所 (`tools.rs` の model probe
+  fallback × 2、batch embedding error × 1、model cache check × 1、および
+  `search.rs` の batch embedding error × 1) にインライン文書化を追加。
+  「なぜ Other のままか」「上流の typed surface が必要」を明記し、将来の
+  typed 化候補を可視化 (#127)。
+- `[features] test-support` 下に hidden `__test_force_unknown` subcommand
+  を追加 (`#[command(hide = true)]`)。`tests/cli_integration.rs::T-CI006`
+  で UNKNOWN (104) envelope を hermetic に pin する (#127 OPS-005)。
+  `cargo install` で配布される production binary には含まれない。
 
 ## [0.2.0] - 2026-05-12
 

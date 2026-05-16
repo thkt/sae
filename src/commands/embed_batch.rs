@@ -64,7 +64,11 @@ where
     let batch_len = u32::try_from(batch.len()).expect("batch size exceeds u32::MAX");
     let embs = embed_fn(&texts)?;
     if embs.len() != batch.len() {
-        return Err(SaeError::Other(format!(
+        // Programmer-detectable invariant violation: embedder returned a
+        // vector count that does not match the requested batch. Surfaces as
+        // `INTERNAL` so agents can distinguish bug signals from the
+        // `anyhow`-swallow `Other` (=UNKNOWN) path (#127 CHX-001).
+        return Err(SaeError::Internal(format!(
             "Embedding count mismatch: expected {}, got {}",
             batch.len(),
             embs.len()

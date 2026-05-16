@@ -42,6 +42,14 @@ jobs:
       - name: Test
         run: cargo nextest run --profile ci
 
+      - name: Test (test-support feature)
+        run: cargo nextest run --profile ci --features test-support
+        # Runs T-CI006..T-CI008 hidden-seam integration tests that pin the
+        # UNKNOWN (104) and INTERNAL (70) envelopes at the process boundary
+        # (#127 OPS-005 / CHX-001). The default `cargo nextest` invocation
+        # builds without `--features test-support`, so these tests are
+        # skipped there.
+
       - name: Clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
 

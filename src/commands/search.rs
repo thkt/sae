@@ -101,6 +101,10 @@ pub(crate) fn run_search(
     let embed_info = if let Some(emb) = embedder {
         match auto_embed_pending_with(&db, SEARCH_EMBED_BUDGET, |texts| {
             emb.embed_documents_batch(texts)
+                // Other (UNKNOWN): embedder's runtime error is an opaque
+                // `anyhow::Error` (no typed variant from amici/rurico).
+                // Mirrors `tools::Sae::embed`; promoting requires upstream
+                // typed surface first.
                 .map_err(|e| SaeError::Other(format!("Batch embedding failed: {e}")))
         }) {
             Ok((processed, budget_exhausted)) => Some(output::EmbedInfo {
