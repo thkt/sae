@@ -17,11 +17,19 @@ pub struct HarvestResult {
 
 impl fmt::Display for HarvestResult {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Fetched {} posts, stored {}. remote: {} | local: {}",
-            self.posts_fetched, self.posts_stored, self.total_count, self.local_count,
-        )?;
+        if self.posts_fetched == 0 {
+            write!(
+                f,
+                "No updates. remote: {} | local: {}",
+                self.total_count, self.local_count,
+            )?;
+        } else {
+            write!(
+                f,
+                "Fetched {} posts, stored {}. remote: {} | local: {}",
+                self.posts_fetched, self.posts_stored, self.total_count, self.local_count,
+            )?;
+        }
         if self.gap_detected {
             write!(
                 f,
@@ -49,6 +57,11 @@ pub async fn harvest(
     full: bool,
 ) -> Result<HarvestResult, SyncError> {
     let state = storage::get_sync_state(db.conn())?;
+    let prior_total = if full {
+        0
+    } else {
+        state.as_ref().map_or(0, |s| s.total_count)
+    };
 
     if full {
         storage::save_sync_state(
@@ -77,7 +90,7 @@ pub async fn harvest(
     } else {
         state.and_then(|s| s.latest_updated_at)
     };
-    let mut api_total: u32 = 0;
+    let mut max_api_total: u32 = 0;
 
     // esa API caps pagination at 10,000 items per query.
     // When hit, we narrow by updated_at window and continue.
@@ -108,7 +121,8 @@ pub async fn harvest(
             }
             Err(e) => return Err(e.into()),
         };
-        api_total = resp.total_count;
+        let api_total = resp.total_count;
+        max_api_total = max_api_total.max(api_total);
         let est_pages = api_total.div_ceil(100);
 
         let tx = db
@@ -135,7 +149,7 @@ pub async fn harvest(
             &tx,
             &storage::SyncStateUpdate {
                 latest_updated_at: latest.as_deref(),
-                total_count: api_total,
+                total_count: effective_total(full, prior_total, max_api_total, 0),
                 local_count: prior_count + total_stored,
                 last_page: resp.next_page,
             },
@@ -160,35 +174,31 @@ pub async fn harvest(
     }
 
     let local_count = storage::count_posts(db.conn())?;
-    let gap_detected = local_count < api_total;
+    let total_count = effective_total(full, prior_total, max_api_total, local_count);
+    let gap_detected = local_count < total_count;
 
     storage::save_sync_state(
         db.conn(),
         &storage::SyncStateUpdate {
             latest_updated_at: latest.as_deref(),
-            total_count: api_total,
+            total_count,
             local_count,
             last_page: None,
         },
     )?;
 
     if gap_detected {
+        let missing = total_count - local_count;
         progress_step(&[&format!(
-            "warning: gap detected — {} missing posts (run `sae rebuild {team}` to re-sync)",
-            api_total - local_count
+            "warning: gap detected — {missing} missing posts (run `sae rebuild {team}` to re-sync)"
         )]);
-        info!(
-            local_count,
-            api_total,
-            missing = api_total - local_count,
-            "gap detected"
-        );
+        info!(local_count, total_count, missing, "gap detected");
     }
 
     Ok(HarvestResult {
         posts_fetched: total_fetched,
         posts_stored: total_stored,
-        total_count: api_total,
+        total_count,
         local_count,
         gap_detected,
     })
@@ -196,6 +206,29 @@ pub async fn harvest(
 
 fn is_pagination_limit(msg: &str) -> bool {
     msg.contains("10,000") || msg.contains("10000")
+}
+
+/// Resolve the remote total to persist in sync_state.
+///
+/// In full sync, the largest API total seen across responses is authoritative:
+/// pagination narrowing can produce a smaller total in later responses that
+/// does not reflect the real remote size, so we take the max.
+///
+/// In incremental sync, every response's `total_count` comes from a diff
+/// filter (`q=updated:>X`) and underestimates the real total. Preserve the
+/// prior total and apply `local_floor` so previously corrupted state can
+/// self-heal once the floor reflects an authoritative local row count.
+///
+/// Pass `0` for `local_floor` at intermediate checkpoints. A running upsert
+/// counter includes updates to existing posts and would otherwise inflate
+/// the persisted total — only the post-loop `count_posts` query reports the
+/// actual row count.
+fn effective_total(full: bool, prior: u32, max_api: u32, local_floor: u32) -> u32 {
+    if full {
+        max_api
+    } else {
+        prior.max(max_api).max(local_floor)
+    }
 }
 
 fn build_window_query(base: Option<&str>, boundary: Option<&str>) -> Option<String> {
@@ -744,6 +777,15 @@ pub(crate) mod tests {
             "should fetch posts across window narrowing"
         );
         assert_eq!(storage::count_posts(db.conn()).unwrap(), 3);
+        assert_eq!(
+            r.total_count, 10001,
+            "the largest total_count seen (before window narrowing) is authoritative; \
+             later narrowed responses must not regress it"
+        );
+        assert!(
+            r.gap_detected,
+            "local 3 < remote 10001 should surface a gap"
+        );
     }
 
     // T-300: upsert_post_locally inserts a post into an empty DB
@@ -835,5 +877,142 @@ pub(crate) mod tests {
             "sync_state should not be created when previously absent"
         );
         assert_eq!(storage::count_posts(db.conn()).unwrap(), 1);
+    }
+
+    // T-173: Display shows "No updates" when an incremental harvest fetches 0 posts
+    #[test]
+    fn harvest_result_display_no_updates() {
+        let r = HarvestResult {
+            posts_fetched: 0,
+            posts_stored: 0,
+            total_count: 15712,
+            local_count: 15712,
+            gap_detected: false,
+        };
+        let s = r.to_string();
+        assert!(s.contains("No updates"), "expected 'No updates', got: {s}");
+        assert!(s.contains("remote: 15712"));
+        assert!(s.contains("local: 15712"));
+        assert!(!s.contains("Fetched"));
+    }
+
+    fn seed_posts(db: &Db, n: u32) {
+        for i in 1..=n {
+            upsert_post_locally(
+                db,
+                &make_esa_post(i, "P", "# body", "2025-01-01T00:00:00+09:00"),
+            )
+            .unwrap();
+        }
+    }
+
+    // T-174: incremental harvest with 0 diff results preserves prior total_count
+    //        instead of overwriting sync_state with the diff-query total.
+    #[tokio::test]
+    async fn incremental_with_zero_diff_preserves_prior_total() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/teams/t/posts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(posts_response(&[], None, 0)))
+            .mount(&server)
+            .await;
+
+        let client = EsaClient::with_base_url("tok".into(), server.uri());
+        let db = Db::open_memory().unwrap();
+        seed_posts(&db, 5);
+        storage::save_sync_state(
+            db.conn(),
+            &storage::SyncStateUpdate {
+                latest_updated_at: Some("2025-01-01T00:00:00+09:00"),
+                total_count: 5,
+                local_count: 5,
+                last_page: None,
+            },
+        )
+        .unwrap();
+
+        let r = harvest(&client, &db, "t", false).await.unwrap();
+        assert_eq!(r.posts_fetched, 0);
+        assert_eq!(r.local_count, 5);
+        assert_eq!(
+            r.total_count, 5,
+            "prior total_count must not be overwritten by diff-query result (0)"
+        );
+        assert!(!r.gap_detected);
+
+        let state = storage::get_sync_state(db.conn()).unwrap().unwrap();
+        assert_eq!(
+            state.total_count, 5,
+            "saved state must preserve prior total"
+        );
+    }
+
+    // T-175: incremental harvest self-heals when state was previously corrupted
+    //        (e.g., total_count overwritten with 0 by an earlier buggy run).
+    //        local_count acts as a floor on the effective remote total.
+    #[tokio::test]
+    async fn incremental_self_heals_corrupt_total() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/teams/t/posts"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(posts_response(&[], None, 0)))
+            .mount(&server)
+            .await;
+
+        let client = EsaClient::with_base_url("tok".into(), server.uri());
+        let db = Db::open_memory().unwrap();
+        seed_posts(&db, 7);
+        storage::save_sync_state(
+            db.conn(),
+            &storage::SyncStateUpdate {
+                latest_updated_at: Some("2025-01-01T00:00:00+09:00"),
+                total_count: 0,
+                local_count: 7,
+                last_page: None,
+            },
+        )
+        .unwrap();
+
+        let r = harvest(&client, &db, "t", false).await.unwrap();
+        assert_eq!(
+            r.total_count, 7,
+            "local_count floor should recover the total"
+        );
+        assert!(!r.gap_detected);
+
+        let state = storage::get_sync_state(db.conn()).unwrap().unwrap();
+        assert_eq!(state.total_count, 7, "saved state must be self-healed");
+    }
+
+    // T-176: effective_total decision table — one row per branch of the
+    //        full / incremental / local_floor matrix. See fn rustdoc for the rule.
+    #[test]
+    fn effective_total_resolver() {
+        assert_eq!(
+            effective_total(true, 100, 50, 9999),
+            50,
+            "full ignores prior/floor"
+        );
+        assert_eq!(effective_total(true, 0, 100, 0), 100);
+        assert_eq!(
+            effective_total(false, 100, 5, 0),
+            100,
+            "incremental checkpoint with prior > max_api keeps prior"
+        );
+        assert_eq!(
+            effective_total(false, 100, 5, 100),
+            100,
+            "incremental final with local_floor == prior is idempotent"
+        );
+        assert_eq!(
+            effective_total(false, 0, 0, 7),
+            7,
+            "incremental with corrupt prior self-heals via local_floor"
+        );
+        assert_eq!(
+            effective_total(false, 0, 200, 50),
+            200,
+            "first incremental (no prior) accepts the diff total when it dominates"
+        );
     }
 }
