@@ -53,6 +53,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   違反 — 例: embedder batch count mismatch)。両方とも `INTERNAL` (70) に
   routing し、anyhow-swallow `Other` (=UNKNOWN 104) と区別する (#127 CHX-001)。
 
+### Fixed
+
+- `sae index` の差分同期で `sync_state.total_count` が差分クエリ
+  (`q=updated:>X`) のヒット件数で上書きされ、増分実行のたびに表示が
+  `remote: 0 | local: N` のように退行していた。`total_count` は full 同期
+  でのみ authoritative とし、増分時は prior_total と `local_count` を
+  floor として採用するように修正。既存の汚染ステートは次回 `sae index`
+  実行時に local_count まで自己治癒する。あわせて `posts_fetched == 0`
+  時は `No updates. remote: M | local: N` を表示し、「差分ヒット 0 件」
+  を「リモートに何もない」と誤解させないようにする。
+- `sae rebuild` で `pagination_limit` を踏んで window を絞り込んだ場合、
+  最後の narrowed レスポンスの `total_count` (実 remote より小さい値)
+  で state を上書きしていたのも同じ修正で解消 (最初に観測した最大値を
+  採用)。
+
 ### Internal
 
 - 残存 `SaeError::Other` 構築サイト 5 箇所 (`tools.rs` の model probe
