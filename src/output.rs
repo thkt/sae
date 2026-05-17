@@ -416,7 +416,7 @@ mod tests {
         assert_eq!(out.notes.len(), 1);
         assert!(
             out.notes[0].contains("reranker failed"),
-            "warning should be surfaced verbatim; got: {:?}",
+            "warning should be surfaced in notes[0]; got: {:?}",
             out.notes
         );
     }
