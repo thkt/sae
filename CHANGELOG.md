@@ -45,6 +45,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
     両変更を吸収できる。
   - 移行: backend missing / embedder invariant 違反で `UNKNOWN` を branch して
     いたスクリプト・agent retry policy は `INTERNAL` を見るように更新する。
+- **BREAKING**: esa API が 404 (post not found) を返した場合の exit code が
+  `70` (INTERNAL) から `65` (DATA_ERROR) に変化 (#136)。`--json` の
+  `error.code` も `"INTERNAL"` → `"DATA_ERROR"`、`next_step` に「Verify the
+  post number exists in esa, or run \`sae search <keyword>\` to find it.」
+  ヒントが追加される。`sae get` / `sae update` / `sae archive` / `sae ship`
+  に存在しない post 番号を渡したケースを、サーバ起因の 5xx と判別可能にする。
+  - **net 状態** (#126 / #127 routing との関係): 404 (入力データ起因) は
+    65 へ、404 以外の HTTP error (4xx 401/403/422 や 5xx) は引き続き 70。
+    agent retry policy は `error.code` で分岐すれば、入力ミスは「該当 post
+    の番号を確認」、5xx は「リトライ」と判別できる。
+  - 移行: 「post 番号間違い → INTERNAL (70)」を branch していたスクリプト
+    は `DATA_ERROR` (65) を見るように更新する。`error.code` で分岐していれば
+    変更は自動吸収される。
+- 公開 API: `ClientError::Api(String)` を `ClientError::Api { status: u16,
+  body: String }` に変更し、HTTP status を保持できるようにする。あわせて
+  URL parse / token format error 用の `ClientError::InvalidRequest(String)`
+  variant を追加。`ClientError` には `#[non_exhaustive]` を付与し、以後の
+  variant 追加は非破壊。`ClientError::Api` を pattern match で参照していた
+  downstream crate (sae crate 内 0 件) はコンパイルエラーになる。
 
 ### Added
 
@@ -79,6 +98,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   を追加 (`#[command(hide = true)]`)。`tests/cli_integration.rs::T-CI006`
   で UNKNOWN (104) envelope を hermetic に pin する (#127 OPS-005)。
   `cargo install` で配布される production binary には含まれない。
+- `[features] test-support` 下に hidden `__test_force_client_api_404`
+  subcommand を追加。`tests/cli_integration.rs::T-CI009` で esa-404 →
+  DATA_ERROR (65) routing を binary-boundary で pin する (#136)。
 
 ## [0.2.0] - 2026-05-12
 

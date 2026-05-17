@@ -270,3 +270,43 @@ fn force_internal_with_json_emits_internal_envelope() {
         "error.message must be present"
     );
 }
+
+// T-CI009: synthetic esa API 404 path exits 65 (DATA_ERROR) with
+// `error.code = "DATA_ERROR"`. Pins the binary-boundary routing for the
+// esa-404 reclassification (#136): the `ClientError::Api { status: 404, .. }`
+// → DATA_ERROR mapping must survive the `error_code()` → `exit_code()` →
+// process exit chain. Without this pin, the routing only lives in unit tests
+// (T-346 / T-348 / T-352) and could regress silently. The hint string is
+// exact-equality matched so the wire-level surface cannot drift from the
+// in-process surface pinned by T-349 / T-352.
+#[cfg(feature = "test-support")]
+#[test]
+fn force_client_api_404_with_json_emits_data_error_envelope() {
+    let dir = tempdir().unwrap();
+    let output = sae_command(dir.path())
+        .args(["--json", "__test_force_client_api_404"])
+        .output()
+        .expect("failed to spawn sae binary");
+
+    assert_eq!(
+        output.status.code(),
+        Some(65),
+        "exit code must be 65 (DATA_ERROR); stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let env = parse_stderr_envelope(&stderr);
+    assert_eq!(env["error"]["code"], "DATA_ERROR");
+    assert_eq!(env["error"]["retryable"], false);
+    assert_eq!(
+        env["error"]["next_step"],
+        "Verify the post number exists in esa, or run `sae search <keyword>` to find it."
+    );
+    let message = env["error"]["message"]
+        .as_str()
+        .expect("error.message must be a string");
+    assert!(
+        message.contains("HTTP 404"),
+        "message must surface the HTTP 404 status; got: {message}"
+    );
+}
