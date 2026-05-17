@@ -102,12 +102,22 @@ struct UpdatePostBody {
 }
 
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum ClientError {
     #[error("ESA_ACCESS_TOKEN not set")]
     TokenNotSet,
 
-    #[error("esa API error: {0}")]
-    Api(String),
+    /// HTTP non-success response from esa API. `status` is preserved so
+    /// downstream classification can split client-side (4xx, e.g. 404 →
+    /// DATA_ERROR) from server-side (5xx → INTERNAL) per #136.
+    #[error("esa API error: HTTP {status}: {body}")]
+    Api { status: u16, body: String },
+
+    /// Pre-call request construction failure (URL parse, malformed token
+    /// header). Distinct from `Api` because no HTTP exchange occurred —
+    /// these are program-detectable bugs and route to INTERNAL (70).
+    #[error("invalid request: {0}")]
+    InvalidRequest(String),
 
     #[error("Network error: {0}")]
     Network(#[from] reqwest::Error),
@@ -235,7 +245,8 @@ impl EsaClient {
 
     fn build_url(&self, path: &str) -> Result<reqwest::Url, ClientError> {
         let raw = format!("{}/{path}", self.base_url);
-        reqwest::Url::parse(&raw).map_err(|e| ClientError::Api(format!("invalid URL '{raw}': {e}")))
+        reqwest::Url::parse(&raw)
+            .map_err(|e| ClientError::InvalidRequest(format!("invalid URL '{raw}': {e}")))
     }
 
     async fn throttle(&self) {
@@ -255,7 +266,7 @@ impl EsaClient {
 
     fn auth_header(&self) -> Result<HeaderValue, ClientError> {
         let mut v = HeaderValue::from_str(&format!("Bearer {}", self.token))
-            .map_err(|_| ClientError::Api("invalid token format".into()))?;
+            .map_err(|_| ClientError::InvalidRequest("invalid token format".into()))?;
         v.set_sensitive(true);
         Ok(v)
     }
@@ -298,10 +309,10 @@ impl EsaClient {
                 None => {
                     let text = resp.text().await.unwrap_or_default();
                     let safe = redact_token(&text, &self.token);
-                    return Err(ClientError::Api(format!(
-                        "HTTP {status}: {}",
-                        truncate_str(&safe, 500)
-                    )));
+                    return Err(ClientError::Api {
+                        status,
+                        body: truncate_str(&safe, 500).to_owned(),
+                    });
                 }
             }
         }
@@ -464,6 +475,9 @@ mod tests {
         assert_eq!(post.name, "Getting Started");
     }
 
+    // T-345: get_post on 404 returns ClientError::Api with status=404 preserved
+    // so downstream routing (SaeError::error_code) can split 404 → DATA_ERROR
+    // from non-404 → INTERNAL per #136.
     #[tokio::test]
     async fn api_error_returns_client_error() {
         let server = MockServer::start().await;
@@ -481,7 +495,11 @@ mod tests {
             .get_post("myteam", 999)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("404"));
+        assert!(
+            matches!(err, ClientError::Api { status: 404, .. }),
+            "expected Api {{ status: 404, .. }}, got: {err:?}"
+        );
+        assert!(err.to_string().contains("HTTP 404"));
     }
 
     #[tokio::test]

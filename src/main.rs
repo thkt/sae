@@ -10,6 +10,8 @@ use amici::cli::exit_code::{CliError, codes};
 use amici::cli::{exit_error, hint_arrow, try_expand_shorthand};
 use amici::logging::init_subscriber;
 use clap::{Parser, Subcommand};
+#[cfg(feature = "test-support")]
+use sae::client::ClientError;
 use sae::config::Config;
 use sae::io::write_output;
 use sae::tools::{CreateArgs, Sae, SaeError, SearchArgs, UpdateArgs};
@@ -178,6 +180,14 @@ Examples:
     #[cfg(feature = "test-support")]
     #[command(name = "__test_force_internal", hide = true)]
     TestForceInternal,
+    /// Hidden test seam: force a `ClientError::Api { status: 404, .. }` so
+    /// `tests/cli_integration.rs` can pin the DATA_ERROR (65) envelope at the
+    /// process boundary for the esa-404 routing (#136). `test-support`
+    /// feature only — the production binary built with `cargo install` never
+    /// carries this variant.
+    #[cfg(feature = "test-support")]
+    #[command(name = "__test_force_client_api_404", hide = true)]
+    TestForceClientApi404,
 }
 
 #[derive(Debug, Subcommand)]
@@ -208,6 +218,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "__test_force_unknown",
     "__test_force_backend_unavailable",
     "__test_force_internal",
+    "__test_force_client_api_404",
 ];
 const GLOBAL_FLAGS: &[&str] = &["--json"];
 
@@ -280,6 +291,11 @@ async fn run(cli: Cli, config: Config) -> Result<CommandOutput, SaeError> {
         Command::TestForceInternal => Err(SaeError::Internal(
             "synthetic INTERNAL for cli_integration test (test-support feature)".to_owned(),
         )),
+        #[cfg(feature = "test-support")]
+        Command::TestForceClientApi404 => Err(SaeError::Client(ClientError::Api {
+            status: 404,
+            body: r#"{"error":"not_found","message":"Not Found"}"#.to_owned(),
+        })),
         Command::Model { .. } => unreachable!("handled before Sae::new()"),
     }
 }

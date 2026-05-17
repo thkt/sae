@@ -102,7 +102,7 @@ pub async fn harvest(
 
         let resp = match client.list_posts(team, page, query.as_deref()).await {
             Ok(r) => r,
-            Err(ClientError::Api(ref msg)) if is_pagination_limit(msg) => {
+            Err(ClientError::Api { ref body, .. }) if is_pagination_limit(body) => {
                 if let Some(ref oldest) = batch_oldest_ts {
                     if window_boundary.as_ref() == Some(oldest) {
                         progress_step(&["window didn't advance, stopping"]);

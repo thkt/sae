@@ -353,6 +353,14 @@ const MODEL_NOT_FOUND_PREFIX: &str = "Model not found";
 const BACKEND_UNAVAILABLE_HINT: &str =
     "Install the MLX backend (Apple Silicon required), or pass `--no-embed` for FTS-only search.";
 
+/// Shared `next_step` hint for `ClientError::Api { status: 404, .. }`
+/// (post-not-found path). Centralised so the production arm and unit tests
+/// cannot drift. The integration test (`tests/cli_integration.rs::T-CI009`)
+/// intentionally keeps an exact-string literal: it asserts the binary-boundary
+/// surface, not the in-process surface (#136).
+const POST_NOT_FOUND_HINT: &str =
+    "Verify the post number exists in esa, or run `sae search <keyword>` to find it.";
+
 impl SaeError {
     pub(crate) fn input_no_data_for_team(team: &str) -> Self {
         Self::InputUsage(format!(
@@ -374,9 +382,18 @@ impl SaeError {
             Self::Client(ClientError::TokenNotSet)
             | Self::Sync(SyncError::Client(ClientError::TokenNotSet)) => ErrorCode::UsageError,
             Self::Storage(_) | Self::Sync(SyncError::Storage(_)) => ErrorCode::CantCreat,
+            // esa API 404 is an input failure (the post number does not exist
+            // in the team), not a server-side fault. Route to DATA_ERROR (65)
+            // so AI agents distinguish missing inputs from 5xx INTERNAL (#136).
+            Self::Client(ClientError::Api { status: 404, .. })
+            | Self::Sync(SyncError::Client(ClientError::Api { status: 404, .. })) => {
+                ErrorCode::DataError
+            }
             Self::Json(_)
-            | Self::Client(ClientError::Api(_))
-            | Self::Sync(SyncError::Client(ClientError::Api(_))) => ErrorCode::Internal,
+            | Self::Client(ClientError::Api { .. } | ClientError::InvalidRequest(_))
+            | Self::Sync(SyncError::Client(
+                ClientError::Api { .. } | ClientError::InvalidRequest(_),
+            )) => ErrorCode::Internal,
             Self::Client(ClientError::Network(e))
             | Self::Sync(SyncError::Client(ClientError::Network(e)))
                 if e.is_decode() =>
@@ -429,6 +446,13 @@ impl SaeError {
             Self::Client(ClientError::TokenNotSet)
             | Self::Sync(SyncError::Client(ClientError::TokenNotSet)) => {
                 Some("Set `ESA_ACCESS_TOKEN=<token>` and retry.")
+            }
+            // esa API 404: the requested post number does not exist in the
+            // team. Pairs with the DATA_ERROR routing in `error_code()` (#136)
+            // so agents see both a 65 exit code and a recovery hint.
+            Self::Client(ClientError::Api { status: 404, .. })
+            | Self::Sync(SyncError::Client(ClientError::Api { status: 404, .. })) => {
+                Some(POST_NOT_FOUND_HINT)
             }
             // Direct API commands (get/create/update/archive/ship) bubble
             // ClientError::MaxRetries as Self::Client(_); the index/rebuild
@@ -647,11 +671,40 @@ mod tests {
         );
     }
 
-    // T-245: Client(Api) maps to INTERNAL (sysexits 70) — non-retryable HTTP 4xx
+    // T-245: Client(Api) with non-404 status maps to INTERNAL (sysexits 70)
+    // — non-retryable HTTP error from the esa API (5xx, 4xx other than 404).
     #[test]
     fn exit_code_client_api_is_internal() {
         assert_code(
-            &SaeError::Client(ClientError::Api("404 Not Found".into())),
+            &SaeError::Client(ClientError::Api {
+                status: 500,
+                body: "Internal Server Error".into(),
+            }),
+            codes::INTERNAL,
+        );
+    }
+
+    // T-346: Client(Api { status: 404 }) maps to DATA_ERROR (sysexits 65)
+    // — input-side failure (post number does not exist in the team), distinct
+    // from server-side 5xx per #136.
+    #[test]
+    fn exit_code_client_api_404_is_data_error() {
+        assert_code(
+            &SaeError::Client(ClientError::Api {
+                status: 404,
+                body: r#"{"error":"not_found","message":"Not Found"}"#.into(),
+            }),
+            codes::DATA_ERROR,
+        );
+    }
+
+    // T-347: Client(InvalidRequest) maps to INTERNAL (sysexits 70) — pre-call
+    // request construction failure (URL parse, bad token header), a
+    // program-detectable bug, not user input.
+    #[test]
+    fn exit_code_client_invalid_request_is_internal() {
+        assert_code(
+            &SaeError::Client(ClientError::InvalidRequest("invalid URL".into())),
             codes::INTERNAL,
         );
     }
@@ -703,12 +756,30 @@ mod tests {
         );
     }
 
-    // T-248: Sync(Client(Api)) maps to INTERNAL (sysexits 70) — non-retryable HTTP 4xx
+    // T-248: Sync(Client(Api)) with non-404 status maps to INTERNAL (sysexits 70)
+    // — index/rebuild path mirrors the direct-call routing of T-245.
     #[test]
     fn exit_code_sync_client_api_is_internal() {
         assert_code(
-            &SaeError::Sync(SyncError::Client(ClientError::Api("404 Not Found".into()))),
+            &SaeError::Sync(SyncError::Client(ClientError::Api {
+                status: 503,
+                body: "Service Unavailable".into(),
+            })),
             codes::INTERNAL,
+        );
+    }
+
+    // T-348: Sync(Client(Api { status: 404 })) maps to DATA_ERROR (sysexits 65)
+    // — index/rebuild path mirrors T-346 so the 404 routing is symmetric across
+    // direct API commands and bulk sync.
+    #[test]
+    fn exit_code_sync_client_api_404_is_data_error() {
+        assert_code(
+            &SaeError::Sync(SyncError::Client(ClientError::Api {
+                status: 404,
+                body: r#"{"error":"not_found","message":"Not Found"}"#.into(),
+            })),
+            codes::DATA_ERROR,
         );
     }
 
@@ -1121,6 +1192,64 @@ mod tests {
         assert_eq!(
             env.error.message,
             "Embedding count mismatch: expected 5, got 4"
+        );
+    }
+
+    // T-349: next_step for Client(Api { status: 404 }) returns the post-not-found
+    // hint so AI agents recover from missing post numbers (#136). Mirrors T-340
+    // (BackendUnavailable) — the hint surface and the routing surface must
+    // agree at the source.
+    #[test]
+    fn next_step_client_api_404_returns_post_not_found_hint() {
+        let err = SaeError::Client(ClientError::Api {
+            status: 404,
+            body: r#"{"error":"not_found"}"#.into(),
+        });
+        assert_eq!(err.next_step(), Some(POST_NOT_FOUND_HINT));
+    }
+
+    // T-350: next_step for Sync(Client(Api { status: 404 })) returns the same hint
+    // as T-349 so direct API and bulk sync paths share guidance.
+    #[test]
+    fn next_step_sync_client_api_404_returns_post_not_found_hint() {
+        let err = SaeError::Sync(SyncError::Client(ClientError::Api {
+            status: 404,
+            body: r#"{"error":"not_found"}"#.into(),
+        }));
+        assert_eq!(err.next_step(), Some(POST_NOT_FOUND_HINT));
+    }
+
+    // T-351: next_step for Client(Api { status: 500 }) returns None — only 404
+    // carries a recovery hint, 5xx is server-side and not actionable on the
+    // agent side.
+    #[test]
+    fn next_step_client_api_non_404_returns_none() {
+        let err = SaeError::Client(ClientError::Api {
+            status: 500,
+            body: "Internal Server Error".into(),
+        });
+        assert_eq!(err.next_step(), None);
+    }
+
+    // T-352: to_error_envelope(Client(Api { status: 404 })) composes the
+    // ADR-0060 wire payload with code=DATA_ERROR, retryable=false, and the
+    // post-not-found next_step. Mirrors T-342 so the composition surface is
+    // pinned alongside the individual method tests.
+    #[test]
+    fn to_error_envelope_client_api_404_composes_data_error_payload() {
+        let err = SaeError::Client(ClientError::Api {
+            status: 404,
+            body: r#"{"error":"not_found","message":"Not Found"}"#.into(),
+        });
+        let env = err.to_error_envelope();
+        assert_eq!(env.error.code, ErrorCode::DataError);
+        assert!(!env.error.retryable);
+        assert_eq!(env.error.next_step.as_deref(), Some(POST_NOT_FOUND_HINT));
+        assert!(env.error.candidates.is_empty());
+        assert!(
+            env.error.message.contains("HTTP 404"),
+            "message should mention HTTP 404; got: {}",
+            env.error.message
         );
     }
 }
