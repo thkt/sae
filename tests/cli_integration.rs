@@ -310,3 +310,39 @@ fn force_client_api_404_with_json_emits_data_error_envelope() {
         "message must surface the HTTP 404 status; got: {message}"
     );
 }
+
+// T-CI010: synthetic reranker-failure search path emits a success envelope
+// with `degraded=true` and the storage-layer warning surfaced in `notes[]`.
+// Pins #140 wiring: `SearchOutput.warnings` reaches the `--json` envelope so
+// AI agents can detect the reranker fallback. Unit tests T-221 (storage push)
+// and T-262 / T-263 (output transform) cover the pieces; this test pins the
+// end-to-end process-boundary shape.
+#[cfg(feature = "test-support")]
+#[test]
+fn force_search_warning_with_json_emits_degraded_envelope() {
+    let dir = tempdir().unwrap();
+    let output = sae_command(dir.path())
+        .args(["--json", "__test_force_search_warning"])
+        .output()
+        .expect("failed to spawn sae binary");
+
+    assert!(
+        output.status.success(),
+        "synthetic warning path is still a success; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let env: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("stdout not JSON: {e}; got: {stdout}"));
+    assert_eq!(
+        env["degraded"], true,
+        "degraded must be true; got: {stdout}"
+    );
+    let notes = env["notes"].as_array().expect("notes must be an array");
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.as_str().is_some_and(|s| s.contains("reranker failed"))),
+        "notes[] must surface the reranker-failure warning; got: {notes:?}"
+    );
+}

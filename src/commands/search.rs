@@ -166,6 +166,7 @@ pub(crate) fn run_search(
         semantic,
         embedder_load_failed,
         embed_info,
+        &search_output.warnings,
     )?;
     const PREFETCH_TTL_SECS: u64 = 5 * 60;
     if !storage::sync_harvested_within(db.conn(), PREFETCH_TTL_SECS) {
