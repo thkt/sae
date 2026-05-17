@@ -429,6 +429,7 @@ pub fn hybrid_search(
             }
             Err(e) => {
                 warn!(%e, "cross-encoder reranking failed, keeping heuristic order");
+                warnings.push(format!("reranker failed ({e}), falling back to RRF order"));
                 apply_recency_boost(merged, &post_meta, now)
             }
         }
@@ -1532,5 +1533,64 @@ mod tests {
                 r.score
             );
         }
+    }
+
+    // T-221: hybrid_search with a failing reranker pushes a degraded-warning note
+    // symmetric with the vec_search failure path so AI agents see the same
+    // `warnings[]` signal regardless of which hybrid component degraded.
+    #[test]
+    fn hybrid_search_failing_reranker_pushes_warning() {
+        use rurico::reranker::{RankedResult, Rerank, RerankerError};
+
+        struct FailingReranker;
+
+        impl Rerank for FailingReranker {
+            fn score(&self, _query: &str, _document: &str) -> Result<f32, RerankerError> {
+                Err(RerankerError::Inference(
+                    "forced failure for T-221".to_owned(),
+                ))
+            }
+            fn score_batch(&self, _pairs: &[(&str, &str)]) -> Result<Vec<f32>, RerankerError> {
+                Err(RerankerError::Inference(
+                    "forced failure for T-221".to_owned(),
+                ))
+            }
+            fn rerank(
+                &self,
+                _query: &str,
+                _documents: &[&str],
+            ) -> Result<Vec<RankedResult>, RerankerError> {
+                Err(RerankerError::Inference(
+                    "forced failure for T-221".to_owned(),
+                ))
+            }
+        }
+
+        let db = Db::open_memory().unwrap();
+        setup_db_with_posts(&db);
+
+        let reranker = FailingReranker;
+        let output = hybrid_search(
+            db.conn(),
+            "認証の仕組み",
+            None,
+            10,
+            Timestamp::now(),
+            &SearchFilter::default(),
+            Some(&reranker),
+        )
+        .unwrap();
+        assert!(
+            !output.results.is_empty(),
+            "fallback path should still produce results"
+        );
+        assert!(
+            output
+                .warnings
+                .iter()
+                .any(|w| w.contains("reranker failed") && w.contains("falling back")),
+            "expected warnings to include reranker failure note, got: {:?}",
+            output.warnings
+        );
     }
 }
