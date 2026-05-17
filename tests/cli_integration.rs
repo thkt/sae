@@ -346,3 +346,33 @@ fn force_search_warning_with_json_emits_degraded_envelope() {
         "notes[] must surface the reranker-failure warning; got: {notes:?}"
     );
 }
+
+// T-CI011: SSRF guard rejects http://127.0.0.1 base_url at construction time.
+// Integration tests build the lib without `cfg(test)`, so the test exemption
+// inside `validate_base_url` does NOT apply — the production strict path runs.
+// Pins #138 subtask 3: AI agents that read a misconfigured `base_url` from
+// config / env should never be able to steer the esa client at a private host.
+#[test]
+fn esa_client_rejects_private_ip_base_url() {
+    use sae::client::{ClientError, EsaClient};
+
+    let result = EsaClient::with_base_url("token".into(), "http://127.0.0.1".into());
+    assert!(
+        matches!(result, Err(ClientError::InvalidRequest(_))),
+        "with_base_url('http://127.0.0.1') must be rejected; got: {result:?}"
+    );
+}
+
+// T-CI012: SSRF guard rejects arbitrary attacker-controlled hosts even with
+// https. Companion to T-CI011 pinning the .esa.io allowlist at the binary
+// boundary (strict path, no cfg(test) exemption).
+#[test]
+fn esa_client_rejects_non_esa_host() {
+    use sae::client::{ClientError, EsaClient};
+
+    let result = EsaClient::with_base_url("token".into(), "https://attacker.com".into());
+    assert!(
+        matches!(result, Err(ClientError::InvalidRequest(_))),
+        "with_base_url('https://attacker.com') must be rejected; got: {result:?}"
+    );
+}

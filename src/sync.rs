@@ -406,7 +406,8 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        let client = EsaClient::with_base_url("tok".into(), server.uri());
+        let client = EsaClient::with_base_url("tok".into(), server.uri())
+            .expect("wiremock uri should pass SSRF validation under cfg(test)");
         let db = Db::open_memory().unwrap();
 
         let r = harvest(&client, &db, "t", false).await.unwrap();
@@ -433,7 +434,8 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        let client = EsaClient::with_base_url("tok".into(), server.uri());
+        let client = EsaClient::with_base_url("tok".into(), server.uri())
+            .expect("wiremock uri should pass SSRF validation under cfg(test)");
         let db = Db::open_memory().unwrap();
         harvest(&client, &db, "t", false).await.unwrap();
 
@@ -474,7 +476,8 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        let client = EsaClient::with_base_url("tok".into(), server.uri());
+        let client = EsaClient::with_base_url("tok".into(), server.uri())
+            .expect("wiremock uri should pass SSRF validation under cfg(test)");
         let db = Db::open_memory().unwrap();
 
         let r = harvest(&client, &db, "t", false).await.unwrap();
@@ -509,7 +512,8 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        let client = EsaClient::with_base_url("tok".into(), server.uri());
+        let client = EsaClient::with_base_url("tok".into(), server.uri())
+            .expect("wiremock uri should pass SSRF validation under cfg(test)");
         let db = Db::open_memory().unwrap();
 
         let r = harvest(&client, &db, "t", false).await.unwrap();
@@ -530,7 +534,8 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        let client = EsaClient::with_base_url("tok".into(), server.uri());
+        let client = EsaClient::with_base_url("tok".into(), server.uri())
+            .expect("wiremock uri should pass SSRF validation under cfg(test)");
         let db = Db::open_memory().unwrap();
         harvest(&client, &db, "t", false).await.unwrap();
 
@@ -768,7 +773,8 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        let client = EsaClient::with_base_url("tok".into(), server.uri());
+        let client = EsaClient::with_base_url("tok".into(), server.uri())
+            .expect("wiremock uri should pass SSRF validation under cfg(test)");
         let db = Db::open_memory().unwrap();
 
         let r = harvest(&client, &db, "t", false).await.unwrap();
@@ -917,7 +923,8 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        let client = EsaClient::with_base_url("tok".into(), server.uri());
+        let client = EsaClient::with_base_url("tok".into(), server.uri())
+            .expect("wiremock uri should pass SSRF validation under cfg(test)");
         let db = Db::open_memory().unwrap();
         seed_posts(&db, 5);
         storage::save_sync_state(
@@ -959,7 +966,8 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        let client = EsaClient::with_base_url("tok".into(), server.uri());
+        let client = EsaClient::with_base_url("tok".into(), server.uri())
+            .expect("wiremock uri should pass SSRF validation under cfg(test)");
         let db = Db::open_memory().unwrap();
         seed_posts(&db, 7);
         storage::save_sync_state(
