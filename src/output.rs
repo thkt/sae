@@ -22,6 +22,7 @@ pub(crate) fn search(
     semantic: bool,
     embedder_load_failed: bool,
     embed_info: Option<EmbedInfo>,
+    search_warnings: &[String],
 ) -> Result<CommandOutput, SaeError> {
     let search_mode = if semantic { "hybrid" } else { "fts" };
     let data = serde_json::json!({
@@ -62,15 +63,15 @@ pub(crate) fn search(
         }
         lines.join("\n")
     };
+    let mut notes = Vec::new();
     if embedder_load_failed {
-        Ok(CommandOutput::with_notes(
-            markdown,
-            data,
-            true,
-            vec!["semantic search unavailable, falling back to FTS".to_owned()],
-        ))
-    } else {
+        notes.push("semantic search unavailable, falling back to FTS".to_owned());
+    }
+    notes.extend(search_warnings.iter().cloned());
+    if notes.is_empty() {
         Ok(CommandOutput::ok(markdown, data))
+    } else {
+        Ok(CommandOutput::with_notes(markdown, data, true, notes))
     }
 }
 
@@ -337,7 +338,7 @@ mod tests {
     // T-087: search data includes search_mode hybrid
     #[test]
     fn search_json_hybrid_includes_search_mode() {
-        let out = search(&[], "test", true, false, None).unwrap();
+        let out = search(&[], "test", true, false, None, &[]).unwrap();
         assert_eq!(out.data["search_mode"], "hybrid");
         assert!(out.data["results"].is_array());
     }
@@ -345,7 +346,7 @@ mod tests {
     // T-088: search data includes search_mode fts
     #[test]
     fn search_json_fts_includes_search_mode() {
-        let out = search(&[], "test", false, false, None).unwrap();
+        let out = search(&[], "test", false, false, None, &[]).unwrap();
         assert_eq!(out.data["search_mode"], "fts");
     }
 
@@ -361,7 +362,7 @@ mod tests {
             score: 0.5,
             match_source: MatchSource::Fts,
         }];
-        let out = search(&results, "q", false, false, None).unwrap();
+        let out = search(&results, "q", false, false, None, &[]).unwrap();
         assert!(out.markdown.contains("semantic search unavailable"));
     }
 
@@ -377,14 +378,14 @@ mod tests {
             score: 0.5,
             match_source: MatchSource::Fts,
         }];
-        let out = search(&results, "q", true, false, None).unwrap();
+        let out = search(&results, "q", true, false, None, &[]).unwrap();
         assert!(!out.markdown.contains("semantic search unavailable"));
     }
 
     // T-260: search degraded fallback populates notes
     #[test]
     fn search_degraded_fallback_populates_notes() {
-        let out = search(&[], "q", false, true, None).unwrap();
+        let out = search(&[], "q", false, true, None, &[]).unwrap();
         assert!(
             out.degraded,
             "embedder_load_failed=true should set degraded"
@@ -396,8 +397,48 @@ mod tests {
     // T-261: search no-embed (FTS without load failure) leaves notes empty
     #[test]
     fn search_no_embed_does_not_degrade() {
-        let out = search(&[], "q", false, false, None).unwrap();
+        let out = search(&[], "q", false, false, None, &[]).unwrap();
         assert!(!out.degraded);
         assert!(out.notes.is_empty());
+    }
+
+    // T-262: non-empty search_warnings alone (no embedder failure) sets degraded
+    // and surfaces the warnings as notes. Pins #140 wiring: storage warnings
+    // reach the envelope notes[] without depending on embedder_load_failed.
+    #[test]
+    fn search_warnings_alone_set_degraded_and_populate_notes() {
+        let warnings = vec!["reranker failed (boom), falling back to RRF order".to_owned()];
+        let out = search(&[], "q", true, false, None, &warnings).unwrap();
+        assert!(
+            out.degraded,
+            "non-empty warnings should set degraded even with embedder loaded"
+        );
+        assert_eq!(out.notes.len(), 1);
+        assert!(
+            out.notes[0].contains("reranker failed"),
+            "warning should be surfaced in notes[0]; got: {:?}",
+            out.notes
+        );
+    }
+
+    // T-263: embedder_load_failed + non-empty search_warnings produces ordered
+    // notes (embedder note first, then storage warnings). Order pinned so
+    // agents that read notes[0] keep the same upstream-first semantics.
+    #[test]
+    fn search_warnings_with_embedder_failure_preserve_order() {
+        let warnings = vec!["reranker failed (boom), falling back to RRF order".to_owned()];
+        let out = search(&[], "q", false, true, None, &warnings).unwrap();
+        assert!(out.degraded);
+        assert_eq!(out.notes.len(), 2);
+        assert!(
+            out.notes[0].contains("semantic search unavailable"),
+            "embedder note should come first (upstream degradation); got: {:?}",
+            out.notes
+        );
+        assert!(
+            out.notes[1].contains("reranker failed"),
+            "storage warning should come second (downstream); got: {:?}",
+            out.notes
+        );
     }
 }

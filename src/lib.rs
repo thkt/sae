@@ -13,6 +13,26 @@ pub mod tools;
 pub use envelope::CommandOutput;
 pub use tools::{Sae, SaeError};
 
+/// Hidden test seam: builds a [`CommandOutput`] by running `output::search`
+/// with a synthetic search result and a non-empty `search_warnings` slice so
+/// `tests/cli_integration.rs` can pin the `--json` envelope wiring for #140
+/// without seeding a SQLite DB or loading a real reranker. The production
+/// binary built with `cargo install` never exposes this symbol.
+#[cfg(feature = "test-support")]
+pub fn __test_search_with_warnings() -> Result<CommandOutput, SaeError> {
+    let warnings = vec!["reranker failed (forced for test), falling back to RRF order".to_owned()];
+    let result = storage::SearchResult {
+        post_number: 1,
+        post_name: "test post".to_owned(),
+        post_url: "https://example.com/posts/1".to_owned(),
+        section_title: None,
+        snippet: "synthetic snippet".to_owned(),
+        score: 0.5,
+        match_source: storage::MatchSource::Fts,
+    };
+    output::search(&[result], "test query", true, false, None, &warnings)
+}
+
 /// Renders [`CommandOutput`] for stdout. With `json_mode` set, emits the
 /// `SuccessEnvelope`; otherwise the default-mode markdown.
 pub fn render_success(out: &CommandOutput, json_mode: bool) -> String {

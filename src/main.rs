@@ -188,6 +188,14 @@ Examples:
     #[cfg(feature = "test-support")]
     #[command(name = "__test_force_client_api_404", hide = true)]
     TestForceClientApi404,
+    /// Hidden test seam: emit a `CommandOutput` whose `notes[]` contains a
+    /// reranker-failure warning so `tests/cli_integration.rs` can pin the
+    /// `--json` envelope wiring for #140 (storage warnings → envelope notes)
+    /// without seeding a SQLite DB or loading a real reranker. `test-support`
+    /// feature only.
+    #[cfg(feature = "test-support")]
+    #[command(name = "__test_force_search_warning", hide = true)]
+    TestForceSearchWarning,
 }
 
 #[derive(Debug, Subcommand)]
@@ -219,6 +227,7 @@ const KNOWN_SUBCOMMANDS: &[&str] = &[
     "__test_force_backend_unavailable",
     "__test_force_internal",
     "__test_force_client_api_404",
+    "__test_force_search_warning",
 ];
 const GLOBAL_FLAGS: &[&str] = &["--json"];
 
@@ -296,6 +305,8 @@ async fn run(cli: Cli, config: Config) -> Result<CommandOutput, SaeError> {
             status: 404,
             body: r#"{"error":"not_found","message":"Not Found"}"#.to_owned(),
         })),
+        #[cfg(feature = "test-support")]
+        Command::TestForceSearchWarning => sae::__test_search_with_warnings(),
         Command::Model { .. } => unreachable!("handled before Sae::new()"),
     }
 }
