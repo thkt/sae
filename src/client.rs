@@ -154,7 +154,24 @@ impl EsaClient {
         }
     }
 
-    pub fn with_base_url(token: String, base_url: String) -> Self {
+    /// Constructs a client against an arbitrary `base_url`, enforcing the
+    /// esa.io SSRF allowlist. Production callers should use [`EsaClient::new`];
+    /// tests that need wiremock should use [`EsaClient::with_base_url_unchecked`].
+    pub fn with_base_url(token: String, base_url: String) -> Result<Self, ClientError> {
+        validate_base_url(&base_url)?;
+        Ok(Self::construct(token, base_url))
+    }
+
+    /// Test-only constructor that bypasses the SSRF allowlist so wiremock
+    /// servers on `127.0.0.1` / `localhost` are reachable. Not exposed in
+    /// production builds (`#[cfg(test)]` only), so the SSRF guard cannot leak
+    /// into the binary path.
+    #[cfg(test)]
+    pub(crate) fn with_base_url_unchecked(token: String, base_url: String) -> Self {
+        Self::construct(token, base_url)
+    }
+
+    fn construct(token: String, base_url: String) -> Self {
         Self {
             http: Client::new(),
             token,
@@ -320,6 +337,35 @@ impl EsaClient {
     }
 }
 
+/// SSRF guard: accepts only `https://esa.io` or `https://*.esa.io`. Anything
+/// else (private IPs, IPv6 loopback, arbitrary hostnames, non-https schemes,
+/// missing host) is rejected with [`ClientError::InvalidRequest`]. Tests that
+/// need wiremock should construct via [`EsaClient::with_base_url_unchecked`]
+/// rather than weakening this guard with a `cfg(test)` carve-out.
+fn validate_base_url(url: &str) -> Result<(), ClientError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| ClientError::InvalidRequest(format!("invalid base_url '{url}': {e}")))?;
+
+    let host_str = parsed
+        .host_str()
+        .ok_or_else(|| ClientError::InvalidRequest(format!("base_url '{url}' has no host")))?;
+
+    if parsed.scheme() != "https" {
+        return Err(ClientError::InvalidRequest(format!(
+            "base_url '{url}' must use https scheme (got: {})",
+            parsed.scheme()
+        )));
+    }
+
+    if host_str == "esa.io" || host_str.ends_with(".esa.io") {
+        Ok(())
+    } else {
+        Err(ClientError::InvalidRequest(format!(
+            "base_url '{url}' host '{host_str}' is not in allowlist (.esa.io required)"
+        )))
+    }
+}
+
 fn retry_wait(status: u16, retry_after: Option<&str>, attempt: u32) -> Option<Duration> {
     match status {
         429 => {
@@ -357,7 +403,7 @@ mod tests {
     }
 
     async fn test_client(server: &MockServer) -> EsaClient {
-        EsaClient::with_base_url("test-token".into(), server.uri())
+        EsaClient::with_base_url_unchecked("test-token".into(), server.uri())
     }
 
     #[tokio::test]
@@ -770,5 +816,69 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.posts.len(), 1);
+    }
+
+    // T-380: SSRF allowlist accepts https://api.esa.io (canonical production host)
+    #[test]
+    fn validate_base_url_accepts_api_esa_io() {
+        validate_base_url("https://api.esa.io/v1").expect("api.esa.io should be allowed");
+    }
+
+    // T-381: SSRF allowlist accepts https://esa.io (root domain)
+    #[test]
+    fn validate_base_url_accepts_root_esa_io() {
+        validate_base_url("https://esa.io").expect("root esa.io should be allowed");
+    }
+
+    // T-382: SSRF allowlist rejects arbitrary hosts (defense against config
+    // pointing the client at an attacker-controlled host)
+    #[test]
+    fn validate_base_url_rejects_arbitrary_host() {
+        let err = validate_base_url("https://attacker.com")
+            .expect_err("non-esa.io host must be rejected");
+        assert!(matches!(err, ClientError::InvalidRequest(_)));
+    }
+
+    // T-383: SSRF allowlist rejects host suffix attacks (esa.io.attacker.com
+    // ends with .com, not .esa.io)
+    #[test]
+    fn validate_base_url_rejects_host_suffix_attack() {
+        let err = validate_base_url("https://esa.io.attacker.com")
+            .expect_err("esa.io.attacker.com suffix must be rejected");
+        assert!(matches!(err, ClientError::InvalidRequest(_)));
+    }
+
+    // T-384: SSRF allowlist rejects private IP literals (defense in depth even
+    // though they would not match the .esa.io allowlist anyway)
+    #[test]
+    fn validate_base_url_rejects_private_ip() {
+        let err =
+            validate_base_url("https://10.0.0.1").expect_err("private IP literal must be rejected");
+        assert!(matches!(err, ClientError::InvalidRequest(_)));
+    }
+
+    // T-387: SSRF allowlist rejects IPv6 loopback `::1`. Issue #138 subtask 3
+    // explicitly enumerates `::1` as a rejection target alongside IPv4 private
+    // ranges. `reqwest::Url::parse` reads it as `host_str = "[::1]"` which
+    // cannot satisfy the `.esa.io` suffix.
+    #[test]
+    fn validate_base_url_rejects_ipv6_loopback() {
+        let err = validate_base_url("https://[::1]/").expect_err("IPv6 loopback must be rejected");
+        assert!(matches!(err, ClientError::InvalidRequest(_)));
+    }
+
+    // T-385: SSRF allowlist rejects non-http(s) schemes (gopher / file / ftp
+    // / data are common SSRF amplifiers)
+    #[test]
+    fn validate_base_url_rejects_ftp_scheme() {
+        let err = validate_base_url("ftp://api.esa.io").expect_err("ftp scheme must be rejected");
+        assert!(matches!(err, ClientError::InvalidRequest(_)));
+    }
+
+    // T-386: SSRF allowlist rejects unparseable URLs
+    #[test]
+    fn validate_base_url_rejects_invalid_url() {
+        let err = validate_base_url("not-a-url").expect_err("garbage must be rejected");
+        assert!(matches!(err, ClientError::InvalidRequest(_)));
     }
 }
