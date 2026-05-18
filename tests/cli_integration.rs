@@ -412,6 +412,46 @@ fn no_team_envelope_lists_known_teams_as_candidates() {
     );
 }
 
+// T-CI015: end-to-end — a typo subcommand emits a `--json` envelope whose
+// `error.candidates` lists the user-facing subcommands without any
+// `__test_*` seam leaking. Closes #148.
+#[test]
+fn invalid_subcommand_envelope_lists_public_subcommands() {
+    let dir = tempdir().unwrap();
+    let output = sae_command(dir.path())
+        .args(["--json", "sserach", "test query"])
+        .output()
+        .expect("failed to spawn sae binary");
+
+    assert!(
+        !output.status.success(),
+        "typo subcommand must exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let env = parse_stderr_envelope(&stderr);
+    assert_eq!(env["error"]["code"], "USAGE_ERROR");
+
+    let candidates = env["error"]["candidates"]
+        .as_array()
+        .expect("candidates must be an array");
+    assert!(
+        !candidates.is_empty(),
+        "InvalidSubcommand must surface candidates; envelope: {env}"
+    );
+    assert!(
+        candidates
+            .iter()
+            .all(|c| !c.as_str().is_some_and(|s| s.starts_with("__test_"))),
+        "test-seam subcommands must not leak to user-facing candidates; got: {candidates:?}"
+    );
+    for required in ["search", "get", "status"] {
+        assert!(
+            candidates.iter().any(|c| c == required),
+            "candidates must include {required:?}; got: {candidates:?}"
+        );
+    }
+}
+
 // T-CI011: SSRF guard rejects http://127.0.0.1 base_url at construction time.
 // Integration tests cannot see `with_base_url_unchecked` (gated on `cfg(test)`
 // in the lib build), so they exercise the strict `with_base_url` path.

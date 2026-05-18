@@ -204,12 +204,27 @@ enum ModelCommand {
     Download,
 }
 
-// Includes the deprecated `harvest` (split into `index`/`rebuild` in v0.3.0)
-// so `sae harvest` reaches clap as an unrecognized subcommand instead of being
-// silently rewritten to `sae search harvest` by the shorthand expander.
-// `__test_force_unknown` is the hidden test seam (#127 OPS-005); listing it
-// here keeps the production binary from rewriting it to `sae search
-// __test_force_unknown` so users see clap's "unrecognized subcommand" error.
+// User-facing subcommand list, used as the `candidates` array for
+// `ErrorKind::InvalidSubcommand` (#148). Excludes:
+//   - `__test_*` seams (hidden, not for agent retry)
+//   - `harvest` (deprecated in v0.3.0; surfacing it as a "did you mean"
+//     would tell an agent to retry into the same clap error)
+// Kept manually parallel to the live `Cli` enum; drift is guarded by
+// `public_subcommands_matches_cli_non_hidden` in tests.
+const PUBLIC_SUBCOMMANDS: &[&str] = &[
+    "index", "rebuild", "search", "get", "create", "update", "archive", "ship", "embed", "status",
+    "model",
+];
+
+// Superset consulted by `try_expand_shorthand`. The `__test_force_*` entries
+// are hidden test seams (#127 OPS-005); listing them here keeps the
+// production binary from rewriting `sae __test_force_unknown` to
+// `sae search __test_force_unknown` so users see clap's "unrecognized
+// subcommand" error.
+// Also includes the deprecated `harvest` (split into `index`/`rebuild` in
+// v0.3.0) so `sae harvest` reaches clap as an unrecognized subcommand
+// instead of being silently rewritten to `sae search harvest` (pinned by
+// `deprecated_harvest_not_rewritten_as_search`, T-034c).
 const KNOWN_SUBCOMMANDS: &[&str] = &[
     "index",
     "rebuild",
@@ -344,7 +359,7 @@ fn handle_parse_error(e: &clap::Error, json_mode: bool) -> ExitCode {
         return ExitCode::SUCCESS;
     }
     if json_mode {
-        eprintln!("{}", render_parse_error(e, true));
+        eprintln!("{}", render_parse_error(e, true, PUBLIC_SUBCOMMANDS));
     } else {
         let _ = e.print();
     }
@@ -599,6 +614,26 @@ mod tests {
             }
             other => panic!("expected Archive, got {other:?}"),
         }
+    }
+
+    // T-400: PUBLIC_SUBCOMMANDS must match Cli's non-hidden subcommands
+    // (kept lock-step manually). Guards against drift when a new subcommand
+    // is added to enum Command without updating the constant (#148).
+    #[test]
+    fn public_subcommands_matches_cli_non_hidden() {
+        let cmd = Cli::command();
+        let from_cli: Vec<&str> = cmd
+            .get_subcommands()
+            .filter(|s| !s.is_hide_set())
+            .map(clap::Command::get_name)
+            .collect();
+        assert_eq!(
+            from_cli.as_slice(),
+            PUBLIC_SUBCOMMANDS,
+            "PUBLIC_SUBCOMMANDS drifted from Cli's non-hidden subcommands. \
+             Add the new subcommand to PUBLIC_SUBCOMMANDS, hide it from Cli, \
+             or reorder to match the enum definition."
+        );
     }
 
     // T-042: help output contains Examples section
