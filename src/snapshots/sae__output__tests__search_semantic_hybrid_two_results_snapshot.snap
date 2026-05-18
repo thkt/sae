@@ -1,0 +1,8 @@
+---
+source: src/output.rs
+expression: out.markdown
+---
+[0.9123] Architecture > Overview (#101)  https://example.esa.io/posts/101
+  First snippet content
+[0.7456] Pricing model (#102)  https://example.esa.io/posts/102
+  Second snippet content

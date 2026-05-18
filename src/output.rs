@@ -205,7 +205,50 @@ pub(crate) fn status(statuses: &[TeamStatus]) -> Result<CommandOutput, SaeError>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::client::EsaUser;
     use crate::storage::{EmbedResult, MatchSource, SyncState};
+
+    fn make_post() -> EsaPost {
+        EsaPost {
+            number: 42,
+            name: "Onboarding".to_owned(),
+            full_name: "design/Onboarding".to_owned(),
+            body_md: Some("# Welcome\n\nFirst paragraph.".to_owned()),
+            category: Some("design".to_owned()),
+            tags: vec!["docs".to_owned(), "team".to_owned()],
+            wip: false,
+            kind: "stock".to_owned(),
+            url: "https://example.esa.io/posts/42".to_owned(),
+            created_at: "2025-01-01 00:00:00".to_owned(),
+            updated_at: "2025-01-15 12:00:00".to_owned(),
+            created_by: EsaUser {
+                screen_name: "alice".to_owned(),
+            },
+            updated_by: EsaUser {
+                screen_name: "alice".to_owned(),
+            },
+            revision_number: 3,
+        }
+    }
+
+    fn make_result(
+        post_number: u32,
+        name: &str,
+        section: Option<&str>,
+        score: f32,
+        snippet: &str,
+        source: MatchSource,
+    ) -> SearchResult {
+        SearchResult {
+            post_number,
+            post_name: name.to_owned(),
+            post_url: format!("https://example.esa.io/posts/{post_number}"),
+            section_title: section.map(str::to_owned),
+            snippet: snippet.to_owned(),
+            score,
+            match_source: source,
+        }
+    }
 
     fn make_synced(team: &str, posts: u32) -> TeamStatus {
         TeamStatus {
@@ -353,15 +396,7 @@ mod tests {
     // T-089: search human fts fallback shows notice
     #[test]
     fn search_human_fts_fallback_shows_notice() {
-        let results = vec![SearchResult {
-            post_number: 1,
-            post_name: "Test".to_owned(),
-            post_url: "https://example.com".to_owned(),
-            section_title: None,
-            snippet: String::new(),
-            score: 0.5,
-            match_source: MatchSource::Fts,
-        }];
+        let results = vec![make_result(1, "Test", None, 0.5, "", MatchSource::Fts)];
         let out = search(&results, "q", false, false, None, &[]).unwrap();
         assert!(out.markdown.contains("semantic search unavailable"));
     }
@@ -369,15 +404,7 @@ mod tests {
     // T-090: search human hybrid does not show fallback notice
     #[test]
     fn search_human_hybrid_no_fallback_notice() {
-        let results = vec![SearchResult {
-            post_number: 1,
-            post_name: "Test".to_owned(),
-            post_url: "https://example.com".to_owned(),
-            section_title: None,
-            snippet: String::new(),
-            score: 0.5,
-            match_source: MatchSource::Fts,
-        }];
+        let results = vec![make_result(1, "Test", None, 0.5, "", MatchSource::Fts)];
         let out = search(&results, "q", true, false, None, &[]).unwrap();
         assert!(!out.markdown.contains("semantic search unavailable"));
     }
@@ -440,5 +467,59 @@ mod tests {
             "storage warning should come second (downstream); got: {:?}",
             out.notes
         );
+    }
+
+    // T-401: format_post_frontmatter typical post → frontmatter snapshot.
+    // Out of scope: wip:true / updated_by != created_by (separate pin if needed).
+    #[test]
+    fn format_post_frontmatter_typical_post_snapshot() {
+        let post = make_post();
+        insta::assert_snapshot!(format_post_frontmatter(&post));
+    }
+
+    // T-402: search hybrid with section_title present vs absent → markdown snapshot.
+    #[test]
+    fn search_semantic_hybrid_two_results_snapshot() {
+        let results = vec![
+            make_result(
+                101,
+                "Architecture",
+                Some("Overview"),
+                0.9123,
+                "First snippet content",
+                MatchSource::Semantic,
+            ),
+            make_result(
+                102,
+                "Pricing model",
+                None,
+                0.7456,
+                "Second snippet content",
+                MatchSource::Fts,
+            ),
+        ];
+        let out = search(&results, "design", true, false, None, &[]).unwrap();
+        insta::assert_snapshot!(out.markdown);
+    }
+
+    // T-403: search FTS fallback with embed_info → markdown snapshot
+    // (agents parse the embed hint).
+    #[test]
+    fn search_fts_fallback_with_embed_info_snapshot() {
+        let results = vec![make_result(
+            1,
+            "Test post",
+            None,
+            0.5,
+            "snippet text",
+            MatchSource::Fts,
+        )];
+        let info = EmbedInfo {
+            processed: 5,
+            budget_exhausted: true,
+            team: "demo".to_owned(),
+        };
+        let out = search(&results, "test", false, false, Some(info), &[]).unwrap();
+        insta::assert_snapshot!(out.markdown);
     }
 }
