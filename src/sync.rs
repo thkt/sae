@@ -1,16 +1,6 @@
 //! Bulk sync (`index` / `rebuild`) between esa.io and the local SQLite cache.
-//!
-//! [`SyncError`] flattens client- and storage-layer failures into one type so
-//! orchestrators see a uniform `Result`. [`SyncError::is_retryable`] is the
-//! per-variant retry discriminator: it returns `true` only for transient
-//! storage conditions (SQLite WAL contention, transient I/O). The retry
-//! policy in [`crate::tools::SaeError::error_code`] consults it to route
-//! `SyncError::Storage(transient)` to `TempFailure (75)` instead of the
-//! `CantCreat (73)` default, so AI agents do not give up on recoverable
-//! failures (#138 subtask 2).
 
 use std::fmt;
-use std::io;
 
 use amici::cli::progress_step;
 use tracing::info;
@@ -63,42 +53,17 @@ pub enum SyncError {
 }
 
 impl SyncError {
-    /// True when the failure originates from a transient condition retrying
-    /// might recover. Only the `Storage` variant uses this discriminator;
-    /// `Client` retryability is already classified per-variant in
-    /// [`crate::tools::SaeError::error_code`] (Network / MaxRetries →
-    /// `TempFailure`, Api / InvalidRequest → `Internal`).
+    /// True when the failure is transient enough that retrying might recover.
     ///
-    /// Retryable storage cases: SQLite `SQLITE_BUSY` / `SQLITE_LOCKED` under
-    /// WAL contention, and `io::ErrorKind::{WouldBlock, Interrupted,
-    /// TimedOut}` for transient I/O. Everything else (Open failure, schema
-    /// mismatch, non-busy SQLite errors) is non-retryable.
+    /// `Client` variants always return `false`: their retryability is
+    /// classified per-case in [`crate::tools::SaeError::error_code`]
+    /// (Network / MaxRetries → `TempFailure`, Api → `Internal`).
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Client(_) => false,
-            Self::Storage(StorageError::Open(_)) => false,
-            Self::Storage(StorageError::Db(e)) => is_retryable_sqlite_error(e),
-            Self::Storage(StorageError::Io(e)) => is_retryable_io_error(e),
+            Self::Storage(e) => e.is_retryable(),
         }
     }
-}
-
-fn is_retryable_sqlite_error(e: &rusqlite::Error) -> bool {
-    matches!(
-        e,
-        rusqlite::Error::SqliteFailure(err, _)
-            if matches!(
-                err.code,
-                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
-            )
-    )
-}
-
-fn is_retryable_io_error(e: &io::Error) -> bool {
-    matches!(
-        e.kind(),
-        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
-    )
 }
 
 pub async fn harvest(
@@ -362,10 +327,13 @@ fn post_to_row(post: &EsaPost) -> EsaPostRow {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::*;
-    use crate::client::EsaUser;
+    use rusqlite::ErrorCode;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::client::EsaUser;
+    use crate::storage::sqlite_failure;
 
     fn make_esa_post(number: u32, name: &str, body_md: &str, updated_at: &str) -> EsaPost {
         EsaPost {
@@ -1067,43 +1035,29 @@ pub(crate) mod tests {
         );
     }
 
-    // T-260a: SyncError::is_retryable() returns true for transient SQLite busy
+    // T-353: SyncError::is_retryable() returns true for transient SQLite busy
     // (WAL contention). Without this, the catch-all CantCreat (73) routing
     // blocks AI-agent auto-retry on recoverable contention (#138 subtask 2).
     #[test]
     fn is_retryable_true_for_sqlite_busy() {
-        use rusqlite::{Error as SqlError, ErrorCode, ffi};
-        let busy = SqlError::SqliteFailure(
-            ffi::Error {
-                code: ErrorCode::DatabaseBusy,
-                extended_code: 5,
-            },
-            None,
-        );
+        let busy = sqlite_failure(ErrorCode::DatabaseBusy, 5);
         let err = SyncError::Storage(StorageError::Db(busy));
         assert!(err.is_retryable(), "SQLITE_BUSY must be retryable");
     }
 
-    // T-260b: SyncError::is_retryable() returns true for SQLITE_LOCKED
-    // (sibling of BUSY under heavier contention).
+    // T-354: SyncError::is_retryable() returns true for SQLITE_LOCKED.
     #[test]
     fn is_retryable_true_for_sqlite_locked() {
-        use rusqlite::{Error as SqlError, ErrorCode, ffi};
-        let locked = SqlError::SqliteFailure(
-            ffi::Error {
-                code: ErrorCode::DatabaseLocked,
-                extended_code: 6,
-            },
-            None,
-        );
+        let locked = sqlite_failure(ErrorCode::DatabaseLocked, 6);
         let err = SyncError::Storage(StorageError::Db(locked));
         assert!(err.is_retryable(), "SQLITE_LOCKED must be retryable");
     }
 
-    // T-260c: SyncError::is_retryable() returns true for transient I/O kinds
+    // T-355: SyncError::is_retryable() returns true for transient I/O kinds
     // (WouldBlock / Interrupted / TimedOut).
     #[test]
     fn is_retryable_true_for_transient_io() {
+        use std::io;
         for kind in [
             io::ErrorKind::WouldBlock,
             io::ErrorKind::Interrupted,
@@ -1114,21 +1068,16 @@ pub(crate) mod tests {
         }
     }
 
-    // T-260d: SyncError::is_retryable() returns false for non-retryable
+    // T-356: SyncError::is_retryable() returns false for non-retryable
     // storage variants (Open failure, non-busy SQLite, permanent I/O).
     #[test]
     fn is_retryable_false_for_non_retryable_storage() {
-        use rusqlite::{Error as SqlError, ErrorCode, ffi};
+        use std::io;
+
         let open_err = SyncError::Storage(StorageError::Open("path missing".into()));
         assert!(!open_err.is_retryable());
 
-        let schema = SqlError::SqliteFailure(
-            ffi::Error {
-                code: ErrorCode::DatabaseCorrupt,
-                extended_code: 11,
-            },
-            None,
-        );
+        let schema = sqlite_failure(ErrorCode::DatabaseCorrupt, 11);
         let db_err = SyncError::Storage(StorageError::Db(schema));
         assert!(!db_err.is_retryable());
 
@@ -1138,7 +1087,7 @@ pub(crate) mod tests {
         assert!(!perm.is_retryable());
     }
 
-    // T-260e: SyncError::is_retryable() always returns false for Client
+    // T-357: SyncError::is_retryable() always returns false for Client
     // variants — Client retryability is classified separately in
     // SaeError::error_code (per-variant Network / MaxRetries / Api routing).
     #[test]
