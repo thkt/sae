@@ -159,7 +159,7 @@ impl EsaClient {
     /// tests that need wiremock should use [`EsaClient::with_base_url_unchecked`].
     pub fn with_base_url(token: String, base_url: String) -> Result<Self, ClientError> {
         validate_base_url(&base_url)?;
-        Ok(Self::construct(token, base_url))
+        Ok(Self::construct(token, base_url, REQUEST_INTERVAL))
     }
 
     /// Test-only constructor that bypasses the SSRF allowlist so wiremock
@@ -168,15 +168,15 @@ impl EsaClient {
     /// into the binary path.
     #[cfg(test)]
     pub(crate) fn with_base_url_unchecked(token: String, base_url: String) -> Self {
-        Self::construct(token, base_url)
+        Self::construct(token, base_url, Duration::ZERO)
     }
 
-    fn construct(token: String, base_url: String) -> Self {
+    fn construct(token: String, base_url: String, request_interval: Duration) -> Self {
         Self {
             http: Client::new(),
             token,
             base_url,
-            request_interval: Duration::ZERO,
+            request_interval,
             last_request: Mutex::new(None),
         }
     }
@@ -880,5 +880,22 @@ mod tests {
     fn validate_base_url_rejects_invalid_url() {
         let err = validate_base_url("not-a-url").expect_err("garbage must be rejected");
         assert!(matches!(err, ClientError::InvalidRequest(_)));
+    }
+
+    // T-388: with_base_url uses production REQUEST_INTERVAL so the esa
+    // 75 req / 15 min quota throttle is enforced.
+    #[test]
+    fn with_base_url_sets_request_interval() {
+        let client =
+            EsaClient::with_base_url("tok".into(), "https://example.esa.io".into()).unwrap();
+        assert_eq!(client.request_interval, REQUEST_INTERVAL);
+    }
+
+    // T-389: with_base_url_unchecked keeps Duration::ZERO so wiremock-backed
+    // tests are not gated by the production rate limiter.
+    #[test]
+    fn with_base_url_unchecked_keeps_zero_interval() {
+        let client = EsaClient::with_base_url_unchecked("tok".into(), "http://127.0.0.1/".into());
+        assert_eq!(client.request_interval, Duration::ZERO);
     }
 }
