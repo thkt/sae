@@ -1,3 +1,10 @@
+//! Storage layer for sae.
+//!
+//! Assumes single-process operation. WAL journaling + `busy_timeout=5000ms`
+//! handle ad-hoc contention from CLI re-invocations, but daemonized or
+//! concurrent CLI runs against the same DB file are unsupported (no advisory
+//! lock); moving to multi-process requires schema and lock redesign.
+
 pub(crate) mod embed;
 mod search;
 mod types;
@@ -92,6 +99,8 @@ const DDL: &str = "
     CREATE INDEX IF NOT EXISTS idx_chunks_post ON chunks(post_number);
 
     CREATE TABLE IF NOT EXISTS sync_state (
+        -- Singleton: one team per database, so sync_state has exactly one row.
+        -- The CHECK guards against schema changes that would allow multiple rows.
         id INTEGER PRIMARY KEY CHECK (id = 1),
         latest_updated_at TEXT,
         total_count INTEGER NOT NULL DEFAULT 0,
@@ -127,6 +136,9 @@ impl Db {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
+                // Best-effort: continue on chmod failure (restricted FS, exotic
+                // mount options) since DB functionality must not be blocked;
+                // the warn surfaces the failure so an operator can notice.
                 if let Err(e) = fs::set_permissions(parent, fs::Permissions::from_mode(0o700)) {
                     warn!(path = %parent.display(), error = %e, "failed to restrict data directory permissions");
                 }
