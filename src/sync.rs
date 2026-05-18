@@ -108,8 +108,7 @@ pub async fn harvest(
     };
     let mut max_api_total: u32 = 0;
 
-    // esa API caps pagination at 10,000 items per query.
-    // When hit, we narrow by updated_at window and continue.
+    // Pagination cap (see PAGINATION_LIMIT): on hit, narrow by updated_at and continue.
     let mut window_boundary: Option<String> = None;
     let mut batch_oldest_ts: Option<String> = None;
 
@@ -118,7 +117,10 @@ pub async fn harvest(
 
         let resp = match client.list_posts(team, page, query.as_deref()).await {
             Ok(r) => r,
-            Err(ClientError::Api { ref body, .. }) if is_pagination_limit(body) => {
+            Err(ClientError::Api {
+                status: 400,
+                ref body,
+            }) if detect_pagination_limit(body, max_api_total) => {
                 if let Some(ref oldest) = batch_oldest_ts {
                     if window_boundary.as_ref() == Some(oldest) {
                         progress_step(&["window didn't advance, stopping"]);
@@ -220,8 +222,42 @@ pub async fn harvest(
     })
 }
 
-fn is_pagination_limit(msg: &str) -> bool {
-    msg.contains("10,000") || msg.contains("10000")
+/// esa API caps pagination at this many items per query. Used as a structured
+/// detection signal for the `400 Bad Request` response: when `max_api_total`
+/// observed in prior responses exceeds this constant, a 400 is almost
+/// certainly the pagination cap rather than an unrelated bad-request.
+const PAGINATION_LIMIT: u32 = 10_000;
+
+/// Detect esa's 10k-item pagination cap from a `400 Bad Request` response.
+///
+/// Primary structured signal: `max_api_total > PAGINATION_LIMIT`. esa returns
+/// 400 to ANY page request when the result set would exceed 10000 items, so
+/// the prior pages' `total_count` is a wording-independent witness.
+///
+/// Fallback: legacy substring match (`"10,000"` / `"10000"`) for the case
+/// where the very first request fails (no prior `total_count` observed).
+/// The fallback is fragile against esa wording changes; both code paths emit
+/// `tracing::warn!` so operators notice when the structured signal stops
+/// agreeing with the substring.
+fn detect_pagination_limit(body: &str, max_api_total: u32) -> bool {
+    let substring_match = body.contains("10,000") || body.contains("10000");
+    if max_api_total > PAGINATION_LIMIT {
+        if !substring_match {
+            tracing::warn!(
+                body = %body,
+                max_api_total,
+                "pagination limit detected by total_count; esa error message wording may have changed (legacy substring missing)"
+            );
+        }
+        return true;
+    }
+    if substring_match {
+        tracing::warn!(
+            body = %body,
+            "pagination limit detected via legacy substring fallback (no structured signal); fragile path"
+        );
+    }
+    substring_match
 }
 
 /// Resolve the remote total to persist in sync_state.
@@ -634,23 +670,46 @@ pub(crate) mod tests {
         assert_eq!(v["gap_detected"], true);
     }
 
-    // T-113: is_pagination_limit
+    // T-113: substring fallback detects comma form when no structured signal exists
     #[test]
-    fn is_pagination_limit_detects_comma_format() {
-        assert!(is_pagination_limit("exceeds 10,000 items"));
+    fn detect_pagination_limit_substring_comma_format() {
+        assert!(detect_pagination_limit("exceeds 10,000 items", 0));
     }
 
-    // T-165: is_pagination_limit detects error message without comma in number
+    // T-165: substring fallback also accepts plain "10000"; both forms appear historically in esa errors
     #[test]
-    fn is_pagination_limit_detects_plain_format() {
-        assert!(is_pagination_limit("exceeds 10000 items"));
+    fn detect_pagination_limit_substring_plain_format() {
+        assert!(detect_pagination_limit("exceeds 10000 items", 0));
     }
 
-    // T-166: is_pagination_limit returns false for messages with non-10000 numbers
+    // T-166: substring fallback rejects unrelated numbers (e.g. "1000") and empty bodies
     #[test]
-    fn is_pagination_limit_rejects_other_numbers() {
-        assert!(!is_pagination_limit("1000 items"));
-        assert!(!is_pagination_limit(""));
+    fn detect_pagination_limit_rejects_other_numbers() {
+        assert!(!detect_pagination_limit("1000 items", 0));
+        assert!(!detect_pagination_limit("", 0));
+    }
+
+    // T-391: structured signal (max_api_total > PAGINATION_LIMIT) recognises the cap regardless of wording (#138 subtask 4)
+    #[test]
+    fn detect_pagination_limit_structured_signal_dominates() {
+        assert!(
+            detect_pagination_limit("Result set capped at 10K", 10_001),
+            "structured signal must win even when substring is absent"
+        );
+        assert!(
+            detect_pagination_limit("totally unrelated error wording", 50_000),
+            "any 400 with prior total > limit must be treated as the cap"
+        );
+    }
+
+    // T-392: no signal returns false; pins the strict `>` boundary so a drift to `>=` fails the suite
+    #[test]
+    fn detect_pagination_limit_returns_false_without_signal() {
+        assert!(!detect_pagination_limit("invalid q parameter", 0));
+        assert!(
+            !detect_pagination_limit("invalid q parameter", PAGINATION_LIMIT),
+            "max_api_total equal to PAGINATION_LIMIT must not trigger detection (only > triggers)"
+        );
     }
 
     // T-114: post_to_row with body_md: None → empty string
@@ -805,6 +864,63 @@ pub(crate) mod tests {
             r.gap_detected,
             "local 3 < remote 10001 should surface a gap"
         );
+    }
+
+    // T-393: structured signal narrows the window even when the 400 body has no "10,000"/"10000" substring (#138 subtask 4)
+    #[tokio::test]
+    async fn pagination_limit_narrows_window_via_structured_signal() {
+        let server = MockServer::start().await;
+
+        // Page 1: total_count=10_001 → max_api_total > PAGINATION_LIMIT for the next call
+        Mock::given(method("GET"))
+            .and(path("/teams/t/posts"))
+            .and(query_param("page", "1"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(posts_response(
+                &[
+                    api_post(1, "A", "2025-01-03T00:00:00+09:00"),
+                    api_post(2, "B", "2025-01-02T00:00:00+09:00"),
+                ],
+                Some(2),
+                10_001,
+            )))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        // Reworded esa error — no legacy substring; only the structured
+        // total_count witness from page 1 saves us.
+        Mock::given(method("GET"))
+            .and(path("/teams/t/posts"))
+            .and(query_param("page", "2"))
+            .respond_with(ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                "error": "bad_request",
+                "message": "Result set capped — refine your query"
+            })))
+            .up_to_n_times(1)
+            .mount(&server)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/teams/t/posts"))
+            .and(query_param("q", "updated:<=2025-01-02T00:00:00+09:00"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(posts_response(
+                &[api_post(3, "C", "2025-01-01T00:00:00+09:00")],
+                None,
+                1,
+            )))
+            .mount(&server)
+            .await;
+
+        let client = EsaClient::with_base_url_unchecked("tok".into(), server.uri());
+        let db = Db::open_memory().unwrap();
+
+        let r = harvest(&client, &db, "t", false).await.unwrap();
+        assert!(
+            r.posts_fetched >= 3,
+            "structured-signal detection must narrow without substring match"
+        );
+        assert_eq!(storage::count_posts(db.conn()).unwrap(), 3);
+        assert_eq!(r.total_count, 10_001);
     }
 
     // T-300: upsert_post_locally inserts a post into an empty DB
