@@ -168,6 +168,10 @@ pub(crate) fn run_search(
         embed_info,
         &search_output.warnings,
     )?;
+    // 5-minute TTL: long enough that repeated user searches within a single
+    // workflow do not trigger redundant background harvests (coalescing), but
+    // short enough that an idle period (e.g., next day) re-fetches before the
+    // next search returns stale results.
     const PREFETCH_TTL_SECS: u64 = 5 * 60;
     if !storage::sync_harvested_within(db.conn(), PREFETCH_TTL_SECS) {
         spawn_background_index(team);
