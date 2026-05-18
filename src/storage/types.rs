@@ -118,6 +118,55 @@ pub enum StorageError {
     Io(#[from] io::Error),
 }
 
+impl StorageError {
+    /// True for transient conditions where retrying might recover: SQLite
+    /// `SQLITE_BUSY` / `SQLITE_LOCKED` under WAL contention, and
+    /// `io::ErrorKind::{WouldBlock, Interrupted, TimedOut}`.
+    ///
+    /// Consulted from [`crate::tools::SaeError::error_code`] so AI agents
+    /// auto-retry instead of bailing on the `CantCreat (73)` default
+    /// (#138 subtask 2).
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Open(_) => false,
+            Self::Db(e) => is_retryable_sqlite_error(e),
+            Self::Io(e) => is_retryable_io_error(e),
+        }
+    }
+}
+
+fn is_retryable_sqlite_error(e: &rusqlite::Error) -> bool {
+    matches!(
+        e,
+        rusqlite::Error::SqliteFailure(err, _)
+            if matches!(
+                err.code,
+                rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked
+            )
+    )
+}
+
+fn is_retryable_io_error(e: &io::Error) -> bool {
+    matches!(
+        e.kind(),
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted | io::ErrorKind::TimedOut
+    )
+}
+
+/// Test helper: build a typed `rusqlite::Error::SqliteFailure` so callers do
+/// not repeat the same 4-line struct literal in every test module.
+#[cfg(test)]
+pub(crate) fn sqlite_failure(code: rusqlite::ErrorCode, extended_code: i32) -> rusqlite::Error {
+    use rusqlite::{Error, ffi};
+    Error::SqliteFailure(
+        ffi::Error {
+            code,
+            extended_code,
+        },
+        None,
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

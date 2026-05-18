@@ -1,3 +1,5 @@
+//! Bulk sync (`index` / `rebuild`) between esa.io and the local SQLite cache.
+
 use std::fmt;
 
 use amici::cli::progress_step;
@@ -48,6 +50,20 @@ pub enum SyncError {
 
     #[error(transparent)]
     Storage(#[from] StorageError),
+}
+
+impl SyncError {
+    /// True when the failure is transient enough that retrying might recover.
+    ///
+    /// `Client` variants always return `false`: their retryability is
+    /// classified per-case in [`crate::tools::SaeError::error_code`]
+    /// (Network / MaxRetries → `TempFailure`, Api → `Internal`).
+    pub fn is_retryable(&self) -> bool {
+        match self {
+            Self::Client(_) => false,
+            Self::Storage(e) => e.is_retryable(),
+        }
+    }
 }
 
 pub async fn harvest(
@@ -311,10 +327,13 @@ fn post_to_row(post: &EsaPost) -> EsaPostRow {
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use super::*;
-    use crate::client::EsaUser;
+    use rusqlite::ErrorCode;
     use wiremock::matchers::{method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    use super::*;
+    use crate::client::EsaUser;
+    use crate::storage::sqlite_failure;
 
     fn make_esa_post(number: u32, name: &str, body_md: &str, updated_at: &str) -> EsaPost {
         EsaPost {
@@ -1014,5 +1033,72 @@ pub(crate) mod tests {
             200,
             "first incremental (no prior) accepts the diff total when it dominates"
         );
+    }
+
+    // T-353: SyncError::is_retryable() returns true for transient SQLite busy
+    // (WAL contention). Without this, the catch-all CantCreat (73) routing
+    // blocks AI-agent auto-retry on recoverable contention (#138 subtask 2).
+    #[test]
+    fn is_retryable_true_for_sqlite_busy() {
+        let busy = sqlite_failure(ErrorCode::DatabaseBusy, 5);
+        let err = SyncError::Storage(StorageError::Db(busy));
+        assert!(err.is_retryable(), "SQLITE_BUSY must be retryable");
+    }
+
+    // T-354: SyncError::is_retryable() returns true for SQLITE_LOCKED.
+    #[test]
+    fn is_retryable_true_for_sqlite_locked() {
+        let locked = sqlite_failure(ErrorCode::DatabaseLocked, 6);
+        let err = SyncError::Storage(StorageError::Db(locked));
+        assert!(err.is_retryable(), "SQLITE_LOCKED must be retryable");
+    }
+
+    // T-355: SyncError::is_retryable() returns true for transient I/O kinds
+    // (WouldBlock / Interrupted / TimedOut).
+    #[test]
+    fn is_retryable_true_for_transient_io() {
+        use std::io;
+        for kind in [
+            io::ErrorKind::WouldBlock,
+            io::ErrorKind::Interrupted,
+            io::ErrorKind::TimedOut,
+        ] {
+            let err = SyncError::Storage(StorageError::Io(io::Error::from(kind)));
+            assert!(err.is_retryable(), "{kind:?} must be retryable");
+        }
+    }
+
+    // T-356: SyncError::is_retryable() returns false for non-retryable
+    // storage variants (Open failure, non-busy SQLite, permanent I/O).
+    #[test]
+    fn is_retryable_false_for_non_retryable_storage() {
+        use std::io;
+
+        let open_err = SyncError::Storage(StorageError::Open("path missing".into()));
+        assert!(!open_err.is_retryable());
+
+        let schema = sqlite_failure(ErrorCode::DatabaseCorrupt, 11);
+        let db_err = SyncError::Storage(StorageError::Db(schema));
+        assert!(!db_err.is_retryable());
+
+        let perm = SyncError::Storage(StorageError::Io(io::Error::from(
+            io::ErrorKind::PermissionDenied,
+        )));
+        assert!(!perm.is_retryable());
+    }
+
+    // T-357: SyncError::is_retryable() always returns false for Client
+    // variants — Client retryability is classified separately in
+    // SaeError::error_code (per-variant Network / MaxRetries / Api routing).
+    #[test]
+    fn is_retryable_false_for_client_variants() {
+        let token = SyncError::Client(ClientError::TokenNotSet);
+        assert!(!token.is_retryable());
+
+        let api = SyncError::Client(ClientError::Api {
+            status: 503,
+            body: "Service Unavailable".into(),
+        });
+        assert!(!api.is_retryable());
     }
 }

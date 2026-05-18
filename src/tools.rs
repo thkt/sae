@@ -381,6 +381,11 @@ impl SaeError {
             Self::InputData(_) => ErrorCode::DataError,
             Self::Client(ClientError::TokenNotSet)
             | Self::Sync(SyncError::Client(ClientError::TokenNotSet)) => ErrorCode::UsageError,
+            // Retryable storage failures (SQLite WAL contention, transient I/O)
+            // route to `TempFailure` (75) instead of the `CantCreat` (73) default
+            // so AI agents auto-retry recoverable conditions (#138 subtask 2).
+            Self::Storage(e) if e.is_retryable() => ErrorCode::TempFailure,
+            Self::Sync(e) if e.is_retryable() => ErrorCode::TempFailure,
             Self::Storage(_) | Self::Sync(SyncError::Storage(_)) => ErrorCode::CantCreat,
             // esa API 404 is an input failure (the post number does not exist
             // in the team), not a server-side fault. Route to DATA_ERROR (65)
@@ -598,6 +603,7 @@ mod tests {
     use amici::cli::exit_code::codes;
 
     use super::*;
+    use crate::storage::sqlite_failure;
 
     fn assert_code(err: &SaeError, expected: u8) {
         assert_eq!(err.exit_code(), ExitCode::from(expected));
@@ -790,6 +796,42 @@ mod tests {
             &SaeError::Sync(SyncError::Client(ClientError::MaxRetries(5))),
             codes::TEMP_FAIL,
         );
+    }
+
+    // T-388: Sync(Storage(SQLITE_BUSY)) maps to TEMP_FAIL (75) via the new
+    // `is_retryable()` discriminator (#138 subtask 2). Without this arm, the
+    // CantCreat (73) default catches retryable contention during per-page
+    // harvest and AI agents do not auto-retry.
+    #[test]
+    fn exit_code_sync_storage_sqlite_busy_is_temp_fail() {
+        use rusqlite::ErrorCode;
+        let busy = sqlite_failure(ErrorCode::DatabaseBusy, 5);
+        assert_code(
+            &SaeError::Sync(SyncError::Storage(StorageError::Db(busy))),
+            codes::TEMP_FAIL,
+        );
+    }
+
+    // T-389: Sync(Storage(Open)) still maps to CANT_CREAT (73) — the new
+    // retryability arm is order-sensitive and must not capture non-retryable
+    // storage failures (companion to T-388 / T-247).
+    #[test]
+    fn exit_code_sync_storage_open_is_cant_creat_after_retry_arm() {
+        assert_code(
+            &SaeError::Sync(SyncError::Storage(StorageError::Open("missing".into()))),
+            codes::CANT_CREAT,
+        );
+    }
+
+    // T-390: Storage(SQLITE_BUSY) (no Sync wrapping) also maps to TEMP_FAIL.
+    // Covers `Db::open` contention during `sae index`/`rebuild` startup
+    // where the error surfaces as `SaeError::Storage` directly, before
+    // `sync::harvest` wraps it (Codex P2 finding on #138 subtask 2).
+    #[test]
+    fn exit_code_storage_sqlite_busy_is_temp_fail() {
+        use rusqlite::ErrorCode;
+        let busy = sqlite_failure(ErrorCode::DatabaseBusy, 5);
+        assert_code(&SaeError::Storage(StorageError::Db(busy)), codes::TEMP_FAIL);
     }
 
     // T-300: Sae::with_env enables rerank when SAE_RERANK="1"
