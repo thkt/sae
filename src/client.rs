@@ -154,19 +154,31 @@ impl EsaClient {
         }
     }
 
-    /// Constructs a client against an arbitrary `base_url`. Validates the URL
-    /// against the esa.io allowlist (SSRF guard); rejects HTTP except for
-    /// localhost / 127.0.0.1 under `cfg(test)` so wiremock-backed unit tests
-    /// keep working. Production callers should use [`EsaClient::new`].
+    /// Constructs a client against an arbitrary `base_url`, enforcing the
+    /// esa.io SSRF allowlist. Production callers should use [`EsaClient::new`];
+    /// tests that need wiremock should use [`EsaClient::with_base_url_unchecked`].
     pub fn with_base_url(token: String, base_url: String) -> Result<Self, ClientError> {
         validate_base_url(&base_url)?;
-        Ok(Self {
+        Ok(Self::construct(token, base_url))
+    }
+
+    /// Test-only constructor that bypasses the SSRF allowlist so wiremock
+    /// servers on `127.0.0.1` / `localhost` are reachable. Not exposed in
+    /// production builds (`#[cfg(test)]` only), so the SSRF guard cannot leak
+    /// into the binary path.
+    #[cfg(test)]
+    pub(crate) fn with_base_url_unchecked(token: String, base_url: String) -> Self {
+        Self::construct(token, base_url)
+    }
+
+    fn construct(token: String, base_url: String) -> Self {
+        Self {
             http: Client::new(),
             token,
             base_url,
             request_interval: Duration::ZERO,
             last_request: Mutex::new(None),
-        })
+        }
     }
 
     pub fn from_env() -> Result<Self, ClientError> {
@@ -325,17 +337,11 @@ impl EsaClient {
     }
 }
 
-/// SSRF guard: rejects any `base_url` that is not within the esa.io zone.
-///
-/// Allowed shapes:
-/// - `https://esa.io` or `https://*.esa.io` (production)
-/// - `http://localhost` or `http://127.0.0.1` under `cfg(test)` only (wiremock)
-///
-/// Anything else (private IPs, arbitrary hostnames, plain http to public hosts,
-/// IP-literal hosts, missing host, non-http(s) schemes) is rejected with
-/// [`ClientError::InvalidRequest`]. Integration tests in
-/// `tests/cli_integration.rs` build the lib without `cfg(test)`, so the test
-/// exemption does not leak into the binary path.
+/// SSRF guard: accepts only `https://esa.io` or `https://*.esa.io`. Anything
+/// else (private IPs, IPv6 loopback, arbitrary hostnames, non-https schemes,
+/// missing host) is rejected with [`ClientError::InvalidRequest`]. Tests that
+/// need wiremock should construct via [`EsaClient::with_base_url_unchecked`]
+/// rather than weakening this guard with a `cfg(test)` carve-out.
 fn validate_base_url(url: &str) -> Result<(), ClientError> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| ClientError::InvalidRequest(format!("invalid base_url '{url}': {e}")))?;
@@ -343,11 +349,6 @@ fn validate_base_url(url: &str) -> Result<(), ClientError> {
     let host_str = parsed
         .host_str()
         .ok_or_else(|| ClientError::InvalidRequest(format!("base_url '{url}' has no host")))?;
-
-    #[cfg(test)]
-    if parsed.scheme() == "http" && (host_str == "localhost" || host_str == "127.0.0.1") {
-        return Ok(());
-    }
 
     if parsed.scheme() != "https" {
         return Err(ClientError::InvalidRequest(format!(
@@ -402,8 +403,7 @@ mod tests {
     }
 
     async fn test_client(server: &MockServer) -> EsaClient {
-        EsaClient::with_base_url("test-token".into(), server.uri())
-            .expect("wiremock uri should pass SSRF validation under cfg(test)")
+        EsaClient::with_base_url_unchecked("test-token".into(), server.uri())
     }
 
     #[tokio::test]

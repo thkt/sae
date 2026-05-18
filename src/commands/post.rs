@@ -262,8 +262,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = EsaClient::with_base_url("tok".into(), server.uri())
-            .expect("wiremock uri should pass SSRF validation under cfg(test)");
+        let client = EsaClient::with_base_url_unchecked("tok".into(), server.uri());
         let db = Db::open_memory().unwrap();
         let args = create_args("Created Post");
 
@@ -297,8 +296,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = EsaClient::with_base_url("tok".into(), server.uri())
-            .expect("wiremock uri should pass SSRF validation under cfg(test)");
+        let client = EsaClient::with_base_url_unchecked("tok".into(), server.uri());
         let db = Db::open_memory().unwrap();
         let args = update_args(7);
 
@@ -338,8 +336,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = EsaClient::with_base_url("tok".into(), server.uri())
-            .expect("wiremock uri should pass SSRF validation under cfg(test)");
+        let client = EsaClient::with_base_url_unchecked("tok".into(), server.uri());
         let args = create_args("No DB");
         create_via_client("myteam", &client, None, &args, None)
             .await

@@ -348,8 +348,8 @@ fn force_search_warning_with_json_emits_degraded_envelope() {
 }
 
 // T-CI011: SSRF guard rejects http://127.0.0.1 base_url at construction time.
-// Integration tests build the lib without `cfg(test)`, so the test exemption
-// inside `validate_base_url` does NOT apply — the production strict path runs.
+// Integration tests cannot see `with_base_url_unchecked` (gated on `cfg(test)`
+// in the lib build), so they exercise the strict `with_base_url` path.
 // Pins #138 subtask 3: AI agents that read a misconfigured `base_url` from
 // config / env should never be able to steer the esa client at a private host.
 #[test]
