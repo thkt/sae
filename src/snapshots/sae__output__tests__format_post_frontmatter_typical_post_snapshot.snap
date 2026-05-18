@@ -1,0 +1,17 @@
+---
+source: src/output.rs
+expression: format_post_frontmatter(&post)
+---
+---
+title: "design/Onboarding"
+category: "design"
+tags: ["docs", "team"]
+author: "@alice"
+updated_at: "2025-01-15 12:00:00"
+number: 42
+url: https://example.esa.io/posts/42
+---
+
+# Welcome
+
+First paragraph.
