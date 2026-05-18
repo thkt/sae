@@ -327,9 +327,9 @@ fn emit_success(out: &CommandOutput, json_mode: bool) -> ExitCode {
     }
 }
 
-fn emit_error(err: &SaeError, json_mode: bool) {
+fn emit_error(err: &SaeError, json_mode: bool, config: Option<&Config>) {
     if json_mode {
-        eprintln!("{}", render_error(err, true));
+        eprintln!("{}", render_error(err, true, config));
     } else {
         exit_error(&err.to_string());
     }
@@ -369,14 +369,15 @@ async fn main() -> ExitCode {
         Ok(c) => c,
         Err(e) => {
             let err: SaeError = e.into();
-            emit_error(&err, json_mode);
+            emit_error(&err, json_mode, None);
             return err.exit_code();
         }
     };
+    let config_for_emit = config.clone();
     match run(cli, config).await {
         Ok(out) => emit_success(&out, json_mode),
         Err(e) => {
-            emit_error(&e, json_mode);
+            emit_error(&e, json_mode, Some(&config_for_emit));
             e.exit_code()
         }
     }

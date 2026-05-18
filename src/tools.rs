@@ -493,11 +493,32 @@ impl SaeError {
         }
     }
 
-    /// Always returns empty for now. Future revisions may populate
-    /// config-derived candidates for `NoTeamSpecified`/`UnknownTeam` once
-    /// `Config` is threaded into the call site.
-    pub(crate) fn candidates(&self) -> Vec<String> {
-        Vec::new()
+    /// Returns suggestion candidates for recoverable failures so AI agents
+    /// can surface a Did-you-mean list to the caller without a follow-up
+    /// `sae status` roundtrip (#139).
+    ///
+    /// `config` is threaded from [`emit_error`] in `main.rs`. Pass `None` for
+    /// failures that occur before `Config::load()` completes — the only such
+    /// variants are config-load failures themselves, which never produce
+    /// team-list candidates anyway.
+    ///
+    /// Order is preserved as written in `config.json`; the suite is
+    /// deliberately unfiltered (no fuzzy match) per the issue scope.
+    ///
+    /// Wildcard default: every other variant returns empty. Unlike
+    /// [`Self::next_step`], the candidate surface is intentionally restricted
+    /// to the team-list cases — `next_step` carries a per-variant editorial
+    /// hint, but `candidates` is a wire-format vocabulary that only the
+    /// recoverable team failures legitimately populate. A new `SaeError`
+    /// variant added later wanting suggestions should be explicit, not
+    /// inherit a `vec![]` default by mistake.
+    pub(crate) fn candidates(&self, config: Option<&Config>) -> Vec<String> {
+        match self {
+            Self::Config(ConfigError::NoTeamSpecified | ConfigError::UnknownTeam(_)) => {
+                config.map(|c| c.teams.clone()).unwrap_or_default()
+            }
+            _ => Vec::new(),
+        }
     }
 
     /// Mirrors the `TempFailure` classification from [`Self::error_code`].
@@ -509,13 +530,16 @@ impl SaeError {
     /// [`Self::retryable`], and the formatted message into an [`ErrorEnvelope`]
     /// for `--json` rendering. Kept here so the envelope module avoids a
     /// dependency on `SaeError` (which would form a cycle).
-    pub(crate) fn to_error_envelope(&self) -> ErrorEnvelope {
+    ///
+    /// `config` is consulted by [`Self::candidates`] for the team-list cases.
+    /// Pass `None` when the failure occurred before `Config::load()` completed.
+    pub(crate) fn to_error_envelope(&self, config: Option<&Config>) -> ErrorEnvelope {
         ErrorEnvelope {
             error: ErrorPayload {
                 code: self.error_code(),
                 message: self.to_string(),
                 next_step: self.next_step().map(String::from),
-                candidates: self.candidates(),
+                candidates: self.candidates(config),
                 retryable: self.retryable(),
             },
         }
@@ -978,7 +1002,7 @@ mod tests {
     #[test]
     fn to_error_envelope_input_data_composes_data_error_payload() {
         let err = SaeError::InputData("Invalid date '--after 2025-xx-xx'".into());
-        let env = err.to_error_envelope();
+        let env = err.to_error_envelope(None);
         assert_eq!(env.error.code, ErrorCode::DataError);
         assert!(!env.error.retryable);
         assert!(env.error.next_step.is_none());
@@ -1032,19 +1056,69 @@ mod tests {
         }
     }
 
-    // T-324: candidates_returns_empty_in_phase_2_1
+    // T-324: candidates(None) returns empty for every variant — without a
+    // Config there is no team list to derive suggestions from. Pins the
+    // pre-Config-load failure path (main.rs:372).
     #[test]
-    fn candidates_returns_empty_in_phase_2_1() {
+    fn candidates_returns_empty_without_config() {
         for err in [
             SaeError::InputUsage("anything".into()),
             SaeError::InputData("anything".into()),
             SaeError::Config(ConfigError::NoTeamSpecified),
+            SaeError::Config(ConfigError::UnknownTeam("gajj".into())),
             SaeError::Other("internal".into()),
         ] {
             assert_eq!(
-                err.candidates(),
+                err.candidates(None),
                 Vec::<String>::new(),
-                "Phase 2.1 returns empty Vec for {err:?}"
+                "candidates(None) must be empty for {err:?}"
+            );
+        }
+    }
+
+    fn config_with_teams(teams: &[&str]) -> Config {
+        Config {
+            teams: teams.iter().map(|&t| t.to_owned()).collect(),
+            default_team: None,
+            embed_budget: 50,
+        }
+    }
+
+    // T-394: NoTeamSpecified with a populated Config returns the team list
+    // verbatim (config-order, no sorting) so agents can pick a recovery team
+    // without a follow-up `sae status` roundtrip (#139).
+    #[test]
+    fn candidates_returns_teams_for_no_team_specified() {
+        let cfg = config_with_teams(&["gaji", "gaji-platform"]);
+        let err = SaeError::Config(ConfigError::NoTeamSpecified);
+        assert_eq!(err.candidates(Some(&cfg)), vec!["gaji", "gaji-platform"]);
+    }
+
+    // T-395: UnknownTeam(_) also surfaces the full team list. The
+    // mistaken-team name is already in the message; the candidates field
+    // gives agents the recovery set without fuzzy filtering (out of scope).
+    #[test]
+    fn candidates_returns_teams_for_unknown_team() {
+        let cfg = config_with_teams(&["alpha", "beta"]);
+        let err = SaeError::Config(ConfigError::UnknownTeam("alphaa".into()));
+        assert_eq!(err.candidates(Some(&cfg)), vec!["alpha", "beta"]);
+    }
+
+    // T-396: every other variant ignores the Config and returns empty even
+    // when one is supplied. Prevents accidental team-list leakage on
+    // unrelated failures.
+    #[test]
+    fn candidates_ignores_config_for_unrelated_variants() {
+        let cfg = config_with_teams(&["x", "y"]);
+        for err in [
+            SaeError::InputUsage("bad".into()),
+            SaeError::InputData("bad".into()),
+            SaeError::Other("oops".into()),
+        ] {
+            assert_eq!(
+                err.candidates(Some(&cfg)),
+                Vec::<String>::new(),
+                "{err:?} must not leak the team list"
             );
         }
     }
@@ -1210,7 +1284,7 @@ mod tests {
     // composition (T-337 pattern) for the new variant.
     #[test]
     fn to_error_envelope_backend_unavailable_composes_internal_payload() {
-        let env = SaeError::BackendUnavailable.to_error_envelope();
+        let env = SaeError::BackendUnavailable.to_error_envelope(None);
         assert_eq!(env.error.code, ErrorCode::Internal);
         assert!(!env.error.retryable);
         assert_eq!(
@@ -1226,7 +1300,7 @@ mod tests {
     #[test]
     fn to_error_envelope_internal_variant_composes_internal_payload() {
         let err = SaeError::Internal("Embedding count mismatch: expected 5, got 4".into());
-        let env = err.to_error_envelope();
+        let env = err.to_error_envelope(None);
         assert_eq!(env.error.code, ErrorCode::Internal);
         assert!(!env.error.retryable);
         assert!(env.error.next_step.is_none());
@@ -1283,7 +1357,7 @@ mod tests {
             status: 404,
             body: r#"{"error":"not_found","message":"Not Found"}"#.into(),
         });
-        let env = err.to_error_envelope();
+        let env = err.to_error_envelope(None);
         assert_eq!(env.error.code, ErrorCode::DataError);
         assert!(!env.error.retryable);
         assert_eq!(env.error.next_step.as_deref(), Some(POST_NOT_FOUND_HINT));

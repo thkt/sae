@@ -4,6 +4,7 @@
 //! routing (stdout vs stderr) are all exercised together.
 
 use std::env;
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -344,6 +345,70 @@ fn force_search_warning_with_json_emits_degraded_envelope() {
             .iter()
             .any(|n| n.as_str().is_some_and(|s| s.contains("reranker failed"))),
         "notes[] must surface the reranker-failure warning; got: {notes:?}"
+    );
+}
+
+/// Writes a `config.json` with the given teams into the test home so the
+/// binary's `Config::load()` picks it up. Pairs with [`sae_command`] which
+/// already sets `XDG_CONFIG_HOME=home/.config`.
+fn write_config_with_teams(home: &Path, teams: &[&str]) {
+    let dir = home.join(".config").join("sae");
+    fs::create_dir_all(&dir).expect("config dir");
+    let body = serde_json::json!({ "teams": teams }).to_string();
+    fs::write(dir.join("config.json"), body).expect("write config.json");
+}
+
+// T-CI013: `--team unknownteam` against a multi-team config emits a JSON
+// envelope whose `error.candidates` lists every team verbatim (config order,
+// no fuzzy filter). Closes #139: agents recover from a typo in one
+// roundtrip instead of re-running `sae status` for the team list.
+#[test]
+fn unknown_team_envelope_lists_known_teams_as_candidates() {
+    let dir = tempdir().unwrap();
+    write_config_with_teams(dir.path(), &["alpha", "beta"]);
+
+    let output = sae_command(dir.path())
+        .args(["--json", "get", "1", "--team", "unknownteam"])
+        .output()
+        .expect("failed to spawn sae binary");
+
+    assert!(
+        !output.status.success(),
+        "unknown team should exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let env = parse_stderr_envelope(&stderr);
+    assert_eq!(
+        env["error"]["candidates"],
+        serde_json::json!(["alpha", "beta"]),
+        "candidates must list configured teams in config order; envelope: {env}"
+    );
+}
+
+// T-CI014: when no `--team` is provided AND the config has multiple teams
+// without a default, the resulting `NoTeamSpecified` envelope also surfaces
+// the team list. The two recoverable team failures share the same
+// candidates contract (#139).
+#[test]
+fn no_team_envelope_lists_known_teams_as_candidates() {
+    let dir = tempdir().unwrap();
+    write_config_with_teams(dir.path(), &["alpha", "beta"]);
+
+    let output = sae_command(dir.path())
+        .args(["--json", "get", "1"])
+        .output()
+        .expect("failed to spawn sae binary");
+
+    assert!(
+        !output.status.success(),
+        "no-team-resolved should exit non-zero"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let env = parse_stderr_envelope(&stderr);
+    assert_eq!(
+        env["error"]["candidates"],
+        serde_json::json!(["alpha", "beta"]),
+        "candidates must list teams when no team is selectable; envelope: {env}"
     );
 }
 

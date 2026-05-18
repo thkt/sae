@@ -44,9 +44,12 @@ pub fn render_success(out: &CommandOutput, json_mode: bool) -> String {
 }
 
 /// Renders a `SaeError` for stderr. JSON mode wraps it via `to_error_envelope`.
-pub fn render_error(err: &SaeError, json_mode: bool) -> String {
+///
+/// `config` feeds [`SaeError::candidates`] for the team-list cases (#139).
+/// Pass `None` when the failure occurred before `Config::load()` completed.
+pub fn render_error(err: &SaeError, json_mode: bool, config: Option<&config::Config>) -> String {
     if json_mode {
-        envelope::render_json_error(&err.to_error_envelope())
+        envelope::render_json_error(&err.to_error_envelope(config))
     } else {
         err.to_string()
     }
