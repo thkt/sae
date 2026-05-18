@@ -126,6 +126,12 @@ fn append_search_filters(
     append_timestamp_day_cutoff_filter(sql, params, "p.updated_at", true, before.as_deref());
 }
 
+const SNIPPET_CHAR_LIMIT: usize = 200;
+
+/// Truncate `s` to at most `max_chars` characters (not bytes), appending
+/// `...` only when truncated. Uses `char_indices().nth()` to find the
+/// char-boundary byte position, so the result is always valid UTF-8 even
+/// for multi-byte input (e.g., CJK).
 fn truncate_snippet(s: &str, max_chars: usize) -> String {
     match s.char_indices().nth(max_chars) {
         None => s.to_owned(),
@@ -211,6 +217,10 @@ fn apply_recency_boost(
                     recency_decay(age_days, RECENCY_HALF_LIFE)
                 })
                 .unwrap_or(0.0);
+            // Boost factor `1.0 + RECENCY_WEIGHT * decay` caps at
+            // `1.0 + RECENCY_WEIGHT` (currently 1.2×); changing `RECENCY_WEIGHT`
+            // shifts the cap proportionally and must be reflected in T-103
+            // expected score deltas.
             let boosted = rrf_score * (1.0 + RECENCY_WEIGHT * decay);
             (post_number, boosted)
         })
@@ -265,6 +275,9 @@ pub(crate) fn fts_search(
     collect_storage_rows(rows)
 }
 
+// 10× oversample before MaxSim dedup: each chunk holds multiple sub-embeddings
+// (`ChunkedEmbedding`), so KNN must fetch enough rows to give the dedup step
+// real candidates. Larger value gains recall, smaller cuts query latency.
 const VEC_MAXSIM_OVERSAMPLE: u32 = 10;
 
 pub(crate) fn vec_search(
@@ -350,6 +363,14 @@ pub(crate) fn vec_search(
     Ok(hits)
 }
 
+// Candidate pool multipliers: fetch more candidates than the user-requested
+// `limit` so RRF merging and recency boost have headroom. The reranker case
+// pulls 4× because cross-encoder reordering can promote any of the 4× pool;
+// the non-rerank case pulls 3× since RRF + recency only reshuffle relative
+// rank inside the pool.
+const RERANK_CANDIDATE_MULT: u32 = 4;
+const BASE_CANDIDATE_MULT: u32 = 3;
+
 pub fn hybrid_search(
     conn: &Connection,
     query: &str,
@@ -360,9 +381,9 @@ pub fn hybrid_search(
     reranker: Option<&dyn Rerank>,
 ) -> Result<SearchOutput, StorageError> {
     let candidate_limit = if reranker.is_some() {
-        limit * 4
+        limit * RERANK_CANDIDATE_MULT
     } else {
-        limit * 3
+        limit * BASE_CANDIDATE_MULT
     };
 
     let fts_hits = fts_search(conn, query, candidate_limit, filter)?;
@@ -461,7 +482,7 @@ pub fn hybrid_search(
                 post_name: meta.name,
                 post_url: meta.url,
                 section_title,
-                snippet: truncate_snippet(&snippet, 200),
+                snippet: truncate_snippet(&snippet, SNIPPET_CHAR_LIMIT),
                 score: score as f32,
                 // Semantic takes priority when a post matched both sources.
                 match_source: if vec_hit.is_some() {
