@@ -171,6 +171,16 @@ impl EsaClient {
         Self::construct(token, base_url, Duration::ZERO)
     }
 
+    /// Test-only constructor that lets tests pin `request_interval` to a
+    /// non-zero value so the throttle path can be exercised under virtual
+    /// time. Existing `with_base_url_unchecked` call sites keep `Duration::ZERO`
+    /// semantics; this is the dedicated seam for throttle regression tests
+    /// (T-002 / T-003) that must observe `request_interval` enforcement.
+    #[cfg(test)]
+    pub(crate) fn with_test_interval(token: String, base_url: String, interval: Duration) -> Self {
+        Self::construct(token, base_url, interval)
+    }
+
     fn construct(token: String, base_url: String, request_interval: Duration) -> Self {
         Self {
             http: Client::new(),
@@ -270,15 +280,20 @@ impl EsaClient {
         if self.request_interval.is_zero() {
             return;
         }
-        let sleep_dur = {
-            let last = self.last_request.lock().await;
-            last.map(|prev| self.request_interval.saturating_sub(prev.elapsed()))
-                .filter(|d| !d.is_zero())
-        };
-        if let Some(dur) = sleep_dur {
-            sleep(dur).await;
+        // NOTE: tokio::sync::Mutex の guard を sleep().await 越しに hold して
+        // read → sleep → write を single critical section にする。lock を
+        // 2 回別々に取ると、解放の隙に並行 caller が stale な last_request を
+        // 読んで quota (75 req/15min) を bypass する race window が開く (#155)。
+        // std::sync::Mutex で同じ pattern を書くと .await 越し hold が deadlock
+        // を招くため refactor 不可。
+        let mut last = self.last_request.lock().await;
+        if let Some(prev) = *last {
+            let wait = self.request_interval.saturating_sub(prev.elapsed());
+            if !wait.is_zero() {
+                sleep(wait).await;
+            }
         }
-        *self.last_request.lock().await = Some(Instant::now());
+        *last = Some(Instant::now());
     }
 
     fn auth_header(&self) -> Result<HeaderValue, ClientError> {
@@ -379,7 +394,10 @@ fn retry_wait(status: u16, retry_after: Option<&str>, attempt: u32) -> Option<Du
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
+    use tokio::time::timeout;
     use wiremock::matchers::{body_json, method, path, query_param};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -897,5 +915,83 @@ mod tests {
     fn with_base_url_unchecked_keeps_zero_interval() {
         let client = EsaClient::with_base_url_unchecked("tok".into(), "http://127.0.0.1/".into());
         assert_eq!(client.request_interval, Duration::ZERO);
+    }
+
+    // T-002: throttle_serializes_concurrent_callers
+    // FR-001 / FR-003: under concurrent `Arc<EsaClient>` callers, `throttle()`
+    // must hold the lock across read+sleep+write so the second caller's
+    // critical-section exit lags the first by at least `request_interval`.
+    // Captures each task's post-throttle `Instant::now()` per-task (rather
+    // than re-reading `last_request` after both finish, which would only
+    // surface the second writer's timestamp) to satisfy the "diff of each
+    // task's critical-section exit" intent of the spec.
+    #[tokio::test(start_paused = true)]
+    async fn throttle_serializes_concurrent_callers() {
+        let client = Arc::new(EsaClient::with_test_interval(
+            "tok".into(),
+            "https://example.esa.io".into(),
+            Duration::from_millis(100),
+        ));
+
+        let c1 = Arc::clone(&client);
+        let c2 = Arc::clone(&client);
+
+        let h1 = tokio::spawn(async move {
+            c1.throttle().await;
+            Instant::now()
+        });
+        let h2 = tokio::spawn(async move {
+            c2.throttle().await;
+            Instant::now()
+        });
+
+        let t1 = h1.await.expect("task 1 panicked");
+        let t2 = h2.await.expect("task 2 panicked");
+
+        let gap = if t1 > t2 { t1 - t2 } else { t2 - t1 };
+        assert!(
+            gap >= Duration::from_millis(100),
+            "concurrent throttle gap {gap:?} must be >= 100ms (request_interval)"
+        );
+    }
+
+    // T-003: throttle_cancellation_preserves_last_request
+    // FR-005: dropping a `throttle()` future mid-sleep must leave
+    // `last_request` unchanged (no request was issued, so the timestamp
+    // must not advance). Verified by capturing `last_request` after the
+    // first completed throttle, dropping a second throttle while it sleeps
+    // via `tokio::time::timeout`, then asserting the stored timestamp is
+    // still the post-first-call value.
+    #[tokio::test(start_paused = true)]
+    async fn throttle_cancellation_preserves_last_request() {
+        let client = EsaClient::with_test_interval(
+            "tok".into(),
+            "https://example.esa.io".into(),
+            Duration::from_millis(500),
+        );
+
+        // First throttle completes and writes t1.
+        client.throttle().await;
+        let t1 = client
+            .last_request
+            .lock()
+            .await
+            .expect("last_request must be Some after first throttle");
+
+        // Second throttle gets cancelled mid-sleep via timeout < interval.
+        let timed_out = timeout(Duration::from_millis(50), client.throttle()).await;
+        assert!(
+            timed_out.is_err(),
+            "timeout(50ms) must elapse before throttle(500ms) completes"
+        );
+
+        // last_request must still be t1 because the second throttle was
+        // dropped before its write phase.
+        let after = *client.last_request.lock().await;
+        assert_eq!(
+            after,
+            Some(t1),
+            "cancelled throttle must not advance last_request"
+        );
     }
 }
