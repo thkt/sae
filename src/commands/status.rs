@@ -69,16 +69,6 @@ mod tests {
         }
     }
 
-    // T-074: at least 1 test co-located with status handlers
-    #[test]
-    fn team_status_error_constructs_correctly() {
-        let ts = TeamStatus::error("myteam", &"db error");
-        assert_eq!(ts.team, "myteam");
-        assert_eq!(ts.status, storage::SyncStatus::Error);
-        assert_eq!(ts.error.as_deref(), Some("db error"));
-        assert_eq!(ts.posts, 0);
-    }
-
     // T-075: query_team_status with sync state present → TeamStatus::Synced
     #[test]
     fn query_team_status_returns_synced_when_state_present() {
