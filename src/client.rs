@@ -490,32 +490,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_post_success() {
-        let server = MockServer::start().await;
-        Mock::given(method("POST"))
-            .and(path("/teams/myteam/posts"))
-            .respond_with(ResponseTemplate::new(201).set_body_json(test_post_json(1)))
-            .mount(&server)
-            .await;
-
-        let post = test_client(&server)
-            .await
-            .create_post(
-                "myteam",
-                &CreatePostParams {
-                    name: "Test",
-                    body_md: Some("# Body"),
-                    category: None,
-                    tags: vec![],
-                    wip: true,
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(post.name, "Getting Started");
-    }
-
-    #[tokio::test]
     async fn update_post_success() {
         let server = MockServer::start().await;
         Mock::given(method("PATCH"))

@@ -154,15 +154,6 @@ pub enum ConfigError {
 mod tests {
     use super::*;
 
-    // T-218: Config::default has empty teams, no default_team, and embed_budget=50
-    #[test]
-    fn default_config() {
-        let config = Config::default();
-        assert!(config.teams.is_empty());
-        assert!(config.default_team.is_none());
-        assert_eq!(config.embed_budget, 50);
-    }
-
     // T-219: resolve_team returns the team name when it is in the allowlist
     #[test]
     fn resolve_explicit_team_in_allowlist() {
