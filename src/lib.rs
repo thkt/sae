@@ -32,7 +32,7 @@ pub fn __test_search_with_warnings() -> Result<CommandOutput, SaeError> {
         score: 0.5,
         match_source: storage::MatchSource::Fts,
     };
-    output::search(&[result], "test query", true, false, None, &warnings)
+    output::search(&[result], "test query", true, false, &warnings)
 }
 
 /// Renders [`CommandOutput`] for stdout. With `json_mode` set, emits the

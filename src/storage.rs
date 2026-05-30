@@ -291,22 +291,6 @@ pub(crate) fn save_sync_state_at(
     Ok(())
 }
 
-/// Returns `true` if the last successful harvest completed within `secs` seconds of now.
-/// Returns `false` if no sync state exists (harvest has never run).
-pub fn sync_harvested_within(conn: &Connection, secs: u64) -> bool {
-    conn.query_row(
-        "SELECT (strftime('%s', 'now') - strftime('%s', updated_at)) < ?1 \
-         FROM sync_state WHERE id = 1",
-        [secs as i64],
-        |row| row.get::<_, bool>(0),
-    )
-    .map_err(|e| {
-        tracing::warn!(error = %e, "sync_state query failed, assuming harvest needed");
-        e
-    })
-    .unwrap_or(false)
-}
-
 pub fn count_posts(conn: &Connection) -> Result<u32, StorageError> {
     let count: u32 = conn.query_row("SELECT COUNT(*) FROM posts", [], |row| row.get(0))?;
     Ok(count)
@@ -521,57 +505,6 @@ mod tests {
         assert_eq!(state.local_count, 50);
         assert_eq!(state.last_page, Some(3));
         assert_eq!(state.updated_at, "2025-01-01 00:00:00");
-    }
-
-    // T-099: sync_harvested_within returns false when no sync state
-    #[test]
-    fn sync_harvested_within_false_when_no_state() {
-        let db = Db::open_memory().unwrap();
-        assert!(!sync_harvested_within(db.conn(), 300));
-    }
-
-    // T-099: sync_harvested_within returns true when harvest was recent
-    #[test]
-    fn sync_harvested_within_true_when_recent() {
-        let db = Db::open_memory().unwrap();
-        let now_epoch = i64::try_from(
-            SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        )
-        .expect("epoch seconds fit in i64");
-        save_sync_state_at(
-            db.conn(),
-            &SyncStateUpdate {
-                latest_updated_at: None,
-                total_count: 0,
-                local_count: 0,
-                last_page: None,
-            },
-            now_epoch,
-        )
-        .unwrap();
-        assert!(sync_harvested_within(db.conn(), 300));
-    }
-
-    // T-099: sync_harvested_within returns false when harvest was older than TTL
-    #[test]
-    fn sync_harvested_within_false_when_stale() {
-        let db = Db::open_memory().unwrap();
-        let stale_epoch = 1735689600i64; // 2025-01-01 00:00:00 UTC (far in the past)
-        save_sync_state_at(
-            db.conn(),
-            &SyncStateUpdate {
-                latest_updated_at: None,
-                total_count: 0,
-                local_count: 0,
-                last_page: None,
-            },
-            stale_epoch,
-        )
-        .unwrap();
-        assert!(!sync_harvested_within(db.conn(), 300));
     }
 
     // T-207: save_sync_state with last_page=None clears a previous checkpoint

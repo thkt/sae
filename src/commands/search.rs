@@ -1,6 +1,4 @@
-use std::env;
 use std::io::{self, IsTerminal, Read};
-use std::process::{Command, Stdio};
 
 use crate::config::Config;
 use crate::envelope::CommandOutput;
@@ -9,15 +7,12 @@ use amici::model::{ModelLoad, record_degraded};
 use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
-use rurico::embed::ChunkedEmbedding;
 use rurico::reranker::Rerank;
 
 use super::embedder::try_load_embedder;
 use super::reranker::try_load_reranker;
 use crate::output;
 use crate::tools::{SaeError, require_db};
-
-const SEARCH_EMBED_BUDGET: u32 = 128;
 
 fn parse_date_arg(s: Option<&str>, flag: &str) -> Result<Option<Timestamp>, SaeError> {
     let Some(s) = s else {
@@ -32,43 +27,6 @@ fn parse_date_arg(s: Option<&str>, flag: &str) -> Result<Option<Timestamp>, SaeE
         .to_zoned(TimeZone::UTC)
         .map_err(|e| SaeError::InputData(format!("failed to zone date to UTC: {e}")))?;
     Ok(Some(zoned.timestamp()))
-}
-
-/// Embeds up to `budget` pending chunks in one batch.
-/// Returns `(processed, budget_exhausted)` — `budget_exhausted` signals more chunks remain.
-fn auto_embed_pending_with<F>(
-    db: &storage::Db,
-    budget: u32,
-    embed_fn: F,
-) -> Result<(u32, bool), SaeError>
-where
-    F: Fn(&[&str]) -> Result<Vec<ChunkedEmbedding>, SaeError>,
-{
-    let result = super::embed_batch::embed_one_batch(db.conn(), budget, embed_fn)?;
-    if result.processed == 0 {
-        return Ok((0, false));
-    }
-    tracing::debug!(
-        chunks = result.processed,
-        "auto_embed_pending: embedded chunks during search"
-    );
-    Ok((result.processed, result.budget_exhausted))
-}
-
-fn spawn_background_index(team: &str) {
-    let Ok(exe) = env::current_exe() else {
-        tracing::warn!("background index skipped: current_exe() failed");
-        return;
-    };
-    if let Err(e) = Command::new(exe)
-        .args(["index", team])
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        tracing::warn!(error = %e, "background index spawn failed");
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -97,28 +55,6 @@ pub(crate) fn run_search(
             record_degraded(*reason, "search: embedder load");
         }
         (result.as_ref().ok(), result.is_err())
-    };
-    let embed_info = if let Some(emb) = embedder {
-        match auto_embed_pending_with(&db, SEARCH_EMBED_BUDGET, |texts| {
-            emb.embed_documents_batch(texts)
-                // Other (UNKNOWN): embedder's runtime error is an opaque
-                // `anyhow::Error` (no typed variant from amici/rurico).
-                // Mirrors `tools::Sae::embed`; promoting requires upstream
-                // typed surface first.
-                .map_err(|e| SaeError::Other(format!("Batch embedding failed: {e}")))
-        }) {
-            Ok((processed, budget_exhausted)) => Some(output::EmbedInfo {
-                processed,
-                budget_exhausted,
-                team: team.to_owned(),
-            }),
-            Err(e) => {
-                tracing::warn!(error = %e, "auto-embed failed, continuing with existing embeddings");
-                None
-            }
-        }
-    } else {
-        None
     };
     let query_embedding = if let Some(e) = embedder {
         match e.embed_query(query) {
@@ -159,24 +95,20 @@ pub(crate) fn run_search(
     for w in &search_output.warnings {
         tracing::warn!("{w}");
     }
-    let semantic = query_embedding.is_some();
-    let output = output::search(
+    // `semantic` reflects whether vector search actually ran, not just whether
+    // the embedder loaded: hybrid_search skips vectors when nothing is embedded
+    // yet (e.g. indexed before `model download`), so report FTS — not a
+    // misleading "hybrid" — in that case. Mirrors hybrid_search's own guard.
+    let semantic = query_embedding.is_some() && storage::has_embeddings(db.conn());
+    // Search is read-only — no auto-embed, no background index. Build the
+    // index explicitly with `sae index` / `sae rebuild` (mirrors yomu).
+    output::search(
         &search_output.results,
         query,
         semantic,
         embedder_load_failed,
-        embed_info,
         &search_output.warnings,
-    )?;
-    // 5-minute TTL: long enough that repeated user searches within a single
-    // workflow do not trigger redundant background harvests (coalescing), but
-    // short enough that an idle period (e.g., next day) re-fetches before the
-    // next search returns stale results.
-    const PREFETCH_TTL_SECS: u64 = 5 * 60;
-    if !storage::sync_harvested_within(db.conn(), PREFETCH_TTL_SECS) {
-        spawn_background_index(team);
-    }
-    Ok(output)
+    )
 }
 
 fn read_stdin_value(
@@ -228,131 +160,7 @@ pub fn resolve_search_query(query: Option<String>) -> Result<String, SaeError> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::cell::Cell;
     use std::io::Cursor;
-
-    fn make_test_row(number: u32) -> storage::EsaPostRow {
-        storage::EsaPostRow {
-            body_md: "# Hello\nWorld".into(),
-            category: None,
-            ..storage::test_post_row(number)
-        }
-    }
-
-    // T-065: auto_embed_pending_with skips embed_fn when no unembedded chunks
-    #[test]
-    fn auto_embed_skips_when_no_unembedded_chunks() {
-        let db = storage::Db::open_memory().unwrap();
-        let called = Cell::new(false);
-        let result = auto_embed_pending_with(&db, 256, |_| {
-            called.set(true);
-            Ok(vec![])
-        });
-        assert!(result.is_ok());
-        assert!(
-            !called.get(),
-            "embed_fn must not be called when no chunks pending"
-        );
-    }
-
-    // T-066: auto_embed_pending_with embeds chunks within budget
-    #[test]
-    fn auto_embed_embeds_pending_chunks() {
-        use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
-
-        let db = storage::Db::open_memory().unwrap();
-        let row = make_test_row(1);
-        storage::upsert_post(db.conn(), &row).unwrap();
-        storage::rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
-
-        assert_eq!(storage::count_unembedded_chunks(db.conn()).unwrap(), 1);
-
-        let result = auto_embed_pending_with(&db, 256, |texts| {
-            Ok(texts
-                .iter()
-                .map(|_| ChunkedEmbedding::new(vec![vec![0.5; EMBEDDING_DIMS]]))
-                .collect())
-        });
-        assert!(result.is_ok());
-        assert_eq!(storage::count_unembedded_chunks(db.conn()).unwrap(), 0);
-    }
-
-    // T-067: auto_embed_pending_with respects budget and leaves excess chunks unembedded
-    #[test]
-    fn auto_embed_respects_budget() {
-        use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
-
-        let db = storage::Db::open_memory().unwrap();
-        for i in 1u32..=2 {
-            let row = make_test_row(i);
-            storage::upsert_post(db.conn(), &row).unwrap();
-            storage::rechunk_post(db.conn(), i, "# Hello\nWorld").unwrap();
-        }
-
-        assert_eq!(storage::count_unembedded_chunks(db.conn()).unwrap(), 2);
-
-        let result = auto_embed_pending_with(&db, 1, |texts| {
-            Ok(texts
-                .iter()
-                .map(|_| ChunkedEmbedding::new(vec![vec![0.5; EMBEDDING_DIMS]]))
-                .collect())
-        });
-        assert!(result.is_ok());
-        assert!(
-            result.unwrap().1,
-            "budget=1 with 2 chunks should signal budget exhausted"
-        );
-        assert_eq!(
-            storage::count_unembedded_chunks(db.conn()).unwrap(),
-            1,
-            "budget=1 should leave 1 chunk unembedded"
-        );
-    }
-
-    // T-068: auto_embed_pending_with propagates embed_fn error without side effects
-    #[test]
-    fn auto_embed_propagates_embed_error() {
-        let db = storage::Db::open_memory().unwrap();
-        let row = make_test_row(1);
-        storage::upsert_post(db.conn(), &row).unwrap();
-        storage::rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
-
-        assert_eq!(storage::count_unembedded_chunks(db.conn()).unwrap(), 1);
-
-        let result =
-            auto_embed_pending_with(&db, 256, |_| Err(SaeError::Other("model OOM".into())));
-        assert!(result.is_err(), "embed_fn error should propagate");
-        assert!(result.unwrap_err().to_string().contains("model OOM"));
-        assert_eq!(
-            storage::count_unembedded_chunks(db.conn()).unwrap(),
-            1,
-            "failed embed must not change unembedded count"
-        );
-    }
-
-    // T-069: auto_embed_pending_with rejects embedding count mismatch
-    #[test]
-    fn auto_embed_rejects_count_mismatch() {
-        let db = storage::Db::open_memory().unwrap();
-        let row = make_test_row(1);
-        storage::upsert_post(db.conn(), &row).unwrap();
-        storage::rechunk_post(db.conn(), 1, "# Hello\nWorld").unwrap();
-
-        let result = auto_embed_pending_with(&db, 256, |_| Ok(vec![]));
-        assert!(result.is_err(), "count mismatch should be an error");
-        assert!(
-            result
-                .unwrap_err()
-                .to_string()
-                .contains("Embedding count mismatch"),
-            "error should describe the mismatch"
-        );
-        assert_eq!(
-            storage::count_unembedded_chunks(db.conn()).unwrap(),
-            1,
-            "mismatched embed must not change unembedded count"
-        );
-    }
 
     fn resolve_search(
         value: Option<&str>,
