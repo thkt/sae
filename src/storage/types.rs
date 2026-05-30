@@ -101,11 +101,6 @@ impl TeamStatus {
     }
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct EmbedResult {
-    pub chunks_embedded: u32,
-}
-
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("Failed to open database: {0}")]
@@ -264,16 +259,5 @@ mod tests {
         assert_eq!(v["total_count"], 100);
         assert_eq!(v["local_count"], 50);
         assert_eq!(v["last_page"], 3);
-    }
-
-    // T-111: embed --json → EmbedResult JSON (chunks_embedded field)
-    #[test]
-    fn embed_result_serializes_to_json_with_chunks_embedded() {
-        let result = EmbedResult {
-            chunks_embedded: 150,
-        };
-        let json_str = serde_json::to_string(&result).expect("EmbedResult should serialize");
-        let v: serde_json::Value = serde_json::from_str(&json_str).unwrap();
-        assert_eq!(v["chunks_embedded"], 150);
     }
 }

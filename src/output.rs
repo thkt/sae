@@ -1,19 +1,32 @@
 use crate::client::EsaPost;
 use crate::envelope::CommandOutput;
-use crate::storage::{EmbedResult, SearchResult, SyncStatus, TeamStatus};
+use crate::storage::{SearchResult, SyncStatus, TeamStatus};
 use crate::sync::HarvestResult;
 use crate::tools::SaeError;
 
-pub(crate) fn harvest(result: &HarvestResult) -> Result<CommandOutput, SaeError> {
-    let markdown = result.to_string();
-    let data = serde_json::to_value(result)?;
+/// Renders the combined `index` / `rebuild` result: the harvest summary plus
+/// the embed outcome. `embedded` is `Some(n)` when chunks were embedded this
+/// run (omitted from markdown when zero), `None` when nothing was pending. The
+/// count lives under a nested `embed` key so it never collides with harvest
+/// fields, keeping the `--json` envelope shape stable.
+pub(crate) fn index(
+    harvest: &HarvestResult,
+    embedded: Option<u32>,
+) -> Result<CommandOutput, SaeError> {
+    let mut markdown = harvest.to_string();
+    if let Some(n) = embedded
+        && n > 0
+    {
+        markdown.push_str(&format!("\nEmbedded {n} chunks"));
+    }
+    let mut data = serde_json::to_value(harvest)?;
+    if let Some(obj) = data.as_object_mut() {
+        obj.insert(
+            "embed".to_owned(),
+            serde_json::json!({ "chunks_embedded": embedded.unwrap_or(0) }),
+        );
+    }
     Ok(CommandOutput::ok(markdown, data))
-}
-
-pub(crate) struct EmbedInfo {
-    pub(crate) processed: u32,
-    pub(crate) budget_exhausted: bool,
-    pub(crate) team: String,
 }
 
 pub(crate) fn search(
@@ -21,7 +34,6 @@ pub(crate) fn search(
     query: &str,
     semantic: bool,
     embedder_load_failed: bool,
-    embed_info: Option<EmbedInfo>,
     search_warnings: &[String],
 ) -> Result<CommandOutput, SaeError> {
     let search_mode = if semantic { "hybrid" } else { "fts" };
@@ -48,17 +60,6 @@ pub(crate) fn search(
             ));
             if !r.snippet.is_empty() {
                 lines.push(format!("  {}", r.snippet.replace('\n', " ")));
-            }
-        }
-        if let Some(info) = embed_info {
-            if info.processed > 0 {
-                lines.push(format!("(Embedded {} new chunks)", info.processed));
-            }
-            if info.budget_exhausted {
-                lines.push(format!(
-                    "Hint: more chunks pending. Run 'sae embed {}' to index all.",
-                    info.team
-                ));
             }
         }
         lines.join("\n")
@@ -131,20 +132,6 @@ pub(crate) fn action_result(action: &str, post: &EsaPost) -> Result<CommandOutpu
     Ok(CommandOutput::ok(markdown, data))
 }
 
-pub(crate) fn embed(result: &EmbedResult, total_chunks: u32) -> Result<CommandOutput, SaeError> {
-    let markdown = if result.chunks_embedded == 0 {
-        if total_chunks == 0 {
-            "Nothing to embed".to_owned()
-        } else {
-            format!("All {total_chunks} chunks already embedded")
-        }
-    } else {
-        format!("Embedded {} chunks", result.chunks_embedded)
-    };
-    let data = serde_json::to_value(result)?;
-    Ok(CommandOutput::ok(markdown, data))
-}
-
 /// Dry-run is always envelope-wrapped (consistent shape regardless of `--json`).
 /// `markdown` carries the pretty-printed payload for default-mode visibility.
 pub(crate) fn dry_run(payload: &serde_json::Value) -> Result<CommandOutput, SaeError> {
@@ -181,7 +168,7 @@ pub(crate) fn status(statuses: &[TeamStatus]) -> Result<CommandOutput, SaeError>
                 lines.push(format!("  Posts: {}", ts.posts));
                 if ts.pending_embed > 0 {
                     lines.push(format!(
-                        "  Pending embed: {} chunks (run 'sae embed {}' to index)",
+                        "  Pending embed: {} chunks (run 'sae index {}' to embed)",
                         ts.pending_embed, ts.team
                     ));
                 }
@@ -206,7 +193,7 @@ pub(crate) fn status(statuses: &[TeamStatus]) -> Result<CommandOutput, SaeError>
 mod tests {
     use super::*;
     use crate::client::EsaUser;
-    use crate::storage::{EmbedResult, MatchSource, SyncState};
+    use crate::storage::{MatchSource, SyncState};
 
     fn make_post() -> EsaPost {
         EsaPost {
@@ -311,6 +298,29 @@ mod tests {
         assert!(out.markdown.contains("Last sync: 2025-01-01 00:00:00"));
     }
 
+    // T-415: status human-readable surfaces the pending-embed hint when a
+    // synced team has unembedded chunks (covers the `pending_embed > 0` branch
+    // that points the user at `sae index`).
+    #[test]
+    fn status_human_synced_with_pending_embed_shows_index_hint() {
+        let ts = TeamStatus {
+            team: "team-a".to_owned(),
+            status: SyncStatus::Synced,
+            posts: 10,
+            pending_embed: 3,
+            sync_state: None,
+            error: None,
+            db_path: None,
+        };
+        let out = status(&[ts]).unwrap();
+        assert!(
+            out.markdown
+                .contains("Pending embed: 3 chunks (run 'sae index team-a' to embed)"),
+            "synced team with pending chunks must show the index hint; got: {}",
+            out.markdown
+        );
+    }
+
     // T-081: status human-readable not-synced team → expected lines
     #[test]
     fn status_human_not_synced_contains_expected_lines() {
@@ -319,30 +329,52 @@ mod tests {
         assert!(out.markdown.contains("Not yet synced"));
     }
 
-    // T-082: embed json data carries chunks_embedded
-    #[test]
-    fn embed_json_contains_chunks_embedded() {
-        let result = EmbedResult {
-            chunks_embedded: 42,
-        };
-        let out = embed(&result, 42).unwrap();
-        assert_eq!(out.data["chunks_embedded"], 42);
+    fn make_harvest(posts_fetched: u32) -> HarvestResult {
+        HarvestResult {
+            posts_fetched,
+            posts_stored: posts_fetched,
+            total_count: 10,
+            local_count: 10,
+            gap_detected: false,
+        }
     }
 
-    // T-083: embed human-readable with done=0 → "Nothing to embed"
+    // T-407: index merges harvest stats with the embed result — the embed count
+    // is appended to markdown and nested under a dedicated `embed` data key,
+    // kept separate from harvest fields so the envelope shape stays stable (#3).
     #[test]
-    fn embed_human_zero_done_returns_nothing_to_embed() {
-        let result = EmbedResult { chunks_embedded: 0 };
-        let out = embed(&result, 0).unwrap();
-        assert_eq!(out.markdown, "Nothing to embed");
+    fn index_merges_harvest_and_embed_result() {
+        let out = index(&make_harvest(2), Some(3)).unwrap();
+        assert!(
+            out.markdown.contains("Fetched 2 posts"),
+            "harvest line missing: {}",
+            out.markdown
+        );
+        assert!(
+            out.markdown.contains("Embedded 3 chunks"),
+            "embed line missing: {}",
+            out.markdown
+        );
+        assert_eq!(out.data["posts_fetched"], 2);
+        assert_eq!(out.data["embed"]["chunks_embedded"], 3);
     }
 
-    // T-084: embed human-readable chunks > 0 → "Embedded N chunks"
+    // T-408: index with nothing to embed (pending == 0) omits the embed line
+    // but keeps the `embed` key at zero so agents read a stable shape.
     #[test]
-    fn embed_human_nonzero_returns_embedded_count() {
-        let result = EmbedResult { chunks_embedded: 5 };
-        let out = embed(&result, 5).unwrap();
-        assert_eq!(out.markdown, "Embedded 5 chunks");
+    fn index_without_pending_embed_keeps_zero_embed_key() {
+        let out = index(&make_harvest(0), None).unwrap();
+        assert!(
+            out.markdown.contains("No updates"),
+            "harvest line missing: {}",
+            out.markdown
+        );
+        assert!(
+            !out.markdown.contains("Embedded"),
+            "embed line should be absent: {}",
+            out.markdown
+        );
+        assert_eq!(out.data["embed"]["chunks_embedded"], 0);
     }
 
     // T-085: status error variant — error field displayed
@@ -381,7 +413,7 @@ mod tests {
     // T-087: search data includes search_mode hybrid
     #[test]
     fn search_json_hybrid_includes_search_mode() {
-        let out = search(&[], "test", true, false, None, &[]).unwrap();
+        let out = search(&[], "test", true, false, &[]).unwrap();
         assert_eq!(out.data["search_mode"], "hybrid");
         assert!(out.data["results"].is_array());
     }
@@ -389,7 +421,7 @@ mod tests {
     // T-088: search data includes search_mode fts
     #[test]
     fn search_json_fts_includes_search_mode() {
-        let out = search(&[], "test", false, false, None, &[]).unwrap();
+        let out = search(&[], "test", false, false, &[]).unwrap();
         assert_eq!(out.data["search_mode"], "fts");
     }
 
@@ -397,7 +429,7 @@ mod tests {
     #[test]
     fn search_human_fts_fallback_shows_notice() {
         let results = vec![make_result(1, "Test", None, 0.5, "", MatchSource::Fts)];
-        let out = search(&results, "q", false, false, None, &[]).unwrap();
+        let out = search(&results, "q", false, false, &[]).unwrap();
         assert!(out.markdown.contains("semantic search unavailable"));
     }
 
@@ -405,14 +437,14 @@ mod tests {
     #[test]
     fn search_human_hybrid_no_fallback_notice() {
         let results = vec![make_result(1, "Test", None, 0.5, "", MatchSource::Fts)];
-        let out = search(&results, "q", true, false, None, &[]).unwrap();
+        let out = search(&results, "q", true, false, &[]).unwrap();
         assert!(!out.markdown.contains("semantic search unavailable"));
     }
 
     // T-260: search degraded fallback populates notes
     #[test]
     fn search_degraded_fallback_populates_notes() {
-        let out = search(&[], "q", false, true, None, &[]).unwrap();
+        let out = search(&[], "q", false, true, &[]).unwrap();
         assert!(
             out.degraded,
             "embedder_load_failed=true should set degraded"
@@ -424,7 +456,7 @@ mod tests {
     // T-261: search no-embed (FTS without load failure) leaves notes empty
     #[test]
     fn search_no_embed_does_not_degrade() {
-        let out = search(&[], "q", false, false, None, &[]).unwrap();
+        let out = search(&[], "q", false, false, &[]).unwrap();
         assert!(!out.degraded);
         assert!(out.notes.is_empty());
     }
@@ -435,7 +467,7 @@ mod tests {
     #[test]
     fn search_warnings_alone_set_degraded_and_populate_notes() {
         let warnings = vec!["reranker failed (boom), falling back to RRF order".to_owned()];
-        let out = search(&[], "q", true, false, None, &warnings).unwrap();
+        let out = search(&[], "q", true, false, &warnings).unwrap();
         assert!(
             out.degraded,
             "non-empty warnings should set degraded even with embedder loaded"
@@ -454,7 +486,7 @@ mod tests {
     #[test]
     fn search_warnings_with_embedder_failure_preserve_order() {
         let warnings = vec!["reranker failed (boom), falling back to RRF order".to_owned()];
-        let out = search(&[], "q", false, true, None, &warnings).unwrap();
+        let out = search(&[], "q", false, true, &warnings).unwrap();
         assert!(out.degraded);
         assert_eq!(out.notes.len(), 2);
         assert!(
@@ -498,28 +530,7 @@ mod tests {
                 MatchSource::Fts,
             ),
         ];
-        let out = search(&results, "design", true, false, None, &[]).unwrap();
-        insta::assert_snapshot!(out.markdown);
-    }
-
-    // T-403: search FTS fallback with embed_info → markdown snapshot
-    // (agents parse the embed hint).
-    #[test]
-    fn search_fts_fallback_with_embed_info_snapshot() {
-        let results = vec![make_result(
-            1,
-            "Test post",
-            None,
-            0.5,
-            "snippet text",
-            MatchSource::Fts,
-        )];
-        let info = EmbedInfo {
-            processed: 5,
-            budget_exhausted: true,
-            team: "demo".to_owned(),
-        };
-        let out = search(&results, "test", false, false, Some(info), &[]).unwrap();
+        let out = search(&results, "design", true, false, &[]).unwrap();
         insta::assert_snapshot!(out.markdown);
     }
 }

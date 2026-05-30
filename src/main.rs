@@ -31,7 +31,7 @@ struct Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Fetch new esa posts incrementally and index them
+    /// Fetch new esa posts incrementally and index them (chunks + embeddings)
     #[command(after_help = "\
 Examples:
   sae index myteam")]
@@ -39,7 +39,7 @@ Examples:
         /// Team name
         team: String,
     },
-    /// Re-fetch all esa posts and rebuild the index from scratch
+    /// Re-fetch all esa posts and rebuild the index from scratch (chunks + embeddings)
     #[command(after_help = "\
 Examples:
   sae rebuild myteam")]
@@ -47,14 +47,16 @@ Examples:
         /// Team name
         team: String,
     },
-    /// Semantic search over indexed posts
+    /// Semantic search over indexed posts (read-only)
     #[command(after_help = "\
 Examples:
   sae search \"認証\" --team myteam --limit 5
   sae search \"認証\" --after 2025-01-01
   sae search \"認証\" --after 2025-01-01 --before 2025-06-30
   echo \"認証\" | sae search
-  sae search -")]
+  sae search -
+
+Search is read-only; build the index first with `sae index` (re-run it to refresh).")]
     Search {
         #[command(flatten)]
         args: SearchArgs,
@@ -125,14 +127,6 @@ Examples:
         /// Preview without shipping (no mutation API calls)
         #[arg(long)]
         dry_run: bool,
-    },
-    /// Embed all chunks (model must be downloaded first)
-    #[command(after_help = "\
-Examples:
-  sae embed myteam")]
-    Embed {
-        /// Team name
-        team: String,
     },
     /// Show sync status
     #[command(after_help = "\
@@ -212,8 +206,7 @@ enum ModelCommand {
 // Kept manually parallel to the live `Cli` enum; drift is guarded by
 // `public_subcommands_matches_cli_non_hidden` in tests.
 const PUBLIC_SUBCOMMANDS: &[&str] = &[
-    "index", "rebuild", "search", "get", "create", "update", "archive", "ship", "embed", "status",
-    "model",
+    "index", "rebuild", "search", "get", "create", "update", "archive", "ship", "status", "model",
 ];
 
 // Superset consulted by `try_expand_shorthand`. The `__test_force_*` entries
@@ -225,6 +218,9 @@ const PUBLIC_SUBCOMMANDS: &[&str] = &[
 // v0.3.0) so `sae harvest` reaches clap as an unrecognized subcommand
 // instead of being silently rewritten to `sae search harvest` (pinned by
 // `deprecated_harvest_not_rewritten_as_search`, T-034c).
+// Likewise `embed` (removed once `index`/`rebuild` absorbed embedding) stays
+// listed so `sae embed` surfaces clap's error instead of being rewritten to
+// `sae search embed` (pinned by `removed_embed_not_rewritten_as_search`).
 const KNOWN_SUBCOMMANDS: &[&str] = &[
     "index",
     "rebuild",
@@ -293,7 +289,6 @@ async fn run(cli: Cli, config: Config) -> Result<CommandOutput, SaeError> {
         } => sae.get(number, team.as_deref(), with_body).await,
         Command::Create { args } => sae.create(args).await,
         Command::Update { args } => sae.update(args).await,
-        Command::Embed { team } => sae.embed(&team),
         Command::Archive {
             number,
             team,
@@ -738,16 +733,16 @@ mod tests {
         }
     }
 
-    // T-005: `sae embed myteam` still parses as Command::Embed (regression)
+    // T-005: `sae embed` (removed once index/rebuild absorbed embedding) must
+    // surface as a clap error, not be rewritten to `sae search embed`. Guarded
+    // by KNOWN_SUBCOMMANDS keeping `embed` (mirrors harvest's T-034c).
     #[test]
-    fn embed_still_parses_after_model_addition() {
-        let cli = parse_cli_args(["sae", "embed", "myteam"]).unwrap();
-        match cli.command {
-            Command::Embed { team } => {
-                assert_eq!(team, "myteam", "team should be myteam");
-            }
-            other => panic!("expected Embed, got {other:?}"),
-        }
+    fn removed_embed_not_rewritten_as_search() {
+        let result = parse_cli_args(["sae", "embed", "myteam"]);
+        assert!(
+            result.is_err(),
+            "removed `embed` must produce a clap error, not be rewritten as search"
+        );
     }
 
     // T-077: multi-positional args without valid search expansion → clap error
@@ -867,7 +862,7 @@ mod tests {
     #[test]
     fn all_subcommands_not_shorthand() {
         for cmd in [
-            "index", "rebuild", "get", "update", "ship", "archive", "embed", "status", "model",
+            "index", "rebuild", "get", "update", "ship", "archive", "status", "model",
         ] {
             let result = parse_cli_args(["sae", cmd]);
             assert!(

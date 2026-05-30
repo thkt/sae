@@ -1,13 +1,20 @@
+#[cfg(not(feature = "test-support"))]
 use std::convert::Infallible;
 use std::io;
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use amici::cli::embed_with_spinners;
 use amici::cli::env_lookup;
 use amici::cli::exit_code::CliError;
+#[cfg(not(feature = "test-support"))]
 use amici::model::embedder::{DegradedReason, try_load_embedder_with};
 use amici::model::{ModelDownloadError, download_and_verify_model};
-use rurico::embed::{Artifacts, ModelId, cached_artifacts};
+use rurico::embed::Embed;
+#[cfg(feature = "test-support")]
+use rurico::embed::MockEmbedder;
+#[cfg(not(feature = "test-support"))]
+use rurico::embed::{ModelId, cached_artifacts};
 use rurico::model_init::ModelInitError;
 use rurico::model_probe::ProbeError;
 
@@ -16,7 +23,7 @@ use crate::commands;
 use crate::config::{Config, ConfigError};
 use crate::envelope::{CommandOutput, ErrorCode, ErrorEnvelope, ErrorPayload};
 use crate::output;
-use crate::storage::{Db, EmbedResult, StorageError, count_unembedded_chunks};
+use crate::storage::{Db, StorageError, count_unembedded_chunks};
 use crate::sync::{self, SyncError};
 
 pub use crate::commands::search::resolve_search_query;
@@ -132,85 +139,12 @@ impl Sae {
         let db_path = self.config.team_db_path(team)?;
         let db = Db::open(&db_path)?;
         let result = sync::harvest(&client, &db, team, full).await?;
-        output::harvest(&result)
-    }
-
-    pub fn embed(&self, team: &str) -> Result<CommandOutput, SaeError> {
-        let team = self.config.resolve_team(Some(team))?;
-        let db = require_db(&self.config, team)?;
-        let paths = require_embed_model()?;
-        let pending = count_unembedded_chunks(db.conn())?;
-
-        let result = embed_with_spinners(
-            pending,
-            |_| {
-                // Ok = typed probe variant; Err = fallback Display for the
-                // non-ProbeError path; None = callback never fired.
-                let mut captured: Option<Result<ProbeError, String>> = None;
-                match try_load_embedder_with(
-                    || Ok::<_, Infallible>(Some(paths)),
-                    |e| tracing::warn!(error = %e, "failed to delete corrupt model files"),
-                    |e| {
-                        let display = e.to_string();
-                        captured = Some(extract_probe_error(e).ok_or(display));
-                    },
-                ) {
-                    Ok(e) => Ok(e),
-                    // Mirrors `ModelDownload(BackendUnavailable)` routing via
-                    // `SaeError::BackendUnavailable` so embed and model download
-                    // surface the same INTERNAL signal for hardware mismatch
-                    // (#127 CHX-001; was `Other` → UNKNOWN before).
-                    Err(DegradedReason::BackendUnavailable) => Err(SaeError::BackendUnavailable),
-                    Err(reason) => match captured {
-                        Some(Ok(probe)) => Err(SaeError::Probe(probe)),
-                        // Other (UNKNOWN): `extract_probe_error` returned a non-`ProbeError`
-                        // payload that we surfaced via `Display`. No typed variant exists
-                        // yet for the remaining `DegradedReason` shapes coming from amici.
-                        Some(Err(detail)) => Err(SaeError::Other(format!(
-                            "Model probe failed: {reason:?}: {detail}"
-                        ))),
-                        // Other (UNKNOWN): probe callback never fired — amici returned a
-                        // `DegradedReason` without invoking the per-error hook. Genuine
-                        // unclassified path.
-                        None => Err(SaeError::Other(format!("Model probe failed: {reason:?}"))),
-                    },
-                }
-            },
-            |r: &commands::embed_batch::EmbedAllResult| {
-                format!("Embedded {} chunks", r.total_chunks)
-            },
-            |embedder, update| {
-                commands::embed_batch::embed_all(
-                    db.conn(),
-                    |texts| {
-                        embedder
-                            .embed_documents_batch(texts)
-                            // Other (UNKNOWN): embedder's runtime error is an opaque
-                            // `anyhow::Error` (no typed variant from amici/rurico).
-                            // Promoting requires upstream type surface first.
-                            .map_err(|e| SaeError::Other(format!("Batch embedding failed: {e}")))
-                    },
-                    |n| update(&format!("Embedding... {n}/{pending} chunks")),
-                )
-            },
-        )?;
-
-        match result {
-            Some(all) => {
-                tracing::info!(
-                    total_added = all.added,
-                    total_chunks = all.total_chunks,
-                    "embed complete"
-                );
-                output::embed(
-                    &EmbedResult {
-                        chunks_embedded: all.added,
-                    },
-                    all.total_chunks,
-                )
-            }
-            None => output::embed(&EmbedResult { chunks_embedded: 0 }, 0),
-        }
+        // Embed pending chunks unconditionally — even when harvest fetched
+        // nothing — so a backlog left by an earlier model-less run clears on the
+        // next `index`. Mirrors yomu: never silently leave a chunk-only index.
+        // Harvest is already committed; an embed failure does not roll it back.
+        let embedded = embed_pending(&db)?.map(|r| r.added);
+        output::index(&result, embedded)
     }
 
     pub fn model_download() -> Result<CommandOutput, SaeError> {
@@ -322,11 +256,18 @@ pub enum SaeError {
     #[error("{0}")]
     InputData(String),
     /// MLX backend missing in the runtime hardware (e.g., running on a host
-    /// without Apple Silicon). Maps to `INTERNAL` (sysexits 70) so `sae embed`
+    /// without Apple Silicon). Maps to `INTERNAL` (sysexits 70) so `sae index`
     /// and `sae model download` surface the same hardware-mismatch signal
     /// (was split between 104 and 70 before #127 CHX-001).
     #[error("MLX backend is unavailable")]
     BackendUnavailable,
+    /// The embedding model is absent or failed to load when an
+    /// embedding-dependent command (e.g. `sae index`) needs to embed pending
+    /// chunks. Maps to `TEMP_FAIL` (sysexits 75) and is retryable because
+    /// `sae model download` clears it — distinct from the non-retryable
+    /// `InputUsage` usage-error path. Mirrors yomu's `EmbedderUnavailable`.
+    #[error("{0}")]
+    EmbedderUnavailable(String),
     /// Programmer-detectable invariant violation (e.g., embedder returned a
     /// vector count that does not match the requested batch). Maps to
     /// `INTERNAL` (sysexits 70) so agents distinguish bug signals from the
@@ -340,11 +281,10 @@ pub enum SaeError {
     Other(String),
 }
 
-/// Prefixes shared by the constructors below and [`SaeError::next_step`]
-/// lookup. Centralising them removes the implicit contract that constructor
-/// and lookup strings stay in sync by convention.
+/// Prefix shared by the constructor below and [`SaeError::next_step`] lookup.
+/// Centralising it removes the implicit contract that constructor and lookup
+/// strings stay in sync by convention.
 const NO_DATA_PREFIX: &str = "No data for team ";
-const MODEL_NOT_FOUND_PREFIX: &str = "Model not found";
 
 /// Shared `next_step` hint for both `SaeError::BackendUnavailable` (embed
 /// path) and `SaeError::ModelDownload(ModelDownloadError::BackendUnavailable)`
@@ -365,12 +305,6 @@ impl SaeError {
     pub(crate) fn input_no_data_for_team(team: &str) -> Self {
         Self::InputUsage(format!(
             "{NO_DATA_PREFIX}'{team}'. Run `sae index {team}` first."
-        ))
-    }
-
-    pub(crate) fn input_model_not_found() -> Self {
-        Self::InputUsage(format!(
-            "{MODEL_NOT_FOUND_PREFIX}. Run 'sae model download' first."
         ))
     }
 
@@ -413,6 +347,10 @@ impl SaeError {
             // Mirrors `ModelDownload(BackendUnavailable)` so the embed path and
             // model-download path agree on hardware-mismatch routing (#127 CHX-001).
             Self::BackendUnavailable => ErrorCode::Internal,
+            // Absent/unloadable embedding model is recoverable via
+            // `sae model download`, so route to TEMP_FAIL (75)/retryable rather
+            // than the non-retryable InputUsage path. Mirrors yomu's parity.
+            Self::EmbedderUnavailable(_) => ErrorCode::TempFailure,
             // Programmer-detectable invariant violation (embedder bug, etc.).
             // Routed to `INTERNAL` so it stays distinguishable from anyhow-swallow
             // `Other(=UNKNOWN)` per ADR-0066 L136 (#127).
@@ -442,9 +380,6 @@ impl SaeError {
             Self::InputUsage(s) if s.starts_with(NO_DATA_PREFIX) => {
                 Some("Run `sae index <team>` to fetch posts.")
             }
-            Self::InputUsage(s) if s.starts_with(MODEL_NOT_FOUND_PREFIX) => {
-                Some("Run `sae model download` to fetch the embedding model.")
-            }
             Self::Config(ConfigError::NoTeamSpecified) => {
                 Some("Pass --team <name> or set `SAE_TEAM=<name>`.")
             }
@@ -469,13 +404,16 @@ impl SaeError {
             Self::ModelDownload(ModelDownloadError::DownloadFailed(_)) => {
                 Some("Retry `sae model download`; the failure is transient.")
             }
-            // Mirrors `BackendUnavailable` below so both `sae embed` and
+            // Mirrors `BackendUnavailable` below so both `sae index` and
             // `sae model download` surface the same actionable hint on
             // hardware mismatch (#127 OPS-007).
             Self::ModelDownload(ModelDownloadError::BackendUnavailable) => {
                 Some(BACKEND_UNAVAILABLE_HINT)
             }
             Self::BackendUnavailable => Some(BACKEND_UNAVAILABLE_HINT),
+            Self::EmbedderUnavailable(_) => {
+                Some("Run `sae model download` to fetch the embedding model.")
+            }
             // Explicit catch-all arms per variant. Adding a new SaeError variant
             // must force a compile-time review (no wildcard).
             Self::InputUsage(_)
@@ -592,22 +530,17 @@ impl CliError for SaeError {
     }
 }
 
-fn require_embed_model() -> Result<Artifacts, SaeError> {
-    match cached_artifacts(ModelId::default()) {
-        Ok(Some(p)) => Ok(p),
-        Ok(None) => Err(SaeError::input_model_not_found()),
-        // Other (UNKNOWN): `cached_artifacts` returns an opaque `anyhow::Error`
-        // covering filesystem / permission / cache-layout edge cases. Promoting
-        // requires typed surface from rurico first.
-        Err(e) => Err(SaeError::Other(format!("Failed to check model cache: {e}"))),
-    }
-}
-
 /// Reverse [`From<ProbeError> for ModelInitError`] so per-variant `ProbeError`
 /// routing in [`SaeError::error_code`] survives amici's collapse boundary.
 /// Returns `None` only when `Backend.source` carries a non-`ProbeError`
 /// payload — left open so a future amici/rurico change does not silently
 /// misclassify.
+///
+/// Its only non-test caller is the real-model [`load_embedder`], `cfg`'d out
+/// under `--features test-support`. The routing logic stays exercised by
+/// T-332..T-334; `allow(dead_code)` covers the test-support build where the
+/// production caller is absent.
+#[cfg_attr(feature = "test-support", allow(dead_code))]
 fn extract_probe_error(init_err: ModelInitError) -> Option<ProbeError> {
     match init_err {
         ModelInitError::ModelCorrupt { reason } => Some(ProbeError::ModelLoadFailed { reason }),
@@ -622,12 +555,121 @@ fn extract_probe_error(init_err: ModelInitError) -> Option<ProbeError> {
     }
 }
 
+/// Production embedder loader for the embed path: resolves the model cache and
+/// loads the backend, classifying failures. Absent model → recoverable
+/// `EmbedderUnavailable` (75); hardware/OS backend missing → `BackendUnavailable`
+/// (70); corrupt model / probe failure → typed `Probe`.
+///
+/// Compiled out under `--features test-support`; the coverage build uses that
+/// feature, so the real-model loader is excluded from diff coverage (mirrors
+/// yomu's `try_load_embedder` cfg split). The test-support variant below
+/// returns a deterministic [`MockEmbedder`] so `index` / `rebuild` populate
+/// embeddings without a real model on CI runners.
+#[cfg(not(feature = "test-support"))]
+fn load_embedder() -> Result<Arc<dyn Embed>, SaeError> {
+    // Resolve the model cache lazily (only when chunks are pending, since
+    // `embed_with_spinners` skips the loader at pending == 0). Absent model is
+    // recoverable, so route to retryable `EmbedderUnavailable` (75) rather than
+    // the old non-retryable `InputUsage` (64) path.
+    let paths = match cached_artifacts(ModelId::default()) {
+        Ok(Some(p)) => p,
+        Ok(None) => {
+            return Err(SaeError::EmbedderUnavailable(
+                "embedding model not installed".to_owned(),
+            ));
+        }
+        // Other (UNKNOWN): `cached_artifacts` returns an opaque `anyhow::Error`
+        // covering filesystem / cache-layout edges.
+        Err(e) => return Err(SaeError::Other(format!("Failed to check model cache: {e}"))),
+    };
+    // Ok = typed probe variant; Err = fallback Display for the non-ProbeError
+    // path; None = callback never fired.
+    let mut captured: Option<Result<ProbeError, String>> = None;
+    match try_load_embedder_with(
+        || Ok::<_, Infallible>(Some(paths)),
+        |e| tracing::warn!(error = %e, "failed to delete corrupt model files"),
+        |e| {
+            let display = e.to_string();
+            captured = Some(extract_probe_error(e).ok_or(display));
+        },
+    ) {
+        Ok(e) => Ok(e),
+        // Mirrors `ModelDownload(BackendUnavailable)` routing via
+        // `SaeError::BackendUnavailable` so embed and model download surface the
+        // same INTERNAL signal for hardware mismatch (#127 CHX-001).
+        Err(DegradedReason::BackendUnavailable) => Err(SaeError::BackendUnavailable),
+        Err(reason) => match captured {
+            Some(Ok(probe)) => Err(SaeError::Probe(probe)),
+            // Other (UNKNOWN): `extract_probe_error` returned a non-`ProbeError`
+            // payload that we surfaced via `Display`.
+            Some(Err(detail)) => Err(SaeError::Other(format!(
+                "Model probe failed: {reason:?}: {detail}"
+            ))),
+            // Other (UNKNOWN): probe callback never fired.
+            None => Err(SaeError::Other(format!("Model probe failed: {reason:?}"))),
+        },
+    }
+}
+
+/// Test-support embedder loader: returns a deterministic in-memory
+/// [`MockEmbedder`] so `index` / `rebuild` populate embeddings without a real
+/// model (CI runners have none). Compiled only under `--features test-support`;
+/// the production binary loads the real model via the `cfg(not(...))` variant
+/// above.
+#[cfg(feature = "test-support")]
+fn load_embedder() -> Result<Arc<dyn Embed>, SaeError> {
+    Ok(Arc::new(MockEmbedder::default()))
+}
+
+/// Embeds all pending chunks for `db`, obtaining the embedder via `load`.
+/// Returns `None` when nothing is pending — `load` is never invoked then, so a
+/// model-less index still succeeds for FTS-only use. Production callers use
+/// [`embed_pending`]; tests inject a `load` double.
+fn embed_pending_with<L>(
+    db: &Db,
+    load: L,
+) -> Result<Option<commands::embed_batch::EmbedAllResult>, SaeError>
+where
+    L: FnOnce() -> Result<Arc<dyn Embed>, SaeError>,
+{
+    let pending = count_unembedded_chunks(db.conn())?;
+    embed_with_spinners(
+        pending,
+        // `embed_with_spinners` hands the loader a progress hook, but model
+        // loading reports no progress, so discard it here.
+        |_| load(),
+        |r: &commands::embed_batch::EmbedAllResult| format!("Embedded {} chunks", r.total_chunks),
+        |embedder, update| {
+            commands::embed_batch::embed_all(
+                db.conn(),
+                |texts| {
+                    embedder
+                        .embed_documents_batch(texts)
+                        // Other (UNKNOWN): embedder's runtime error is an opaque
+                        // `anyhow::Error` (no typed variant from amici/rurico).
+                        .map_err(|e| SaeError::Other(format!("Batch embedding failed: {e}")))
+                },
+                |n| update(&format!("Embedding... {n}/{pending} chunks")),
+            )
+        },
+    )
+}
+
+/// Production entry point for [`embed_pending_with`]: binds [`load_embedder`],
+/// so loader failures are classified into recoverable (`EmbedderUnavailable`,
+/// 75) versus terminal conditions.
+fn embed_pending(db: &Db) -> Result<Option<commands::embed_batch::EmbedAllResult>, SaeError> {
+    embed_pending_with(db, load_embedder)
+}
+
 #[cfg(test)]
 mod tests {
     use amici::cli::exit_code::codes;
 
     use super::*;
-    use crate::storage::sqlite_failure;
+    use std::cell::Cell;
+
+    use crate::storage::{rechunk_post, sqlite_failure, test_post_row, upsert_post};
 
     fn assert_code(err: &SaeError, expected: u8) {
         assert_eq!(err.exit_code(), ExitCode::from(expected));
@@ -901,17 +943,6 @@ mod tests {
         );
     }
 
-    // T-311: input_model_not_found_pins_next_step_download_hint
-    #[test]
-    fn input_model_not_found_pins_next_step_download_hint() {
-        let err = SaeError::input_model_not_found();
-        assert_eq!(
-            err.next_step(),
-            Some("Run `sae model download` to fetch the embedding model."),
-            "constructor and next_step must stay in sync"
-        );
-    }
-
     // T-312: next_step_config_no_team_specified
     #[test]
     fn next_step_config_no_team_specified() {
@@ -1054,6 +1085,110 @@ mod tests {
         ] {
             assert!(!err.retryable(), "{err:?} must not be retryable");
         }
+    }
+
+    // EmbedderUnavailable contract (T-404..T-406): the embedding model is not
+    // installed when `sae index` / `sae rebuild` needs to embed pending chunks.
+    // Mirrors yomu's `EmbedderUnavailable` — a recoverable (retryable) signal,
+    // distinct from the non-retryable `InputUsage` missing-model path, because
+    // `sae model download` clears it.
+
+    // T-404: EmbedderUnavailable maps to TEMP_FAIL (75)
+    #[test]
+    fn exit_code_embedder_unavailable_is_temp_fail() {
+        assert_code(
+            &SaeError::EmbedderUnavailable("model not installed".into()),
+            codes::TEMP_FAIL,
+        );
+    }
+
+    // T-405: EmbedderUnavailable is retryable (recoverable via model download)
+    #[test]
+    fn retryable_true_for_embedder_unavailable() {
+        assert!(
+            SaeError::EmbedderUnavailable("x".into()).retryable(),
+            "EmbedderUnavailable must be retryable"
+        );
+    }
+
+    // T-406: next_step for EmbedderUnavailable recommends model download
+    #[test]
+    fn next_step_embedder_unavailable_recommends_model_download() {
+        let err = SaeError::EmbedderUnavailable("x".into());
+        assert_eq!(
+            err.next_step(),
+            Some("Run `sae model download` to fetch the embedding model.")
+        );
+    }
+
+    // T-409: embed_pending skips the model load when no chunks are pending, so
+    // a model-less `index` / `rebuild` still succeeds (FTS-only). Pins the
+    // breaking-change-risk path weighed in Q1.
+    #[test]
+    fn embed_pending_with_no_pending_skips_loader() {
+        let db = Db::open_memory().unwrap();
+        let loader_called = Cell::new(false);
+        let result = embed_pending_with(&db, || {
+            loader_called.set(true);
+            Err(SaeError::Other("loader must not run".to_owned()))
+        });
+        assert!(
+            matches!(result, Ok(None)),
+            "no pending chunks must yield Ok(None), got {result:?}"
+        );
+        assert!(
+            !loader_called.get(),
+            "loader must not be invoked when nothing is pending"
+        );
+    }
+
+    // T-410: embed_pending propagates a loader failure when chunks are pending —
+    // pins Q1: model unavailable + pending chunks → `index` / `rebuild` fail
+    // with the typed error rather than leaving a chunk-only index.
+    #[test]
+    fn embed_pending_with_pending_propagates_loader_failure() {
+        let db = Db::open_memory().unwrap();
+        upsert_post(db.conn(), &test_post_row(1)).unwrap();
+        rechunk_post(db.conn(), 1, "# Title\nBody text").unwrap();
+        assert_eq!(
+            count_unembedded_chunks(db.conn()).unwrap(),
+            1,
+            "fixture must leave exactly one unembedded chunk"
+        );
+        let result = embed_pending_with(&db, || {
+            Err(SaeError::EmbedderUnavailable("not installed".to_owned()))
+        });
+        assert!(
+            matches!(result, Err(SaeError::EmbedderUnavailable(_))),
+            "pending chunks + loader failure must propagate EmbedderUnavailable, got {result:?}"
+        );
+    }
+
+    // T-414: embed_pending embeds every pending chunk through the test-support
+    // loader (MockEmbedder) — pins the happy path index/rebuild depend on,
+    // covering the embed_pending_with run arm and the production embed_pending
+    // binding without a real model. Compiled only under --features test-support
+    // (the coverage build), matching yomu's stub-embedder integration tests.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn embed_pending_embeds_all_pending_chunks() {
+        let db = Db::open_memory().unwrap();
+        upsert_post(db.conn(), &test_post_row(1)).unwrap();
+        rechunk_post(db.conn(), 1, "# Title\nBody text").unwrap();
+        assert_eq!(
+            count_unembedded_chunks(db.conn()).unwrap(),
+            1,
+            "fixture must leave exactly one unembedded chunk"
+        );
+        let result = embed_pending(&db)
+            .expect("embed_pending must succeed with MockEmbedder")
+            .expect("pending chunks must yield Some(EmbedAllResult)");
+        assert_eq!(result.added, 1, "the single pending chunk must be embedded");
+        assert_eq!(
+            count_unembedded_chunks(db.conn()).unwrap(),
+            0,
+            "no chunks must remain unembedded after embed_pending"
+        );
     }
 
     // T-324: candidates(None) returns empty for every variant — without a

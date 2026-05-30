@@ -1,9 +1,0 @@
----
-source: src/output.rs
-expression: out.markdown
----
-(semantic search unavailable, showing text-match results)
-[0.5000] Test post (#1)  https://example.esa.io/posts/1
-  snippet text
-(Embedded 5 new chunks)
-Hint: more chunks pending. Run 'sae embed demo' to index all.

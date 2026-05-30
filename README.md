@@ -57,7 +57,7 @@ sae search - < query.txt
 sae get 42
 ```
 
-`--team` を省略した場合は `default_team` → 設定済みチームが1つだけならそれ → どちらでもなければ `USAGE_ERROR` (64) の順で解決される。`index` / `rebuild` / `embed` だけは team が必須 positional。
+`--team` を省略した場合は `default_team` → 設定済みチームが1つだけならそれ → どちらでもなければ `USAGE_ERROR` (64) の順で解決される。`index` / `rebuild` だけは team が必須 positional。
 
 ### 投稿の作成・更新
 
@@ -107,10 +107,13 @@ sae archive 42 --dry-run
 # 埋め込みモデルをダウンロード（初回のみ）
 sae model download
 
-# チャンクの埋め込み
-sae embed myteam
+# モデル導入後は sae index / sae rebuild がチャンク生成と埋め込みをまとめて実行
+# （未導入で未埋め込みチャンクが残ると EmbedderUnavailable (75) で失敗するため、
+#  先に model download。すべて埋め込み済みならモデル無しでも index は成功）
+sae index myteam
 
-# 以降の検索は FTS + ベクトルのハイブリッド
+# 検索は読み取り専用（FTS + ベクトルのハイブリッド）。esa の最新を反映するには
+# sae index を再実行する（search は自動で再取得・再埋め込みしない）
 sae search "認証フローの設計方針"
 
 # embedder のロードコストを避けて FTS のみで検索（CI / スクリプト用途）
@@ -145,17 +148,17 @@ sysexits.h の symbolic name (`EX_USAGE`, `EX_SOFTWARE` 等) は数値の出典�
 | 0    | (none)         | 正常終了         |                                                          |             |
 | 64   | USAGE_ERROR    | 入力エラー       | 不明なチーム、トークン未設定、未 index 実行              | しない      |
 | 65   | DATA_ERROR     | データ形式不正   | `--after` / `--before` の日付形式不正 (`YYYY-MM-DD` 以外)、esa API 404 (指定 post 番号がチームに存在しない) | しない      |
-| 70   | INTERNAL       | 内部エラー       | JSON parse 失敗、esa API の 404 以外の HTTP エラー (5xx および 401/403/422 等の 4xx)、MLX backend 不在 (`sae embed` / `sae model download` 共通)、model download 検証失敗 (`ModelDownloadError::ProbeFailed`)、`ProbeError` (HandlerNotInstalled / ModelLoadFailed / SetupRejected)、embedder invariant 違反 (例: batch count mismatch) | しない      |
+| 70   | INTERNAL       | 内部エラー       | JSON parse 失敗、esa API の 404 以外の HTTP エラー (5xx および 401/403/422 等の 4xx)、MLX backend 不在 (`sae index` / `sae model download` 共通)、model download 検証失敗 (`ModelDownloadError::ProbeFailed`)、`ProbeError` (HandlerNotInstalled / ModelLoadFailed / SetupRejected)、embedder invariant 違反 (例: batch count mismatch) | しない      |
 | 73   | CANT_CREAT     | データ層エラー   | DB open 失敗、ファイル作成不可                           | 状況による  |
 | 74   | IO_ERROR       | I/O エラー       | ファイル読み書き失敗、`ProbeError::SubprocessFailed`     | 状況による  |
-| 75   | TEMP_FAILURE   | 一時的エラー     | esa API rate limit、ネットワーク障害、model download 一時的失敗 (429, 5xx, timeout) | する  |
+| 75   | TEMP_FAILURE   | 一時的エラー     | esa API rate limit、ネットワーク障害、model download 一時的失敗 (429, 5xx, timeout)、embedding モデル未インストールで `sae index` / `rebuild` が埋め込み不能 (`EmbedderUnavailable`、`sae model download` で解消) | する  |
 | 104  | UNKNOWN        | 分類不能         | model probe fallback、未型化の embedder ランタイムエラー (`anyhow::Error` 経由)、その他の想定外例外。分類済み 70 と区別する ADR-0066 L136 の意図に対応 | しない |
 
 > ⚠️ 破壊的変更（issue #91 / amici #34 migration）: 旧 schema (`1` / `2` / `4`) からの切り替え。スクリプト / CI で specific number に branch している場合は更新が必要。
 
 > ⚠️ 破壊的変更（issue #126 / ADR-0066 Group 2 baseline）: 日付形式不正が 64 → 65、catch-all (`SaeError::Other`) が 70 → 104 に変化。`--json` の `error.code` も同様に `USAGE_ERROR` → `DATA_ERROR`、`INTERNAL` → `UNKNOWN`。
 
-> ⚠️ 破壊的変更（issue #127 / `SaeError::Other` routing audit）: #126 で catch-all が 70 → 104 に動いた一方、以下の 2 種の失敗は **70 (INTERNAL) に分類される** — `sae embed` / `sae search` での MLX backend 不在 (`SaeError::BackendUnavailable`)、`sae embed` / `sae search` での embedder invariant 違反 (`SaeError::Internal`、例: batch count mismatch)。`sae model download` 側 (既に 70) と routing を揃え、agent が「ハードウェア / 環境不一致 or プログラム不変条件違反」シグナルとして検知できるようにする。**net 状態**: agent retry policy は `error.code` (= `"INTERNAL"` か `"UNKNOWN"`) で分岐すれば #126 / #127 双方の変更を吸収できる。
+> ⚠️ 破壊的変更（issue #127 / `SaeError::Other` routing audit）: #126 で catch-all が 70 → 104 に動いた一方、以下の 2 種の失敗は **70 (INTERNAL) に分類される** — `sae index` / `sae search` での MLX backend 不在 (`SaeError::BackendUnavailable`)、`sae index` / `sae search` での embedder invariant 違反 (`SaeError::Internal`、例: batch count mismatch)。`sae model download` 側 (既に 70) と routing を揃え、agent が「ハードウェア / 環境不一致 or プログラム不変条件違反」シグナルとして検知できるようにする。**net 状態**: agent retry policy は `error.code` (= `"INTERNAL"` か `"UNKNOWN"`) で分岐すれば #126 / #127 双方の変更を吸収できる。
 
 > ⚠️ 破壊的変更（issue #136 / esa API 404 reclassify）: esa API が 404 (post not found) を返したときの exit code が `70` → `65`、`--json` の `error.code` が `"INTERNAL"` → `"DATA_ERROR"` に変化。`next_step` に「Verify the post number exists in esa, or run `sae search <keyword>` to find it.」が付くため、agent が「入力 post 番号間違い」と「サーバ起因 5xx」を判別できる。**net 状態**: 404 (入力データ起因) は 65、404 以外の HTTP error (5xx および 401/403/422 等) は 70 のまま。`error.code` で分岐していれば変更は自動吸収される。
 
