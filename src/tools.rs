@@ -1,3 +1,4 @@
+#[cfg(not(feature = "test-support"))]
 use std::convert::Infallible;
 use std::io;
 use std::process::ExitCode;
@@ -6,9 +7,14 @@ use std::sync::Arc;
 use amici::cli::embed_with_spinners;
 use amici::cli::env_lookup;
 use amici::cli::exit_code::CliError;
+#[cfg(not(feature = "test-support"))]
 use amici::model::embedder::{DegradedReason, try_load_embedder_with};
 use amici::model::{ModelDownloadError, download_and_verify_model};
-use rurico::embed::{Embed, ModelId, cached_artifacts};
+use rurico::embed::Embed;
+#[cfg(feature = "test-support")]
+use rurico::embed::MockEmbedder;
+#[cfg(not(feature = "test-support"))]
+use rurico::embed::{ModelId, cached_artifacts};
 use rurico::model_init::ModelInitError;
 use rurico::model_probe::ProbeError;
 
@@ -529,6 +535,12 @@ impl CliError for SaeError {
 /// Returns `None` only when `Backend.source` carries a non-`ProbeError`
 /// payload — left open so a future amici/rurico change does not silently
 /// misclassify.
+///
+/// Its only non-test caller is the real-model [`load_embedder`], `cfg`'d out
+/// under `--features test-support`. The routing logic stays exercised by
+/// T-332..T-334; `allow(dead_code)` covers the test-support build where the
+/// production caller is absent.
+#[cfg_attr(feature = "test-support", allow(dead_code))]
 fn extract_probe_error(init_err: ModelInitError) -> Option<ProbeError> {
     match init_err {
         ModelInitError::ModelCorrupt { reason } => Some(ProbeError::ModelLoadFailed { reason }),
@@ -547,6 +559,13 @@ fn extract_probe_error(init_err: ModelInitError) -> Option<ProbeError> {
 /// loads the backend, classifying failures. Absent model → recoverable
 /// `EmbedderUnavailable` (75); hardware/OS backend missing → `BackendUnavailable`
 /// (70); corrupt model / probe failure → typed `Probe`.
+///
+/// Compiled out under `--features test-support`; the coverage build uses that
+/// feature, so the real-model loader is excluded from diff coverage (mirrors
+/// yomu's `try_load_embedder` cfg split). The test-support variant below
+/// returns a deterministic [`MockEmbedder`] so `index` / `rebuild` populate
+/// embeddings without a real model on CI runners.
+#[cfg(not(feature = "test-support"))]
 fn load_embedder() -> Result<Arc<dyn Embed>, SaeError> {
     // Resolve the model cache lazily (only when chunks are pending, since
     // `embed_with_spinners` skips the loader at pending == 0). Absent model is
@@ -590,6 +609,16 @@ fn load_embedder() -> Result<Arc<dyn Embed>, SaeError> {
             None => Err(SaeError::Other(format!("Model probe failed: {reason:?}"))),
         },
     }
+}
+
+/// Test-support embedder loader: returns a deterministic in-memory
+/// [`MockEmbedder`] so `index` / `rebuild` populate embeddings without a real
+/// model (CI runners have none). Compiled only under `--features test-support`;
+/// the production binary loads the real model via the `cfg(not(...))` variant
+/// above.
+#[cfg(feature = "test-support")]
+fn load_embedder() -> Result<Arc<dyn Embed>, SaeError> {
+    Ok(Arc::new(MockEmbedder::default()))
 }
 
 /// Embeds all pending chunks for `db`, obtaining the embedder via `load`.
@@ -1132,6 +1161,33 @@ mod tests {
         assert!(
             matches!(result, Err(SaeError::EmbedderUnavailable(_))),
             "pending chunks + loader failure must propagate EmbedderUnavailable, got {result:?}"
+        );
+    }
+
+    // T-414: embed_pending embeds every pending chunk through the test-support
+    // loader (MockEmbedder) — pins the happy path index/rebuild depend on,
+    // covering the embed_pending_with run arm and the production embed_pending
+    // binding without a real model. Compiled only under --features test-support
+    // (the coverage build), matching yomu's stub-embedder integration tests.
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn embed_pending_embeds_all_pending_chunks() {
+        let db = Db::open_memory().unwrap();
+        upsert_post(db.conn(), &test_post_row(1)).unwrap();
+        rechunk_post(db.conn(), 1, "# Title\nBody text").unwrap();
+        assert_eq!(
+            count_unembedded_chunks(db.conn()).unwrap(),
+            1,
+            "fixture must leave exactly one unembedded chunk"
+        );
+        let result = embed_pending(&db)
+            .expect("embed_pending must succeed with MockEmbedder")
+            .expect("pending chunks must yield Some(EmbedAllResult)");
+        assert_eq!(result.added, 1, "the single pending chunk must be embedded");
+        assert_eq!(
+            count_unembedded_chunks(db.conn()).unwrap(),
+            0,
+            "no chunks must remain unembedded after embed_pending"
         );
     }
 

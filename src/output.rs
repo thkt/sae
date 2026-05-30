@@ -298,6 +298,29 @@ mod tests {
         assert!(out.markdown.contains("Last sync: 2025-01-01 00:00:00"));
     }
 
+    // T-415: status human-readable surfaces the pending-embed hint when a
+    // synced team has unembedded chunks (covers the `pending_embed > 0` branch
+    // that points the user at `sae index`).
+    #[test]
+    fn status_human_synced_with_pending_embed_shows_index_hint() {
+        let ts = TeamStatus {
+            team: "team-a".to_owned(),
+            status: SyncStatus::Synced,
+            posts: 10,
+            pending_embed: 3,
+            sync_state: None,
+            error: None,
+            db_path: None,
+        };
+        let out = status(&[ts]).unwrap();
+        assert!(
+            out.markdown
+                .contains("Pending embed: 3 chunks (run 'sae index team-a' to embed)"),
+            "synced team with pending chunks must show the index hint; got: {}",
+            out.markdown
+        );
+    }
+
     // T-081: status human-readable not-synced team → expected lines
     #[test]
     fn status_human_not_synced_contains_expected_lines() {

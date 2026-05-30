@@ -29,6 +29,14 @@ fn sae_command(home: &Path) -> Command {
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("PATH", env::var_os("PATH").unwrap_or_default());
+    // cargo-llvm-cov instruments the spawned binary and directs its profile
+    // output via LLVM_PROFILE_FILE; the env_clear() above drops it, leaving the
+    // binary unable to write a profraw — so every integration-only path (the
+    // `__test_*` seams, search) reads as uncovered. Restore it when present.
+    // yomu sidesteps this by never calling env_clear().
+    if let Some(profile) = env::var_os("LLVM_PROFILE_FILE") {
+        cmd.env("LLVM_PROFILE_FILE", profile);
+    }
     cmd
 }
 
@@ -479,5 +487,37 @@ fn esa_client_rejects_non_esa_host() {
     assert!(
         matches!(result, Err(ClientError::InvalidRequest(_))),
         "with_base_url('https://attacker.com') must be rejected; got: {result:?}"
+    );
+}
+
+// T-CI012: `search --no-embed` against a seeded DB drives run_search's
+// read-only path end to end — covering the semantic-flag decision and the
+// success-envelope wiring (search.rs:102,105). Seeds via the public storage
+// API because sae cannot run `index` offline (esa fetch), unlike yomu's
+// local-file index.
+#[test]
+fn search_no_embed_against_seeded_db_exits_success() {
+    use sae::storage::{Db, rechunk_post, test_post_row, upsert_post};
+
+    let dir = tempdir().unwrap();
+    let home = dir.path();
+    write_config_with_teams(home, &["myteam"]);
+
+    // Db::open creates the parent data dir; seed one post + its chunks so FTS
+    // has something to match.
+    let db_path = home.join(".local/share/sae/myteam.db");
+    let db = Db::open(&db_path).expect("open seed db");
+    upsert_post(db.conn(), &test_post_row(1)).expect("seed post");
+    rechunk_post(db.conn(), 1, "# Title\nBody text").expect("seed chunks");
+    drop(db);
+
+    let output = sae_command(home)
+        .args(["search", "Title", "--no-embed", "--team", "myteam"])
+        .output()
+        .expect("run search");
+    assert!(
+        output.status.success(),
+        "search --no-embed against a seeded DB must exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
     );
 }
