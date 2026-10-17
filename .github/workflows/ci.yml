@@ -73,6 +73,10 @@ jobs:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
+      # Keep real-model hashing/host work practical under instrumentation.
+      # Debug assertions and overflow checks retain the dev/test defaults.
+      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
+      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
     permissions:
       contents: read
 
@@ -107,8 +111,15 @@ jobs:
       - name: Generate lcov coverage including real native contracts
         env:
           SAE_MODEL_DIR: ${{ runner.temp }}/sae-coverage-model
-          RUST_TEST_NOCAPTURE: "1"
         run: cargo llvm-cov --no-clean --features test-support --lcov --output-path lcov.info -- --include-ignored --test-threads=1
+
+      - name: Upload coverage evidence
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage-lcov
+          path: lcov.info
+          if-no-files-found: error
+          retention-days: 7
 
       - name: Diff coverage gate (changed lines >= 95%)
         run: |

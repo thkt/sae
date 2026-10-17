@@ -4,8 +4,6 @@ use anyhow::{Context, Result, ensure};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-#[cfg(feature = "test-support")]
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::{
     env,
     fmt::{self, Write as _},
@@ -119,24 +117,6 @@ static SELECTED: OnceLock<ModelSpec> = OnceLock::new();
 pub fn selected() -> &'static ModelSpec {
     SELECTED.get_or_init(ModelSpec::default)
 }
-#[cfg(feature = "test-support")]
-pub(crate) fn record_probe_stage(stage: &str) {
-    if let Some(path) = env::var_os("__SAE_TEST_PROBE_TRACE")
-        && let Ok(mut file) = fs::OpenOptions::new().create(true).append(true).open(path)
-    {
-        let epoch_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis();
-        let event = serde_json::json!({
-            "epoch_ms": epoch_ms,
-            "pid": process::id(),
-            "thread": thread::current().name(),
-            "stage": stage,
-        });
-        let _ = writeln!(file, "{event}");
-    }
-}
 pub fn hash_file(path: &Path) -> Result<String> {
     let mut h = Sha256::new();
     let mut f = fs::File::open(path)?;
@@ -176,34 +156,23 @@ pub fn cached_artifacts() -> Result<Option<PathBuf>> {
     if !root.join("model.gguf").is_file() || !root.join("tokenizer.json").is_file() {
         return Ok(None);
     }
-    #[cfg(feature = "test-support")]
-    record_probe_stage("hash-model-start");
     ensure!(
         hash_file(&root.join("model.gguf"))? == selected().model_sha256,
         "model checksum mismatch"
     );
-    #[cfg(feature = "test-support")]
-    record_probe_stage("hash-tokenizer-start");
     ensure!(
         hash_file(&root.join("tokenizer.json"))? == selected().tokenizer_sha256,
         "tokenizer checksum mismatch"
     );
-    #[cfg(feature = "test-support")]
-    record_probe_stage("hash-complete");
     Ok(Some(root))
 }
 pub fn load_verified() -> Result<Arc<dyn Embed>> {
     let root = cached_artifacts()?.context("model not installed")?;
-    #[cfg(feature = "test-support")]
-    record_probe_stage("model-load-start");
-    let model = Gemma::load(
+    Ok(Arc::new(Gemma::load(
         &root.join("model.gguf"),
         &root.join("tokenizer.json"),
         selected().clone(),
-    )?;
-    #[cfg(feature = "test-support")]
-    record_probe_stage("model-load-complete");
-    Ok(Arc::new(model))
+    )?))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,35 +230,23 @@ pub fn handle_probe_if_needed() {
     if env::var_os("__SAE_GEMMA_PROBE").is_none() {
         return;
     }
-    #[cfg(feature = "test-support")]
-    record_probe_stage("child-handler-entered");
     let result = (|| -> Result<()> {
         let spec: ModelSpec = serde_json::from_str(&env::var("__SAE_GEMMA_SPEC")?)?;
         spec.validate()?;
         SELECTED
             .set(spec)
             .map_err(|_| anyhow::anyhow!("model already selected"))?;
-        #[cfg(feature = "test-support")]
-        record_probe_stage("gpu-init-start");
         if !gpu_available()? {
             process::exit(2);
         }
-        #[cfg(feature = "test-support")]
-        record_probe_stage("gpu-init-complete");
         let model = load_verified()?;
-        #[cfg(feature = "test-support")]
-        record_probe_stage("query-start");
         let v = model.embed_query("model probe")?;
         ensure!(
             v.len() == 768 && v.iter().all(|x| x.is_finite()),
             "invalid probe embedding"
         );
-        #[cfg(feature = "test-support")]
-        record_probe_stage("query-complete");
         Ok(())
     })();
-    #[cfg(feature = "test-support")]
-    record_probe_stage("child-before-exit-after-model-drop");
     process::exit(if result.is_ok() { 0 } else { 1 });
 }
 fn probe() -> Result<bool> {
@@ -307,12 +264,8 @@ fn run_probe(command: &mut Command, timeout: Duration) -> Result<bool> {
         .stderr(Stdio::null())
         .spawn()?;
     let deadline = Instant::now() + timeout;
-    #[cfg(feature = "test-support")]
-    record_probe_stage(&format!("parent-spawned-child={}", child.id()));
     loop {
         if let Some(status) = child.try_wait()? {
-            #[cfg(feature = "test-support")]
-            record_probe_stage("parent-reaped-child");
             if status.code() == Some(2) {
                 return Ok(false);
             }
@@ -320,8 +273,6 @@ fn run_probe(command: &mut Command, timeout: Duration) -> Result<bool> {
             return Ok(true);
         }
         if Instant::now() >= deadline {
-            #[cfg(feature = "test-support")]
-            record_probe_stage("parent-timeout");
             let _ = child.kill();
             let _ = child.wait();
             anyhow::bail!("isolated model probe timed out")
