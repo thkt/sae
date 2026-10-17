@@ -102,14 +102,12 @@ pub(crate) async fn ship_via_client(
 mod tests {
     use super::*;
 
-    // T-140: archive_category returns "Archived" when post has no category
     #[test]
     fn archive_no_category() {
         assert_eq!(archive_category(None), Some("Archived".into()));
         assert_eq!(archive_category(Some("")), Some("Archived".into()));
     }
 
-    // T-141: archive_category prefixes existing category with "Archived/"
     #[test]
     fn archive_with_category() {
         assert_eq!(
@@ -118,14 +116,12 @@ mod tests {
         );
     }
 
-    // T-142: archive_category returns None when post is already archived
     #[test]
     fn archive_already_archived() {
         assert_eq!(archive_category(Some("Archived")), None);
         assert_eq!(archive_category(Some("Archived/dev")), None);
     }
 
-    // T-143: archive_category treats "ArchivedData" as not archived (prefix only)
     #[test]
     fn archive_not_prefix_match() {
         assert_eq!(
@@ -145,7 +141,6 @@ mod tests {
         esa_post_fixture(number, "Post", "# x", category, wip, updated_at)
     }
 
-    // T-313: archive_via_client moves category and writes through to local DB
     #[tokio::test]
     async fn archive_via_client_writes_through_to_local_db() {
         use wiremock::matchers::{method, path};
@@ -189,7 +184,6 @@ mod tests {
         assert_eq!(category, "Archived/dev/guide");
     }
 
-    // T-314: ship_via_client unsets wip and reflects to local DB
     #[tokio::test]
     async fn ship_via_client_writes_through_to_local_db() {
         use wiremock::matchers::{method, path};

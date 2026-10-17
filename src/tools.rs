@@ -123,10 +123,7 @@ impl Sae {
         let db = Db::open(&db_path)?;
         validate_embedding_index(db.conn())?;
         let result = sync::harvest(&client, &db, team, full).await?;
-        // Embed pending chunks unconditionally — even when harvest fetched
-        // nothing — so a backlog left by an earlier model-less run clears on the
-        // next `index`. Mirrors yomu: never silently leave a chunk-only index.
-        // Harvest is already committed; an embed failure does not roll it back.
+        // Clear earlier embedding backlogs even when no posts changed; harvest is already committed.
         let embedded = embed_pending(&db)?.map(|r| r.added);
         output::index(&result, embedded)
     }
@@ -226,60 +223,29 @@ pub enum SaeError {
     Io(#[from] io::Error),
     #[error(transparent)]
     ModelDownload(#[from] ModelDownloadError),
-    /// Verified Gemma artifacts are corrupt or the native model failed to load.
-    /// Maps to `INTERNAL` (sysexits 70), preserving the CLI load-failure contract.
     #[error("model load failed: {0}")]
     ModelLoadFailed(String),
-    /// User action required (e.g., run `sae index` or `sae model download` first,
-    /// or pass a missing flag). Maps to `USAGE_ERROR` (sysexits 64).
     #[error("{0}")]
     InputUsage(String),
-    /// User-supplied data malformed (e.g., date string not `YYYY-MM-DD`).
-    /// Maps to `DATA_ERROR` (sysexits 65) per ADR-0066 Group 2.
     #[error("{0}")]
     InputData(String),
-    /// Gemma native backend unavailable. Maps to `INTERNAL` (sysexits 70) so `sae index`
-    /// and `sae model download` surface the same hardware-mismatch signal
-    /// (was split between 104 and 70 before #127 CHX-001).
     #[error("Gemma native backend is unavailable")]
     BackendUnavailable,
-    /// The embedding model is not installed when an
-    /// embedding-dependent command (e.g. `sae index`) needs to embed pending
-    /// chunks. Maps to `TEMP_FAIL` (sysexits 75) and is retryable because
-    /// `sae model download` clears it — distinct from the non-retryable
-    /// `InputUsage` usage-error path. Mirrors yomu's `EmbedderUnavailable`.
     #[error("{0}")]
     EmbedderUnavailable(String),
-    /// Programmer-detectable invariant violation (e.g., embedder returned a
-    /// vector count that does not match the requested batch). Maps to
-    /// `INTERNAL` (sysexits 70) so agents distinguish bug signals from the
-    /// `anyhow`-swallow `UNKNOWN` (104) path per ADR-0066 L136 (#127 CHX-001).
+    /// Classified invariant failure (INTERNAL).
     #[error("{0}")]
     Internal(String),
-    /// Operational failure with no classified variant. Maps to `UNKNOWN`
-    /// (104) so the `anyhow`-style catch-all is distinguishable from genuine
-    /// `INTERNAL` (70) classifications per ADR-0066 L136.
+    /// Unclassified runtime failure (UNKNOWN).
     #[error("{0}")]
     Other(String),
 }
 
-/// Prefix shared by the constructor below and [`SaeError::next_step`] lookup.
-/// Centralising it removes the implicit contract that constructor and lookup
-/// strings stay in sync by convention.
 const NO_DATA_PREFIX: &str = "No data for team ";
 
-/// Shared `next_step` hint for both `SaeError::BackendUnavailable` (embed
-/// path) and `SaeError::ModelDownload(ModelDownloadError::BackendUnavailable)`
-/// (model download path). Lives as a single const so the unit tests, the
-/// integration test, and the production arm cannot drift.
 const BACKEND_UNAVAILABLE_HINT: &str =
     "Install a build with the Gemma native backend, or pass `--no-embed` for FTS-only search.";
 
-/// Shared `next_step` hint for `ClientError::Api { status: 404, .. }`
-/// (post-not-found path). Centralised so the production arm and unit tests
-/// cannot drift. The integration test (`tests/cli_integration.rs::T-CI009`)
-/// intentionally keeps an exact-string literal: it asserts the binary-boundary
-/// surface, not the in-process surface (#136).
 const POST_NOT_FOUND_HINT: &str =
     "Verify the post number exists in esa, or run `sae search <keyword>` to find it.";
 
@@ -290,23 +256,16 @@ impl SaeError {
         ))
     }
 
-    /// [`CliError::exit_code`] delegates here so the sysexits mapping is single-sourced.
     pub(crate) fn error_code(&self) -> ErrorCode {
         match self {
             Self::InputUsage(_) | Self::Config(_) => ErrorCode::UsageError,
             Self::InputData(_) => ErrorCode::DataError,
             Self::Client(ClientError::TokenNotSet)
             | Self::Sync(SyncError::Client(ClientError::TokenNotSet)) => ErrorCode::UsageError,
-            // Retryable storage failures (SQLite WAL contention, transient I/O)
-            // route to `TempFailure` (75) instead of the `CantCreat` (73) default
-            // so AI agents auto-retry recoverable conditions (#138 subtask 2).
             Self::Storage(StorageError::IndexMismatch(_)) => ErrorCode::DataError,
             Self::Storage(e) if e.is_retryable() => ErrorCode::TempFailure,
             Self::Sync(e) if e.is_retryable() => ErrorCode::TempFailure,
             Self::Storage(_) | Self::Sync(SyncError::Storage(_)) => ErrorCode::CantCreat,
-            // esa API 404 is an input failure (the post number does not exist
-            // in the team), not a server-side fault. Route to DATA_ERROR (65)
-            // so AI agents distinguish missing inputs from 5xx INTERNAL (#136).
             Self::Client(ClientError::Api { status: 404, .. })
             | Self::Sync(SyncError::Client(ClientError::Api { status: 404, .. })) => {
                 ErrorCode::DataError
@@ -326,30 +285,16 @@ impl SaeError {
             Self::ModelDownload(ModelDownloadError::DownloadFailed(_)) => ErrorCode::TempFailure,
             Self::ModelDownload(
                 ModelDownloadError::BackendUnavailable | ModelDownloadError::ProbeFailed(_),
-            ) => ErrorCode::Internal,
-            // Mirrors `ModelDownload(BackendUnavailable)` so the embed path and
-            // model-download path agree on hardware-mismatch routing (#127 CHX-001).
-            Self::BackendUnavailable => ErrorCode::Internal,
-            // Absent/unloadable embedding model is recoverable via
-            // `sae model download`, so route to TEMP_FAIL (75)/retryable rather
-            // than the non-retryable InputUsage path. Mirrors yomu's parity.
+            )
+            | Self::BackendUnavailable
+            | Self::Internal(_)
+            | Self::ModelLoadFailed(_) => ErrorCode::Internal,
             Self::EmbedderUnavailable(_) => ErrorCode::TempFailure,
-            // Programmer-detectable invariant violation (embedder bug, etc.).
-            // Routed to `INTERNAL` so it stays distinguishable from anyhow-swallow
-            // `Other(=UNKNOWN)` per ADR-0066 L136 (#127).
-            Self::Internal(_) | Self::ModelLoadFailed(_) => ErrorCode::Internal,
-            // Remaining Client/Sync (Network connect/timeout, MaxRetries) are retry-eligible.
-            // Explicit arms (no wildcard) so future client variants force a compile-time review.
             Self::Client(_) | Self::Sync(_) => ErrorCode::TempFailure,
-            // Catch-all: anyhow-style swallowing surfaces as UNKNOWN (104) to
-            // distinguish it from classified INTERNAL (70) per ADR-0066 L136.
             Self::Other(_) => ErrorCode::Unknown,
         }
     }
 
-    /// Returns template strings (`Run \`sae index <team>\``).
-    /// Concrete values (`Run \`sae index gaji\``) would require parsing the
-    /// message back, which is fragile; the agent-facing template is unambiguous.
     pub(crate) fn next_step(&self) -> Option<&'static str> {
         match self {
             Self::InputUsage(s) if s.starts_with(NO_DATA_PREFIX) => {
@@ -362,16 +307,10 @@ impl SaeError {
             | Self::Sync(SyncError::Client(ClientError::TokenNotSet)) => {
                 Some("Set `ESA_ACCESS_TOKEN=<token>` and retry.")
             }
-            // esa API 404: the requested post number does not exist in the
-            // team. Pairs with the DATA_ERROR routing in `error_code()` (#136)
-            // so agents see both a 65 exit code and a recovery hint.
             Self::Client(ClientError::Api { status: 404, .. })
             | Self::Sync(SyncError::Client(ClientError::Api { status: 404, .. })) => {
                 Some(POST_NOT_FOUND_HINT)
             }
-            // Direct API commands (get/create/update/archive/ship) bubble
-            // ClientError::MaxRetries as Self::Client(_); the index/rebuild
-            // path wraps it under Sync. Both share the same retry guidance.
             Self::Client(ClientError::MaxRetries(_))
             | Self::Sync(SyncError::Client(ClientError::MaxRetries(_))) => {
                 Some("Retry after the rate-limit window resets.")
@@ -379,21 +318,14 @@ impl SaeError {
             Self::ModelDownload(ModelDownloadError::DownloadFailed(_)) => {
                 Some("Retry `sae model download`; the failure is transient.")
             }
-            // Mirrors `BackendUnavailable` below so both `sae index` and
-            // `sae model download` surface the same actionable hint on
-            // hardware mismatch (#127 OPS-007).
-            Self::ModelDownload(ModelDownloadError::BackendUnavailable) => {
-                Some(BACKEND_UNAVAILABLE_HINT)
-            }
-            Self::BackendUnavailable => Some(BACKEND_UNAVAILABLE_HINT),
+            Self::ModelDownload(ModelDownloadError::BackendUnavailable)
+            | Self::BackendUnavailable => Some(BACKEND_UNAVAILABLE_HINT),
             Self::EmbedderUnavailable(_) => {
                 Some("Run `sae model download` to fetch the embedding model.")
             }
             Self::Storage(StorageError::IndexMismatch(_)) => {
                 Some("Run `sae model migrate <team>` to build a compatible Gemma index.")
             }
-            // Explicit catch-all arms per variant. Adding a new SaeError variant
-            // must force a compile-time review (no wildcard).
             Self::InputUsage(_)
             | Self::InputData(_)
             | Self::Config(_)
@@ -409,25 +341,6 @@ impl SaeError {
         }
     }
 
-    /// Returns suggestion candidates for recoverable failures so AI agents
-    /// can surface a Did-you-mean list to the caller without a follow-up
-    /// `sae status` roundtrip (#139).
-    ///
-    /// `config` is threaded from [`emit_error`] in `main.rs`. Pass `None` for
-    /// failures that occur before `Config::load()` completes — the only such
-    /// variants are config-load failures themselves, which never produce
-    /// team-list candidates anyway.
-    ///
-    /// Order is preserved as written in `config.json`; the suite is
-    /// deliberately unfiltered (no fuzzy match) per the issue scope.
-    ///
-    /// Wildcard default: every other variant returns empty. Unlike
-    /// [`Self::next_step`], the candidate surface is intentionally restricted
-    /// to the team-list cases — `next_step` carries a per-variant editorial
-    /// hint, but `candidates` is a wire-format vocabulary that only the
-    /// recoverable team failures legitimately populate. A new `SaeError`
-    /// variant added later wanting suggestions should be explicit, not
-    /// inherit a `vec![]` default by mistake.
     pub(crate) fn candidates(&self, config: Option<&Config>) -> Vec<String> {
         match self {
             Self::Config(ConfigError::NoTeamSpecified | ConfigError::UnknownTeam(_)) => {
@@ -437,18 +350,10 @@ impl SaeError {
         }
     }
 
-    /// Mirrors the `TempFailure` classification from [`Self::error_code`].
     pub(crate) fn retryable(&self) -> bool {
         matches!(self.error_code(), ErrorCode::TempFailure)
     }
 
-    /// Bundles [`Self::error_code`], [`Self::next_step`], [`Self::candidates`],
-    /// [`Self::retryable`], and the formatted message into an [`ErrorEnvelope`]
-    /// for `--json` rendering. Kept here so the envelope module avoids a
-    /// dependency on `SaeError` (which would form a cycle).
-    ///
-    /// `config` is consulted by [`Self::candidates`] for the team-list cases.
-    /// Pass `None` when the failure occurred before `Config::load()` completed.
     pub(crate) fn to_error_envelope(&self, config: Option<&Config>) -> ErrorEnvelope {
         ErrorEnvelope {
             error: ErrorPayload {
@@ -479,10 +384,7 @@ pub(crate) fn require_db(config: &Config, team: &str) -> Result<Db, SaeError> {
     Ok(Db::open_read_only(&db_path)?)
 }
 
-/// Best-effort DB open for mutation commands. Returns `None` when the team
-/// cannot be resolved, the DB file does not yet exist (no prior `sae index`
-/// run), or the DB fails to open — letting the API call proceed regardless.
-/// Only the open failure logs a warning; the other paths are silent.
+/// Local cache failures must not prevent a successful remote mutation.
 pub(crate) fn try_open_team_db(config: &Config, team: Option<&str>) -> Option<Db> {
     let team = config.resolve_team(team).ok()?;
     let db_path = config.team_db_path(team).ok()?;
@@ -514,7 +416,6 @@ impl CliError for SaeError {
     }
 }
 
-/// Loads the verified Gemma model only when pending chunks need embedding.
 #[cfg(not(feature = "test-support"))]
 pub(crate) fn load_embedder() -> Result<Arc<dyn Embed>, SaeError> {
     let cached = model::cached_artifacts().map_err(|error| {
@@ -542,10 +443,7 @@ pub(crate) fn load_embedder() -> Result<Arc<dyn Embed>, SaeError> {
     Ok(Arc::new(MockEmbedder::default()))
 }
 
-/// Embeds all pending chunks for `db`, obtaining the embedder via `load`.
-/// Returns `None` when nothing is pending — `load` is never invoked then, so a
-/// model-less index still succeeds for FTS-only use. Production callers use
-/// [`embed_pending`]; tests inject a `load` double.
+// Avoid loading the model when no chunks are pending.
 fn embed_pending_with<L>(
     db: &Db,
     load: L,
@@ -556,8 +454,6 @@ where
     let pending = count_unembedded_chunks(db.conn())?;
     embed_with_spinners(
         pending,
-        // `embed_with_spinners` hands the loader a progress hook, but model
-        // loading reports no progress, so discard it here.
         |_| load(),
         |r: &commands::embed_batch::EmbedAllResult| format!("Embedded {} chunks", r.total_chunks),
         |embedder, update| {
@@ -566,8 +462,6 @@ where
                 |texts| {
                     embedder
                         .embed_documents_batch(texts)
-                        // Other (UNKNOWN): embedder's runtime error is an opaque
-                        // runtime error is not further classified here.
                         .map_err(|e| SaeError::Other(format!("Batch embedding failed: {e}")))
                 },
                 |n| update(&format!("Embedding... {n}/{pending} chunks")),
@@ -576,9 +470,6 @@ where
     )
 }
 
-/// Production entry point for [`embed_pending_with`]: binds [`load_embedder`],
-/// so loader failures are classified into recoverable (`EmbedderUnavailable`,
-/// 75) versus terminal conditions.
 fn embed_pending(db: &Db) -> Result<Option<commands::embed_batch::EmbedAllResult>, SaeError> {
     embed_pending_with(db, load_embedder)
 }
@@ -596,13 +487,11 @@ mod tests {
         assert_eq!(err.exit_code(), ExitCode::from(expected));
     }
 
-    // T-237: InputUsage variant maps to USAGE (sysexits 64)
     #[test]
     fn exit_code_input_usage_is_usage() {
         assert_code(&SaeError::InputUsage("bad".into()), codes::USAGE);
     }
 
-    // T-335: InputData variant maps to DATA_ERROR (sysexits 65) per ADR-0066 Group 2
     #[test]
     fn exit_code_input_data_is_data_error() {
         assert_code(
@@ -611,7 +500,6 @@ mod tests {
         );
     }
 
-    // T-238: Config variant maps to USAGE (sysexits 64)
     #[test]
     fn exit_code_config_is_usage() {
         assert_code(
@@ -620,13 +508,11 @@ mod tests {
         );
     }
 
-    // T-239: Client(TokenNotSet) maps to USAGE (sysexits 64)
     #[test]
     fn exit_code_token_not_set_is_usage() {
         assert_code(&SaeError::Client(ClientError::TokenNotSet), codes::USAGE);
     }
 
-    // T-240: Storage variant maps to CANT_CREAT (sysexits 73)
     #[test]
     fn exit_code_storage_is_cant_creat() {
         assert_code(
@@ -635,27 +521,22 @@ mod tests {
         );
     }
 
-    // T-241: Json variant maps to INTERNAL (sysexits 70)
     #[test]
     fn exit_code_json_is_internal() {
         let err: serde_json::Error = serde_json::from_str::<i32>("not json").unwrap_err();
         assert_code(&SaeError::Json(err), codes::INTERNAL);
     }
 
-    // T-242: Other variant maps to UNKNOWN (104) — anyhow-style catch-all is
-    // distinguished from classified INTERNAL (70) per ADR-0066 L136.
     #[test]
     fn exit_code_other_is_unknown() {
         assert_code(&SaeError::Other("unexpected".into()), codes::UNKNOWN);
     }
 
-    // T-243: Io variant maps to IO_ERR (sysexits 74)
     #[test]
     fn exit_code_io_is_io_err() {
         assert_code(&SaeError::Io(io::Error::other("disk full")), codes::IO_ERR);
     }
 
-    // T-244: Client(MaxRetries) maps to TEMP_FAIL (sysexits 75) for retry
     #[test]
     fn exit_code_client_max_retries_is_temp_fail() {
         assert_code(
@@ -664,8 +545,6 @@ mod tests {
         );
     }
 
-    // T-245: Client(Api) with non-404 status maps to INTERNAL (sysexits 70)
-    // — non-retryable HTTP error from the esa API (5xx, 4xx other than 404).
     #[test]
     fn exit_code_client_api_is_internal() {
         assert_code(
@@ -677,9 +556,6 @@ mod tests {
         );
     }
 
-    // T-346: Client(Api { status: 404 }) maps to DATA_ERROR (sysexits 65)
-    // — input-side failure (post number does not exist in the team), distinct
-    // from server-side 5xx per #136.
     #[test]
     fn exit_code_client_api_404_is_data_error() {
         assert_code(
@@ -691,9 +567,6 @@ mod tests {
         );
     }
 
-    // T-347: Client(InvalidRequest) maps to INTERNAL (sysexits 70) — pre-call
-    // request construction failure (URL parse, bad token header), a
-    // program-detectable bug, not user input.
     #[test]
     fn exit_code_client_invalid_request_is_internal() {
         assert_code(
@@ -702,7 +575,6 @@ mod tests {
         );
     }
 
-    // T-303: ModelDownload(DownloadFailed) maps to TEMP_FAIL (sysexits 75) — transient HTTP failure
     #[test]
     fn exit_code_model_download_failed_is_temp_fail() {
         assert_code(
@@ -713,7 +585,6 @@ mod tests {
         );
     }
 
-    // T-304: ModelDownload(BackendUnavailable) maps to INTERNAL (sysexits 70) — non-retryable hardware mismatch
     #[test]
     fn exit_code_model_download_backend_unavailable_is_internal() {
         assert_code(
@@ -722,7 +593,6 @@ mod tests {
         );
     }
 
-    // T-305: ModelDownload(ProbeFailed) maps to INTERNAL (sysexits 70) — verification failure, retry won't help
     #[test]
     fn exit_code_model_download_probe_failed_is_internal() {
         assert_code(
@@ -731,7 +601,6 @@ mod tests {
         );
     }
 
-    // T-246: Sync(Client(TokenNotSet)) maps to USAGE (sysexits 64)
     #[test]
     fn exit_code_sync_token_not_set_is_usage() {
         assert_code(
@@ -740,7 +609,6 @@ mod tests {
         );
     }
 
-    // T-247: Sync(Storage) maps to CANT_CREAT (sysexits 73)
     #[test]
     fn exit_code_sync_storage_is_cant_creat() {
         assert_code(
@@ -749,8 +617,6 @@ mod tests {
         );
     }
 
-    // T-248: Sync(Client(Api)) with non-404 status maps to INTERNAL (sysexits 70)
-    // — index/rebuild path mirrors the direct-call routing of T-245.
     #[test]
     fn exit_code_sync_client_api_is_internal() {
         assert_code(
@@ -762,9 +628,6 @@ mod tests {
         );
     }
 
-    // T-348: Sync(Client(Api { status: 404 })) maps to DATA_ERROR (sysexits 65)
-    // — index/rebuild path mirrors T-346 so the 404 routing is symmetric across
-    // direct API commands and bulk sync.
     #[test]
     fn exit_code_sync_client_api_404_is_data_error() {
         assert_code(
@@ -776,7 +639,6 @@ mod tests {
         );
     }
 
-    // T-249: Sync(Client(MaxRetries)) maps to TEMP_FAIL (sysexits 75) for retry
     #[test]
     fn exit_code_sync_client_max_retries_is_temp_fail() {
         assert_code(
@@ -785,10 +647,6 @@ mod tests {
         );
     }
 
-    // T-388: Sync(Storage(SQLITE_BUSY)) maps to TEMP_FAIL (75) via the new
-    // `is_retryable()` discriminator (#138 subtask 2). Without this arm, the
-    // CantCreat (73) default catches retryable contention during per-page
-    // harvest and AI agents do not auto-retry.
     #[test]
     fn exit_code_sync_storage_sqlite_busy_is_temp_fail() {
         use rusqlite::ErrorCode;
@@ -799,9 +657,6 @@ mod tests {
         );
     }
 
-    // T-389: Sync(Storage(Open)) still maps to CANT_CREAT (73) — the new
-    // retryability arm is order-sensitive and must not capture non-retryable
-    // storage failures (companion to T-388 / T-247).
     #[test]
     fn exit_code_sync_storage_open_is_cant_creat_after_retry_arm() {
         assert_code(
@@ -810,10 +665,6 @@ mod tests {
         );
     }
 
-    // T-390: Storage(SQLITE_BUSY) (no Sync wrapping) also maps to TEMP_FAIL.
-    // Covers `Db::open` contention during `sae index`/`rebuild` startup
-    // where the error surfaces as `SaeError::Storage` directly, before
-    // `sync::harvest` wraps it (Codex P2 finding on #138 subtask 2).
     #[test]
     fn exit_code_storage_sqlite_busy_is_temp_fail() {
         use rusqlite::ErrorCode;
@@ -821,7 +672,6 @@ mod tests {
         assert_code(&SaeError::Storage(StorageError::Db(busy)), codes::TEMP_FAIL);
     }
 
-    // T-310: input_no_data_for_team_pins_next_step_index_hint
     #[test]
     fn input_no_data_for_team_pins_next_step_index_hint() {
         let err = SaeError::input_no_data_for_team("gaji");
@@ -832,7 +682,6 @@ mod tests {
         );
     }
 
-    // T-312: next_step_config_no_team_specified
     #[test]
     fn next_step_config_no_team_specified() {
         let err = SaeError::Config(ConfigError::NoTeamSpecified);
@@ -842,7 +691,6 @@ mod tests {
         );
     }
 
-    // T-313: next_step_client_token_not_set
     #[test]
     fn next_step_client_token_not_set() {
         let err = SaeError::Client(ClientError::TokenNotSet);
@@ -852,7 +700,6 @@ mod tests {
         );
     }
 
-    // T-314: next_step_sync_client_token_not_set
     #[test]
     fn next_step_sync_client_token_not_set() {
         let err = SaeError::Sync(SyncError::Client(ClientError::TokenNotSet));
@@ -862,7 +709,6 @@ mod tests {
         );
     }
 
-    // T-315: next_step_sync_client_max_retries
     #[test]
     fn next_step_sync_client_max_retries() {
         let err = SaeError::Sync(SyncError::Client(ClientError::MaxRetries(5)));
@@ -872,10 +718,6 @@ mod tests {
         );
     }
 
-    // T-325: next_step_client_max_retries_matches_sync_variant
-    // Direct API commands (get/create/update/archive/ship) surface MaxRetries
-    // as Self::Client; the index/rebuild path wraps it under Sync. Both must
-    // give the same hint.
     #[test]
     fn next_step_client_max_retries_matches_sync_variant() {
         let err = SaeError::Client(ClientError::MaxRetries(5));
@@ -885,7 +727,6 @@ mod tests {
         );
     }
 
-    // T-316: next_step_model_download_failed
     #[test]
     fn next_step_model_download_failed() {
         let err = SaeError::ModelDownload(ModelDownloadError::DownloadFailed("HTTP 503".into()));
@@ -895,9 +736,6 @@ mod tests {
         );
     }
 
-    // T-317: next_step_input_data_returns_none
-    // InputData carries malformed user input (date parse, etc.) — no
-    // structured hint is appropriate because the fix is "correct the value".
     #[test]
     fn next_step_input_data_returns_none() {
         let err = SaeError::InputData(
@@ -906,19 +744,12 @@ mod tests {
         assert_eq!(err.next_step(), None);
     }
 
-    // T-336: next_step_input_usage_without_recognized_prefix_returns_none
-    // InputUsage messages with a recognized prefix get a hint; arbitrary
-    // strings (e.g. clap-side messages) fall through to None.
     #[test]
     fn next_step_input_usage_without_recognized_prefix_returns_none() {
         let err = SaeError::InputUsage("Missing search query.".into());
         assert_eq!(err.next_step(), None);
     }
 
-    // T-337: to_error_envelope(InputData) composes the ADR-0060 wire payload.
-    // Pins the integration of error_code / next_step / retryable / candidates
-    // for the new variant — each method has its own test (T-335, T-317,
-    // T-323, T-324) but only their composition is the agent-facing contract.
     #[test]
     fn to_error_envelope_input_data_composes_data_error_payload() {
         let err = SaeError::InputData("Invalid date '--after 2025-xx-xx'".into());
@@ -930,42 +761,36 @@ mod tests {
         assert_eq!(env.error.message, "Invalid date '--after 2025-xx-xx'");
     }
 
-    // T-318: next_step_other_returns_none
     #[test]
     fn next_step_other_returns_none() {
         let err = SaeError::Other("internal".into());
         assert_eq!(err.next_step(), None);
     }
 
-    // T-319: next_step_storage_returns_none
     #[test]
     fn next_step_storage_returns_none() {
         let err = SaeError::Storage(StorageError::Open("missing".into()));
         assert_eq!(err.next_step(), None);
     }
 
-    // T-320: retryable_true_for_model_download_failed
     #[test]
     fn retryable_true_for_model_download_failed() {
         let err = SaeError::ModelDownload(ModelDownloadError::DownloadFailed("HTTP 503".into()));
         assert!(err.retryable(), "DownloadFailed must be retryable");
     }
 
-    // T-321: retryable_true_for_sync_max_retries
     #[test]
     fn retryable_true_for_sync_max_retries() {
         let err = SaeError::Sync(SyncError::Client(ClientError::MaxRetries(5)));
         assert!(err.retryable(), "MaxRetries must be retryable");
     }
 
-    // T-322: retryable_false_for_storage
     #[test]
     fn retryable_false_for_storage() {
         let err = SaeError::Storage(StorageError::Open("missing".into()));
         assert!(!err.retryable(), "Storage must not be retryable");
     }
 
-    // T-323: retryable_false_for_input
     #[test]
     fn retryable_false_for_input() {
         for err in [
@@ -976,13 +801,6 @@ mod tests {
         }
     }
 
-    // EmbedderUnavailable contract (T-404..T-406): the embedding model is not
-    // installed when `sae index` / `sae rebuild` needs to embed pending chunks.
-    // Mirrors yomu's `EmbedderUnavailable` — a recoverable (retryable) signal,
-    // distinct from the non-retryable `InputUsage` missing-model path, because
-    // `sae model download` clears it.
-
-    // T-404: EmbedderUnavailable maps to TEMP_FAIL (75)
     #[test]
     fn exit_code_embedder_unavailable_is_temp_fail() {
         assert_code(
@@ -991,7 +809,6 @@ mod tests {
         );
     }
 
-    // T-405: EmbedderUnavailable is retryable (recoverable via model download)
     #[test]
     fn retryable_true_for_embedder_unavailable() {
         assert!(
@@ -1000,7 +817,6 @@ mod tests {
         );
     }
 
-    // T-406: next_step for EmbedderUnavailable recommends model download
     #[test]
     fn next_step_embedder_unavailable_recommends_model_download() {
         let err = SaeError::EmbedderUnavailable("x".into());
@@ -1010,9 +826,6 @@ mod tests {
         );
     }
 
-    // T-409: embed_pending skips the model load when no chunks are pending, so
-    // a model-less `index` / `rebuild` still succeeds (FTS-only). Pins the
-    // breaking-change-risk path weighed in Q1.
     #[test]
     fn embed_pending_with_no_pending_skips_loader() {
         let db = Db::open_memory().unwrap();
@@ -1031,9 +844,6 @@ mod tests {
         );
     }
 
-    // T-410: embed_pending propagates a loader failure when chunks are pending —
-    // pins Q1: model unavailable + pending chunks → `index` / `rebuild` fail
-    // with the typed error rather than leaving a chunk-only index.
     #[test]
     fn embed_pending_with_pending_propagates_loader_failure() {
         let db = Db::open_memory().unwrap();
@@ -1053,11 +863,6 @@ mod tests {
         );
     }
 
-    // T-414: embed_pending embeds every pending chunk through the test-support
-    // loader (MockEmbedder) — pins the happy path index/rebuild depend on,
-    // covering the embed_pending_with run arm and the production embed_pending
-    // binding without a real model. Compiled only under --features test-support
-    // (the coverage build), matching yomu's stub-embedder integration tests.
     #[cfg(feature = "test-support")]
     #[test]
     fn embed_pending_embeds_all_pending_chunks() {
@@ -1080,9 +885,6 @@ mod tests {
         );
     }
 
-    // T-324: candidates(None) returns empty for every variant — without a
-    // Config there is no team list to derive suggestions from. Pins the
-    // pre-Config-load failure path (main.rs:372).
     #[test]
     fn candidates_returns_empty_without_config() {
         for err in [
@@ -1108,9 +910,6 @@ mod tests {
         }
     }
 
-    // T-394: NoTeamSpecified with a populated Config returns the team list
-    // verbatim (config-order, no sorting) so agents can pick a recovery team
-    // without a follow-up `sae status` roundtrip (#139).
     #[test]
     fn candidates_returns_teams_for_no_team_specified() {
         let cfg = config_with_teams(&["gaji", "gaji-platform"]);
@@ -1118,9 +917,6 @@ mod tests {
         assert_eq!(err.candidates(Some(&cfg)), vec!["gaji", "gaji-platform"]);
     }
 
-    // T-395: UnknownTeam(_) also surfaces the full team list. The
-    // mistaken-team name is already in the message; the candidates field
-    // gives agents the recovery set without fuzzy filtering (out of scope).
     #[test]
     fn candidates_returns_teams_for_unknown_team() {
         let cfg = config_with_teams(&["alpha", "beta"]);
@@ -1128,9 +924,6 @@ mod tests {
         assert_eq!(err.candidates(Some(&cfg)), vec!["alpha", "beta"]);
     }
 
-    // T-396: every other variant ignores the Config and returns empty even
-    // when one is supplied. Prevents accidental team-list leakage on
-    // unrelated failures.
     #[test]
     fn candidates_ignores_config_for_unrelated_variants() {
         let cfg = config_with_teams(&["x", "y"]);
@@ -1147,7 +940,6 @@ mod tests {
         }
     }
 
-    // Gemma validation and isolated native loading failures remain terminal.
     #[test]
     fn model_load_failure_preserves_internal_exit_and_error_envelope() {
         let err = SaeError::ModelLoadFailed("checksum mismatch".into());
@@ -1163,17 +955,11 @@ mod tests {
         assert!(envelope.error.candidates.is_empty());
     }
 
-    // T-338: BackendUnavailable variant maps to INTERNAL (70) — mirrors
-    // ModelDownload(BackendUnavailable) (T-304) so embed and model download
-    // share the same hardware-mismatch exit code (#127 CHX-001).
     #[test]
     fn exit_code_backend_unavailable_is_internal() {
         assert_code(&SaeError::BackendUnavailable, codes::INTERNAL);
     }
 
-    // T-339: Internal variant maps to INTERNAL (70) — distinguishes
-    // programmer-detectable invariant violations from anyhow-swallow
-    // Other (UNKNOWN, 104) per ADR-0066 L136 (#127 CHX-001).
     #[test]
     fn exit_code_internal_variant_is_internal() {
         assert_code(
@@ -1182,8 +968,6 @@ mod tests {
         );
     }
 
-    // T-340: BackendUnavailable's next_step points to install / --no-embed.
-    // Constructor and lookup must stay in sync (matches T-310 / T-311 pattern).
     #[test]
     fn next_step_backend_unavailable_returns_install_or_no_embed_hint() {
         assert_eq!(
@@ -1192,17 +976,12 @@ mod tests {
         );
     }
 
-    // T-344: ModelDownload(BackendUnavailable)'s next_step shares the same hint
-    // as the embed-path variant (#127 OPS-007). Constructor and lookup must
-    // stay in sync via the shared `BACKEND_UNAVAILABLE_HINT` const.
     #[test]
     fn next_step_model_download_backend_unavailable_returns_shared_hint() {
         let err = SaeError::ModelDownload(ModelDownloadError::BackendUnavailable);
         assert_eq!(err.next_step(), Some(BACKEND_UNAVAILABLE_HINT));
     }
 
-    // T-341: Internal variant returns no structured hint — the message body
-    // already carries the invariant details; no canned next step applies.
     #[test]
     fn next_step_internal_variant_returns_none() {
         assert_eq!(
@@ -1211,9 +990,6 @@ mod tests {
         );
     }
 
-    // T-342: to_error_envelope(BackendUnavailable) composes the ADR-0060 wire
-    // payload — code=INTERNAL, next_step set, retryable=false. Pins the
-    // composition (T-337 pattern) for the new variant.
     #[test]
     fn to_error_envelope_backend_unavailable_composes_internal_payload() {
         let env = SaeError::BackendUnavailable.to_error_envelope(None);
@@ -1227,8 +1003,6 @@ mod tests {
         assert_eq!(env.error.message, "Gemma native backend is unavailable");
     }
 
-    // T-343: to_error_envelope(Internal) composes code=INTERNAL with no hint.
-    // Mirrors T-342 so both new variants have their composition pinned.
     #[test]
     fn to_error_envelope_internal_variant_composes_internal_payload() {
         let err = SaeError::Internal("Embedding count mismatch: expected 5, got 4".into());
@@ -1243,10 +1017,6 @@ mod tests {
         );
     }
 
-    // T-349: next_step for Client(Api { status: 404 }) returns the post-not-found
-    // hint so AI agents recover from missing post numbers (#136). Mirrors T-340
-    // (BackendUnavailable) — the hint surface and the routing surface must
-    // agree at the source.
     #[test]
     fn next_step_client_api_404_returns_post_not_found_hint() {
         let err = SaeError::Client(ClientError::Api {
@@ -1256,8 +1026,6 @@ mod tests {
         assert_eq!(err.next_step(), Some(POST_NOT_FOUND_HINT));
     }
 
-    // T-350: next_step for Sync(Client(Api { status: 404 })) returns the same hint
-    // as T-349 so direct API and bulk sync paths share guidance.
     #[test]
     fn next_step_sync_client_api_404_returns_post_not_found_hint() {
         let err = SaeError::Sync(SyncError::Client(ClientError::Api {
@@ -1267,9 +1035,6 @@ mod tests {
         assert_eq!(err.next_step(), Some(POST_NOT_FOUND_HINT));
     }
 
-    // T-351: next_step for Client(Api { status: 500 }) returns None — only 404
-    // carries a recovery hint, 5xx is server-side and not actionable on the
-    // agent side.
     #[test]
     fn next_step_client_api_non_404_returns_none() {
         let err = SaeError::Client(ClientError::Api {
@@ -1279,10 +1044,6 @@ mod tests {
         assert_eq!(err.next_step(), None);
     }
 
-    // T-352: to_error_envelope(Client(Api { status: 404 })) composes the
-    // ADR-0060 wire payload with code=DATA_ERROR, retryable=false, and the
-    // post-not-found next_step. Mirrors T-342 so the composition surface is
-    // pinned alongside the individual method tests.
     #[test]
     fn to_error_envelope_client_api_404_composes_data_error_payload() {
         let err = SaeError::Client(ClientError::Api {

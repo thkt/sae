@@ -58,7 +58,6 @@ pub struct TeamStatus {
     pub pending_embed: u32,
     pub sync_state: Option<SyncState>,
     pub error: Option<String>,
-    /// DB path for human-readable output (not included in JSON)
     #[serde(skip)]
     pub db_path: Option<String>,
 }
@@ -118,13 +117,7 @@ pub enum StorageError {
 }
 
 impl StorageError {
-    /// True for transient conditions where retrying might recover: SQLite
-    /// `SQLITE_BUSY` / `SQLITE_LOCKED` under WAL contention, and
-    /// `io::ErrorKind::{WouldBlock, Interrupted, TimedOut}`.
-    ///
-    /// Consulted from [`crate::tools::SaeError::error_code`] so AI agents
-    /// auto-retry instead of bailing on the `CantCreat (73)` default
-    /// (#138 subtask 2).
+    /// Only SQLite contention and transient I/O errors are retryable.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::IndexMismatch(_) => false,
@@ -153,8 +146,6 @@ fn is_retryable_io_error(e: &io::Error) -> bool {
     )
 }
 
-/// Test helper: build a typed `rusqlite::Error::SqliteFailure` so callers do
-/// not repeat the same 4-line struct literal in every test module.
 #[cfg(test)]
 pub(crate) fn sqlite_failure(code: rusqlite::ErrorCode, extended_code: i32) -> rusqlite::Error {
     use rusqlite::{Error, ffi};
@@ -171,7 +162,6 @@ pub(crate) fn sqlite_failure(code: rusqlite::ErrorCode, extended_code: i32) -> r
 mod tests {
     use super::*;
 
-    // T-045: status --json → TeamStatus array with team, status, posts fields
     #[test]
     fn team_status_serializes_to_json_with_expected_fields() {
         let status = TeamStatus {
@@ -200,7 +190,6 @@ mod tests {
         );
     }
 
-    // T-130: TeamStatus array serialization
     #[test]
     fn team_status_array_serializes_to_json_array() {
         let statuses = vec![
@@ -231,7 +220,6 @@ mod tests {
         assert_eq!(v[1]["status"], "not_synced");
     }
 
-    // T-112: SyncStatus::Error serializes to "error" with error message
     #[test]
     fn team_status_error_serializes_correctly() {
         let status = TeamStatus {
@@ -249,7 +237,6 @@ mod tests {
         assert_eq!(v["error"], "config missing");
     }
 
-    // T-131: SyncState serializes (required by TeamStatus.sync_state)
     #[test]
     fn sync_state_serializes_to_json() {
         let state = SyncState {

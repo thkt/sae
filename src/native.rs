@@ -304,7 +304,6 @@ mod tests {
         assert!(capacity_for(usize::MAX).is_err());
     }
 
-    /// Adapted from Recall's public model contract; uses only local pinned artifacts.
     #[test]
     #[ignore = "requires pinned model/tokenizer in SAE_MODEL_DIR; no inference or downloads"]
     fn real_document_windows_preserve_utf8_coverage_overlap_and_token_boundaries() {

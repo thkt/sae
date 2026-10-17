@@ -310,7 +310,7 @@ pub enum ModelDownloadError {
     BackendUnavailable,
 }
 
-/// Publish only complete, hash-verified bytes; interrupted attempts never replace a cache entry.
+// Never replace a cache entry with incomplete or unverified bytes.
 fn install_artifact(root: &Path, name: &str, expected: &str, reader: &mut impl Read) -> Result<()> {
     let mut temporary = tempfile::Builder::new()
         .prefix(&format!(".{name}."))
@@ -328,8 +328,7 @@ fn install_artifact(root: &Path, name: &str, expected: &str, reader: &mut impl R
         .map_err(|error| error.error)?;
     Ok(())
 }
-/// Fetch and verify model bytes independently of hardware availability.
-/// This supports provisioning and CI before loading an inference backend.
+/// Downloads verified artifacts without loading the inference backend.
 pub fn download_model_artifacts() -> Result<(), ModelDownloadError> {
     selected()
         .validate()
@@ -632,8 +631,7 @@ mod tests {
                         Err(error) => panic!("accept: {error}"),
                     }
                 };
-                // Accepted sockets can inherit the listener's nonblocking mode
-                // on macOS. Read request lines with the bounded blocking timeout.
+                // macOS can inherit the listener's nonblocking mode; request reads need a blocking timeout.
                 stream.set_nonblocking(false).unwrap();
                 stream
                     .set_read_timeout(Some(Duration::from_secs(5)))
@@ -693,8 +691,7 @@ mod tests {
             fs::read(cache.join("tokenizer.json")).unwrap(),
             b"verified tokenizer"
         );
-        // The next request expected by the server is a repaired model: a cache hit
-        // must not fetch either artifact, and repairing one must retain the other.
+        // The server accepts only a model repair next, so cache hits must not fetch either artifact.
         super::download_artifacts_at(&cache, &spec).unwrap();
         fs::write(cache.join("model.gguf"), b"corrupt cache").unwrap();
         super::download_artifacts_at(&cache, &spec).unwrap();

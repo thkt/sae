@@ -28,7 +28,7 @@ pub struct ChunkedEmbedding {
     pub chunks: Vec<Vec<f32>>,
 }
 impl ChunkedEmbedding {
-    /// Constructs a nonempty embedding for compatibility with persisted chunk callers.
+    /// Panics on empty chunks; use `try_new` for fallible construction.
     pub fn new(chunks: Vec<Vec<f32>>) -> Self {
         Self::try_new(chunks).expect("chunked embedding must contain nonempty vectors")
     }
@@ -64,7 +64,6 @@ pub trait Embed: Send + Sync {
     }
 }
 
-/// Deterministic one-hot embeddings for integration tests without model loading.
 #[cfg(any(test, feature = "test-support"))]
 pub struct MockEmbedder {
     dims: usize,

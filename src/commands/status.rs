@@ -69,7 +69,6 @@ mod tests {
         }
     }
 
-    // T-075: query_team_status with sync state present → TeamStatus::Synced
     #[test]
     fn query_team_status_returns_synced_when_state_present() {
         let dir = tempfile::tempdir().unwrap();
@@ -95,7 +94,6 @@ mod tests {
         assert!(ts.sync_state.is_some());
     }
 
-    // T-076: query_team_status with no sync state → TeamStatus::NotSynced
     #[test]
     fn query_team_status_returns_not_synced_when_no_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -107,7 +105,6 @@ mod tests {
         assert!(ts.sync_state.is_none());
     }
 
-    // T-073: posts exist but sync_state absent → NotSynced (bug: was reporting Synced)
     #[test]
     fn query_team_status_returns_not_synced_when_posts_exist_but_no_sync_state() {
         let dir = tempfile::tempdir().unwrap();
@@ -115,7 +112,6 @@ mod tests {
         {
             let db = storage::Db::open(&path).unwrap();
             storage::upsert_post(db.conn(), &make_post_row()).unwrap();
-            // sync_state intentionally NOT saved
         }
         let ts = query_team_status("myteam", &path).unwrap();
         assert_eq!(ts.team, "myteam");
@@ -123,7 +119,6 @@ mod tests {
         assert!(ts.sync_state.is_none());
     }
 
-    // T-126: unembedded chunks after interrupted embed → pending_embed > 0
     #[test]
     fn query_team_status_reports_pending_embed_when_chunks_unembedded() {
         let dir = tempfile::tempdir().unwrap();
@@ -144,14 +139,12 @@ mod tests {
                 },
             )
             .unwrap();
-            // embed intentionally NOT run → chunks remain unembedded
         }
         let ts = query_team_status("myteam", &path).unwrap();
         assert_eq!(ts.status, storage::SyncStatus::Synced);
         assert!(ts.pending_embed > 0, "should report unembedded chunks");
     }
 
-    // T-127: no unembedded chunks → pending_embed == 0
     #[test]
     fn query_team_status_reports_zero_pending_embed_when_no_chunks() {
         let dir = tempfile::tempdir().unwrap();

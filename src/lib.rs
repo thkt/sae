@@ -23,11 +23,6 @@ use clap::error::ErrorKind;
 pub use envelope::CommandOutput;
 pub use tools::{Sae, SaeError};
 
-/// Hidden test seam: builds a [`CommandOutput`] by running `output::search`
-/// with a synthetic search result and a non-empty `search_warnings` slice so
-/// `tests/cli_integration.rs` can pin the `--json` envelope wiring for #140
-/// without seeding a SQLite DB or loading a native model. The production
-/// binary built with `cargo install` never exposes this symbol.
 #[cfg(feature = "test-support")]
 pub fn __test_search_with_warnings() -> Result<CommandOutput, SaeError> {
     let warnings = vec![
@@ -45,8 +40,6 @@ pub fn __test_search_with_warnings() -> Result<CommandOutput, SaeError> {
     output::search(&[result], "test query", true, false, &warnings)
 }
 
-/// Renders [`CommandOutput`] for stdout. With `json_mode` set, emits the
-/// `SuccessEnvelope`; otherwise the default-mode markdown.
 pub fn render_success(out: &CommandOutput, json_mode: bool) -> String {
     if json_mode {
         envelope::render_json_success(out)
@@ -55,10 +48,7 @@ pub fn render_success(out: &CommandOutput, json_mode: bool) -> String {
     }
 }
 
-/// Renders a `SaeError` for stderr. JSON mode wraps it via `to_error_envelope`.
-///
-/// `config` feeds [`SaeError::candidates`] for the team-list cases (#139).
-/// Pass `None` when the failure occurred before `Config::load()` completed.
+/// Pass no config when loading it failed.
 pub fn render_error(err: &SaeError, json_mode: bool, config: Option<&config::Config>) -> String {
     if json_mode {
         envelope::render_json_error(&err.to_error_envelope(config))
@@ -67,19 +57,7 @@ pub fn render_error(err: &SaeError, json_mode: bool, config: Option<&config::Con
     }
 }
 
-/// Renders a clap parse error. JSON mode emits a synthetic `UsageError` envelope
-/// so agents see the same shape they get for runtime failures.
-///
-/// Only the first non-empty line of the clap message lands in the envelope; the
-/// usage block and subcommand list that follow are noisy for machine consumers.
-///
-/// Caller supplies `subcommands`: the user-facing subcommand list. Must not
-/// include hidden/test seams or deprecated entries — those would mislead an
-/// agent's retry. The list feeds the `candidates` array when, and only
-/// when, the failure is `ErrorKind::InvalidSubcommand`. Other clap error
-/// kinds (`MissingRequiredArgument`, `UnknownArgument`, etc.) keep
-/// `candidates: []` so agents do not see irrelevant subcommand lists in
-/// missing-arg failures (#148).
+/// Suggestions must exclude hidden and retired commands.
 pub fn render_parse_error(e: &clap::Error, json_mode: bool, subcommands: &[&str]) -> String {
     if json_mode {
         let raw = e.to_string();
@@ -118,8 +96,6 @@ mod tests {
         serde_json::from_str(out).expect("envelope must be JSON")
     }
 
-    // T-397: InvalidSubcommand → candidates lists every supplied subcommand
-    // verbatim. Closes #148: typo recovery surfaces in `--json` envelope.
     #[test]
     fn render_parse_error_invalid_subcommand_emits_candidates() {
         let cmd = Command::new("sae")
@@ -137,10 +113,7 @@ mod tests {
         assert_eq!(env["error"]["code"], "USAGE_ERROR");
     }
 
-    /// Envelope's `candidates: Vec<String>` carries `skip_serializing_if =
-    /// "Vec::is_empty"`, so an empty list appears as a missing field rather
-    /// than `[]`. Agents read both as "no candidates" — this helper accepts
-    /// either shape.
+    // Serde may omit empty candidates, so accept either absent or empty.
     fn assert_candidates_absent(env: &serde_json::Value) {
         let c = &env["error"]["candidates"];
         assert!(
@@ -149,10 +122,6 @@ mod tests {
         );
     }
 
-    // T-398: MissingRequiredArgument keeps candidates absent so agents do
-    // not see an irrelevant subcommand list when the failure is a missing
-    // positional. Regression guard against future "any usage error →
-    // suggest subcommands" simplifications.
     #[test]
     fn render_parse_error_missing_required_arg_keeps_candidates_empty() {
         let cmd = Command::new("sae")
@@ -169,8 +138,6 @@ mod tests {
         assert_candidates_absent(&env);
     }
 
-    // T-399: UnknownArgument also keeps candidates absent. Pairs with T-398
-    // to pin the `==` predicate against `match _ => non-empty` drift.
     #[test]
     fn render_parse_error_unknown_argument_keeps_candidates_empty() {
         let cmd = Command::new("sae").subcommand(Command::new("status"));

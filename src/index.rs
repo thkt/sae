@@ -1016,8 +1016,7 @@ mod tests {
                     .execute("UPDATE embedded_chunk_ids SET vec_rowid=999999", [])
                     .unwrap();
             } else {
-                // A damaged checkpoint may contain an ordinary table in place of vec0;
-                // readers still must validate its bytes before publishing the pointer.
+                // A damaged checkpoint can replace vec0 with a plain table; validate bytes before publication.
                 let mut vector = vec![0.0_f32; 768];
                 vector[0] = match corruption {
                     "nonfinite" => f32::NAN,

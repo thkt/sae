@@ -26,10 +26,7 @@ pub fn add_chunked_embeddings(
     insert_embeddings(conn, &new)
 }
 
-/// Inserts embeddings without checking for duplicates.
-///
-/// Only safe when the caller guarantees none of the `chunk_ids` are already embedded
-/// (e.g., immediately after [`get_unembedded_chunks`]).
+/// Caller must ensure the chunk IDs are not already embedded.
 pub(crate) fn insert_new_embeddings(
     conn: &Connection,
     embeddings: &[(i64, ChunkedEmbedding)],
@@ -155,7 +152,6 @@ mod tests {
         ChunkedEmbedding::new(vals.iter().map(|&v| vec![v; EMBEDDING_DIMS]).collect())
     }
 
-    // T-300: existing_embedded_ids does not error on empty input (regression for IN () syntax)
     #[test]
     fn existing_embedded_ids_empty_input_returns_empty_set() {
         let db = Db::open_memory().unwrap();
@@ -166,7 +162,6 @@ mod tests {
         );
     }
 
-    // T-173: add_chunked_embeddings stores embedding and clears unembedded queue
     #[test]
     fn add_and_query_embeddings() {
         let db = Db::open_memory().unwrap();
@@ -187,7 +182,6 @@ mod tests {
         assert!(has_embeddings(db.conn()));
     }
 
-    // T-174: add_chunked_embeddings skips chunks that are already embedded
     #[test]
     fn skip_already_embedded() {
         let db = Db::open_memory().unwrap();
@@ -204,7 +198,6 @@ mod tests {
         assert_eq!(added, 0);
     }
 
-    // T-175: add_chunked_embeddings stores multiple sub-embeddings per chunk
     #[test]
     fn multi_chunk_stores_all_sub_embeddings() {
         let db = Db::open_memory().unwrap();
@@ -224,14 +217,12 @@ mod tests {
         assert!(has_embeddings(db.conn()));
     }
 
-    // T-176: count_unembedded_chunks returns zero on a fresh empty database
     #[test]
     fn count_unembedded_returns_zero_on_empty_db() {
         let db = Db::open_memory().unwrap();
         assert_eq!(count_unembedded_chunks(db.conn()).unwrap(), 0);
     }
 
-    // T-177: count_unembedded_chunks decrements after embedding is added
     #[test]
     fn count_unembedded_returns_correct_count_before_and_after_embed() {
         let db = Db::open_memory().unwrap();

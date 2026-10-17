@@ -1,4 +1,3 @@
-// Pure helper retained from the previous dependency to preserve behavior.
 pub(crate) fn split_text(text: &str, max_bytes: usize) -> Vec<&str> {
     if max_bytes < 4 || text.len() <= max_bytes {
         return vec![text];

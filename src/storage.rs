@@ -1,9 +1,4 @@
-//! Storage layer for sae.
-//!
-//! Assumes single-process operation. WAL journaling + `busy_timeout=5000ms`
-//! handle ad-hoc contention from CLI re-invocations, but daemonized or
-//! concurrent CLI runs against the same DB file are unsupported (no advisory
-//! lock); moving to multi-process requires schema and lock redesign.
+//! Normal index writers are single-process; WAL/busy_timeout only absorb brief contention.
 
 pub(crate) mod embed;
 mod identity;
@@ -31,10 +26,6 @@ pub(crate) use crate::compat::{anon_placeholders, as_sql_params, in_placeholders
 
 use crate::compat::collect_rows;
 
-/// `collect_rows` wrapper that fixes `E = StorageError`, removing the
-/// `::<_, _, _, StorageError>` turbofish that the bare helper would otherwise
-/// require at every `?`-binding callsite (both `rusqlite::Error` and
-/// `StorageError` satisfy `From<rusqlite::Error>`, leaving `E` ambiguous).
 pub(crate) fn collect_storage_rows<I, T, C>(rows: I) -> Result<C, StorageError>
 where
     I: Iterator<Item = Result<T, rusqlite::Error>>,
@@ -43,15 +34,12 @@ where
     collect_rows(rows)
 }
 
-/// Shared `normalize_for_fts` configuration for index- and query-side calls.
-/// Divergence between sides makes FTS5 token streams disagree and silently
-/// misses matches, so callers must funnel through this single helper.
+// Index and query must share normalization or their FTS tokens diverge.
 pub(crate) fn query_norm_config() -> QueryNormalizationConfig {
     QueryNormalizationConfig::default()
 }
 
-/// Zero-copy `&[f32] → &[u8]` for binding embedding vectors to sqlite-vec.
-/// Persisted f32 bytes use the little-endian layout supported by sqlite-vec.
+// sqlite-vec stores these f32 bytes in little-endian order.
 pub(crate) fn f32_as_bytes(v: &[f32]) -> &[u8] {
     bytemuck::cast_slice(v)
 }
@@ -145,9 +133,6 @@ impl Db {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
-                // Best-effort: continue on chmod failure (restricted FS, exotic
-                // mount options) since DB functionality must not be blocked;
-                // the warn surfaces the failure so an operator can notice.
                 if let Err(e) = fs::set_permissions(parent, fs::Permissions::from_mode(0o700)) {
                     warn!(path = %parent.display(), error = %e, "failed to restrict data directory permissions");
                 }
@@ -433,7 +418,6 @@ mod tests {
     use crate::embedding::{ChunkedEmbedding, EMBEDDING_DIMS};
     use rusqlite::ffi::{self, ErrorCode};
 
-    // T-202: Db::open_memory creates the core tables via init_schema
     #[test]
     fn open_creates_core_tables() {
         let db = Db::open_memory().unwrap();
@@ -449,7 +433,6 @@ mod tests {
         assert_eq!(tbl_count, 3, "core tables must exist after init_schema");
     }
 
-    // T-203: upsert_post inserts a post and count_posts reflects the change
     #[test]
     fn upsert_and_count() {
         let db = Db::open_memory().unwrap();
@@ -465,7 +448,6 @@ mod tests {
         assert_eq!(name, post.name);
     }
 
-    // T-204: upsert_post overwrites an existing post with the same number
     #[test]
     fn upsert_replaces_on_conflict() {
         let db = Db::open_memory().unwrap();
@@ -486,18 +468,15 @@ mod tests {
         assert_eq!(name, "Updated");
     }
 
-    // T-205: get_sync_state returns None on a fresh database
     #[test]
     fn sync_state_none_initially() {
         let db = Db::open_memory().unwrap();
         assert!(get_sync_state(db.conn()).unwrap().is_none());
     }
 
-    // T-206: save_sync_state and get_sync_state round-trip all fields correctly
     #[test]
     fn sync_state_roundtrip() {
         let db = Db::open_memory().unwrap();
-        // Deterministic timestamp for test assertions
         save_sync_state_at(
             db.conn(),
             &SyncStateUpdate {
@@ -521,7 +500,6 @@ mod tests {
         assert_eq!(state.updated_at, "2025-01-01 00:00:00");
     }
 
-    // T-207: save_sync_state with last_page=None clears a previous checkpoint
     #[test]
     fn sync_state_clears_checkpoint() {
         let db = Db::open_memory().unwrap();
@@ -559,7 +537,6 @@ mod tests {
         );
     }
 
-    // T-208: Db::open creates a database file on disk at the specified path
     #[test]
     fn open_file_db() {
         let dir = tempfile::tempdir().unwrap();
@@ -573,7 +550,6 @@ mod tests {
         assert_eq!(count_posts(db.conn()).unwrap(), 1);
     }
 
-    // T-209: upsert_post inside a transaction batches inserts correctly
     #[test]
     fn transaction_upsert_batch() {
         let db = Db::open_memory().unwrap();
@@ -592,7 +568,6 @@ mod tests {
         assert_eq!(name, test_post_row(10).name);
     }
 
-    // T-210: rechunk_post creates chunk rows and FTS entries for each section
     #[test]
     fn rechunk_creates_chunks_and_fts() {
         let db = Db::open_memory().unwrap();
@@ -615,7 +590,6 @@ mod tests {
         assert_eq!(hits, 1);
     }
 
-    // T-211: rechunk_post replaces old chunks and removes stale FTS entries
     #[test]
     fn rechunk_replaces_old_chunks() {
         let db = Db::open_memory().unwrap();
@@ -638,7 +612,6 @@ mod tests {
         assert_eq!(hits, 0);
     }
 
-    // T-212: rechunk_post removes orphaned vector embeddings from previous chunks
     #[test]
     fn rechunk_cleans_orphaned_vec_chunks() {
         let db = Db::open_memory().unwrap();
@@ -665,7 +638,6 @@ mod tests {
         assert_eq!(orphans, 0, "rechunk should clean orphaned embeddings");
     }
 
-    // T-213: FTS trigram index matches a 3-character Japanese substring
     #[test]
     fn fts_trigram_japanese() {
         let db = Db::open_memory().unwrap();
@@ -684,7 +656,6 @@ mod tests {
         assert_eq!(hits, 1);
     }
 
-    // T-094: rechunk 後 fts_chunks 件数 = chunks 件数 (FR-002)
     #[test]
     fn rechunk_fts_count_matches_chunks_count() {
         let db = Db::open_memory().unwrap();
@@ -712,7 +683,6 @@ mod tests {
         );
     }
 
-    // T-214: enrich_body prepends name, author, category, and tags to body
     #[test]
     fn enrich_body_includes_all_metadata() {
         let mut row = test_post_row(1);
@@ -728,7 +698,6 @@ mod tests {
         );
     }
 
-    // T-215: enrich_body omits category and tags line when both are absent
     #[test]
     fn enrich_body_no_category_no_tags() {
         let mut row = test_post_row(1);
@@ -739,7 +708,6 @@ mod tests {
         assert_eq!(enriched, "Untitled\nalice\n\ntext");
     }
 
-    // T-216: enrich_body includes category but no tags when tags are empty
     #[test]
     fn enrich_body_category_only() {
         let mut row = test_post_row(1);
@@ -749,7 +717,6 @@ mod tests {
         assert_eq!(enriched, "Post\nalice dev\n\nbody");
     }
 
-    // T-217: enrich_body includes tags but no category when category is None
     #[test]
     fn enrich_body_tags_only() {
         let mut row = test_post_row(1);
@@ -761,7 +728,6 @@ mod tests {
         assert_eq!(enriched, "Post\nalice rust cli\n\nbody");
     }
 
-    // T-006: fresh DB で fts_chunks に section_title + content カラムあり (FR-001)
     #[test]
     fn fresh_db_fts_has_section_title_and_content_columns() {
         let db = Db::open_memory().unwrap();
@@ -782,7 +748,6 @@ mod tests {
         assert_eq!(title, "見出し");
     }
 
-    // T-097: WAL recovery — is_recoverable_open_error recognizes DatabaseCorrupt
     #[test]
     fn is_recoverable_for_database_corrupt() {
         let err = rusqlite::Error::SqliteFailure(
@@ -795,7 +760,6 @@ mod tests {
         assert!(is_recoverable_open_error(&err));
     }
 
-    // T-097: WAL recovery — is_recoverable_open_error recognizes CannotOpen
     #[test]
     fn is_recoverable_for_cannot_open() {
         let err = rusqlite::Error::SqliteFailure(
@@ -808,7 +772,6 @@ mod tests {
         assert!(is_recoverable_open_error(&err));
     }
 
-    // T-097: WAL recovery — non-SqliteFailure error is not recoverable
     #[test]
     fn is_not_recoverable_for_non_sqlite_failure() {
         let err = rusqlite::Error::QueryReturnedNoRows;

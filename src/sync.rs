@@ -1,5 +1,3 @@
-//! Bulk sync (`index` / `rebuild`) between esa.io and the local SQLite cache.
-
 use std::fmt;
 
 use crate::compat::progress_step;
@@ -53,11 +51,7 @@ pub enum SyncError {
 }
 
 impl SyncError {
-    /// True when the failure is transient enough that retrying might recover.
-    ///
-    /// `Client` variants always return `false`: their retryability is
-    /// classified per-case in [`crate::tools::SaeError::error_code`]
-    /// (Network / MaxRetries → `TempFailure`, Api → `Internal`).
+    // Client retryability is classified by SaeError; this method only covers storage.
     pub fn is_retryable(&self) -> bool {
         match self {
             Self::Client(_) => false,
@@ -108,7 +102,6 @@ pub async fn harvest(
     };
     let mut max_api_total: u32 = 0;
 
-    // Pagination cap (see PAGINATION_LIMIT): on hit, narrow by updated_at and continue.
     let mut window_boundary: Option<String> = None;
     let mut batch_oldest_ts: Option<String> = None;
 
@@ -222,23 +215,10 @@ pub async fn harvest(
     })
 }
 
-/// esa API caps pagination at this many items per query. Used as a structured
-/// detection signal for the `400 Bad Request` response: when `max_api_total`
-/// observed in prior responses exceeds this constant, a 400 is almost
-/// certainly the pagination cap rather than an unrelated bad-request.
 const PAGINATION_LIMIT: u32 = 10_000;
 
-/// Detect esa's 10k-item pagination cap from a `400 Bad Request` response.
-///
-/// Primary structured signal: `max_api_total > PAGINATION_LIMIT`. esa returns
-/// 400 to ANY page request when the result set would exceed 10000 items, so
-/// the prior pages' `total_count` is a wording-independent witness.
-///
-/// Fallback: legacy substring match (`"10,000"` / `"10000"`) for the case
-/// where the very first request fails (no prior `total_count` observed).
-/// The fallback is fragile against esa wording changes; both code paths emit
-/// `tracing::warn!` so operators notice when the structured signal stops
-/// agreeing with the substring.
+// Earlier total_count values detect the cap independently of error wording.
+// Fall back to message matching when no prior count exceeded the limit.
 fn detect_pagination_limit(body: &str, max_api_total: u32) -> bool {
     let substring_match = body.contains("10,000") || body.contains("10000");
     if max_api_total > PAGINATION_LIMIT {
@@ -260,21 +240,9 @@ fn detect_pagination_limit(body: &str, max_api_total: u32) -> bool {
     substring_match
 }
 
-/// Resolve the remote total to persist in sync_state.
-///
-/// In full sync, the largest API total seen across responses is authoritative:
-/// pagination narrowing can produce a smaller total in later responses that
-/// does not reflect the real remote size, so we take the max.
-///
-/// In incremental sync, every response's `total_count` comes from a diff
-/// filter (`q=updated:>X`) and underestimates the real total. Preserve the
-/// prior total and apply `local_floor` so previously corrupted state can
-/// self-heal once the floor reflects an authoritative local row count.
-///
-/// Pass `0` for `local_floor` at intermediate checkpoints. A running upsert
-/// counter includes updates to existing posts and would otherwise inflate
-/// the persisted total — only the post-loop `count_posts` query reports the
-/// actual row count.
+// Incremental totals cover changed posts; preserve the prior total.
+// Narrowed full-sync queries shrink totals, so retain their maximum.
+// Use the actual row count as a floor, never the upsert count.
 fn effective_total(full: bool, prior: u32, max_api: u32, local_floor: u32) -> u32 {
     if full {
         max_api
@@ -307,13 +275,7 @@ fn resolve_start(full: bool, state: &Option<storage::SyncState>) -> (u32, Option
     (page, q)
 }
 
-/// Write-through: reflect a single `EsaPost` from a mutation API response
-/// into the local DB (posts table + chunks + FTS) atomically.
-///
-/// Does NOT touch `sync_state.latest_updated_at`. Advancing the harvest cursor
-/// from a single post would skip concurrent remote updates whose `updated_at`
-/// falls between the last harvest and this post — only a full paginated
-/// harvest can prove that range is fully covered.
+// Do not advance the sync cursor: one post cannot prove the intervening remote range was harvested.
 pub(crate) fn upsert_post_locally(db: &Db, post: &EsaPost) -> Result<(), SyncError> {
     let row = post_to_row(post);
     let tx = db
@@ -327,10 +289,6 @@ pub(crate) fn upsert_post_locally(db: &Db, post: &EsaPost) -> Result<(), SyncErr
     Ok(())
 }
 
-/// Best-effort wrapper for [`upsert_post_locally`]: when `db` is `None`,
-/// or when the write fails, log a warning and continue — never propagate.
-/// Used by mutation commands (create/update/archive/ship) to reflect their
-/// API response into the local DB without disrupting the user-visible result.
 pub(crate) fn try_upsert_post_locally(db: Option<&Db>, post: &EsaPost) {
     let Some(db) = db else { return };
     if let Err(e) = upsert_post_locally(db, post) {
@@ -598,7 +556,6 @@ pub(crate) mod tests {
         assert_eq!(state.local_count, 1);
     }
 
-    // T-161: resolve_start returns page 1 and no query for a first-time sync
     #[test]
     fn resolve_start_first_sync() {
         let (page, q) = resolve_start(false, &None);
@@ -606,7 +563,6 @@ pub(crate) mod tests {
         assert!(q.is_none());
     }
 
-    // T-162: resolve_start returns updated: query when prior sync state exists
     #[test]
     fn resolve_start_incremental() {
         let state = Some(storage::SyncState {
@@ -621,7 +577,6 @@ pub(crate) mod tests {
         assert_eq!(q.as_deref(), Some("updated:>2025-01-01T00:00:00+09:00"));
     }
 
-    // T-163: resolve_start resumes from last_page when a checkpoint exists
     #[test]
     fn resolve_start_resume_checkpoint() {
         let state = Some(storage::SyncState {
@@ -636,7 +591,6 @@ pub(crate) mod tests {
         assert_eq!(q.as_deref(), Some("updated:>2025-01-01T00:00:00+09:00"));
     }
 
-    // T-164: resolve_start ignores saved state when full sync is requested
     #[test]
     fn resolve_start_full_ignores_state() {
         let state = Some(storage::SyncState {
@@ -651,7 +605,6 @@ pub(crate) mod tests {
         assert!(q.is_none());
     }
 
-    // T-044: HarvestResult serialize → posts_fetched, posts_stored, total_count fields
     #[test]
     fn harvest_result_serializes_to_json_with_expected_fields() {
         let result = HarvestResult {
@@ -670,26 +623,22 @@ pub(crate) mod tests {
         assert_eq!(v["gap_detected"], true);
     }
 
-    // T-113: substring fallback detects comma form when no structured signal exists
     #[test]
     fn detect_pagination_limit_substring_comma_format() {
         assert!(detect_pagination_limit("exceeds 10,000 items", 0));
     }
 
-    // T-165: substring fallback also accepts plain "10000"; both forms appear historically in esa errors
     #[test]
     fn detect_pagination_limit_substring_plain_format() {
         assert!(detect_pagination_limit("exceeds 10000 items", 0));
     }
 
-    // T-166: substring fallback rejects unrelated numbers (e.g. "1000") and empty bodies
     #[test]
     fn detect_pagination_limit_rejects_other_numbers() {
         assert!(!detect_pagination_limit("1000 items", 0));
         assert!(!detect_pagination_limit("", 0));
     }
 
-    // T-391: structured signal (max_api_total > PAGINATION_LIMIT) recognises the cap regardless of wording (#138 subtask 4)
     #[test]
     fn detect_pagination_limit_structured_signal_dominates() {
         assert!(
@@ -702,7 +651,6 @@ pub(crate) mod tests {
         );
     }
 
-    // T-392: no signal returns false; pins the strict `>` boundary so a drift to `>=` fails the suite
     #[test]
     fn detect_pagination_limit_returns_false_without_signal() {
         assert!(!detect_pagination_limit("invalid q parameter", 0));
@@ -712,7 +660,6 @@ pub(crate) mod tests {
         );
     }
 
-    // T-114: post_to_row with body_md: None → empty string
     #[test]
     fn post_to_row_none_body_becomes_empty() {
         let post = EsaPost {
@@ -740,13 +687,11 @@ pub(crate) mod tests {
         assert_eq!(row.tags, vec!["rust".to_owned()]);
     }
 
-    // T-167: build_window_query returns None when both base and boundary are absent
     #[test]
     fn build_window_query_none_none() {
         assert!(build_window_query(None, None).is_none());
     }
 
-    // T-168: build_window_query returns base query unchanged when boundary is absent
     #[test]
     fn build_window_query_base_only() {
         assert_eq!(
@@ -755,7 +700,6 @@ pub(crate) mod tests {
         );
     }
 
-    // T-169: build_window_query returns upper-bound clause when only boundary is set
     #[test]
     fn build_window_query_boundary_only() {
         assert_eq!(
@@ -764,7 +708,6 @@ pub(crate) mod tests {
         );
     }
 
-    // T-170: build_window_query combines base and boundary into a window query
     #[test]
     fn build_window_query_both() {
         assert_eq!(
@@ -773,7 +716,6 @@ pub(crate) mod tests {
         );
     }
 
-    // T-171: HarvestResult Display omits gap message when gap_detected is false
     #[test]
     fn harvest_result_display_no_gap() {
         let r = HarvestResult {
@@ -788,7 +730,6 @@ pub(crate) mod tests {
         assert!(!s.contains("gap"));
     }
 
-    // T-172: HarvestResult Display includes missing count when gap_detected is true
     #[test]
     fn harvest_result_display_with_gap() {
         let r = HarvestResult {
@@ -806,7 +747,6 @@ pub(crate) mod tests {
     async fn pagination_limit_narrows_window() {
         let server = MockServer::start().await;
 
-        // First request hits 10,000-item pagination limit
         Mock::given(method("GET"))
             .and(path("/teams/t/posts"))
             .and(query_param("page", "1"))
@@ -822,7 +762,6 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        // Second request (page 2) returns pagination limit error
         Mock::given(method("GET"))
             .and(path("/teams/t/posts"))
             .and(query_param("page", "2"))
@@ -834,7 +773,6 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        // Narrowed window request succeeds
         Mock::given(method("GET"))
             .and(path("/teams/t/posts"))
             .and(query_param("q", "updated:<=2025-01-02T00:00:00+09:00"))
@@ -866,12 +804,10 @@ pub(crate) mod tests {
         );
     }
 
-    // T-393: structured signal narrows the window even when the 400 body has no "10,000"/"10000" substring (#138 subtask 4)
     #[tokio::test]
     async fn pagination_limit_narrows_window_via_structured_signal() {
         let server = MockServer::start().await;
 
-        // Page 1: total_count=10_001 → max_api_total > PAGINATION_LIMIT for the next call
         Mock::given(method("GET"))
             .and(path("/teams/t/posts"))
             .and(query_param("page", "1"))
@@ -887,8 +823,6 @@ pub(crate) mod tests {
             .mount(&server)
             .await;
 
-        // Reworded esa error — no legacy substring; only the structured
-        // total_count witness from page 1 saves us.
         Mock::given(method("GET"))
             .and(path("/teams/t/posts"))
             .and(query_param("page", "2"))
@@ -923,7 +857,6 @@ pub(crate) mod tests {
         assert_eq!(r.total_count, 10_001);
     }
 
-    // T-300: upsert_post_locally inserts a post into an empty DB
     #[test]
     fn upsert_post_locally_inserts_new_post() {
         let db = Db::open_memory().unwrap();
@@ -941,7 +874,6 @@ pub(crate) mod tests {
         assert!(chunks > 0, "expected at least one chunk to be created");
     }
 
-    // T-301: upsert_post_locally replaces an existing post and re-chunks
     #[test]
     fn upsert_post_locally_replaces_existing() {
         let db = Db::open_memory().unwrap();
@@ -970,10 +902,6 @@ pub(crate) mod tests {
         assert_eq!(total, 1, "no duplicate row should be created");
     }
 
-    // T-302: upsert_post_locally must NOT touch sync_state so that the harvest
-    //        cursor only advances after a full paginated harvest proves the
-    //        intervening updated_at range was fully covered. Single-post
-    //        write-through would otherwise skip concurrent remote updates.
     #[test]
     fn upsert_post_locally_does_not_advance_sync_state() {
         let db = Db::open_memory().unwrap();
@@ -1000,7 +928,6 @@ pub(crate) mod tests {
         assert_eq!(after.updated_at, before.updated_at);
     }
 
-    // T-304: upsert_post_locally without prior sync_state leaves it absent
     #[test]
     fn upsert_post_locally_skips_sync_state_when_absent() {
         let db = Db::open_memory().unwrap();
@@ -1014,7 +941,6 @@ pub(crate) mod tests {
         assert_eq!(storage::count_posts(db.conn()).unwrap(), 1);
     }
 
-    // T-173: Display shows "No updates" when an incremental harvest fetches 0 posts
     #[test]
     fn harvest_result_display_no_updates() {
         let r = HarvestResult {
@@ -1041,8 +967,6 @@ pub(crate) mod tests {
         }
     }
 
-    // T-174: incremental harvest with 0 diff results preserves prior total_count
-    //        instead of overwriting sync_state with the diff-query total.
     #[tokio::test]
     async fn incremental_with_zero_diff_preserves_prior_total() {
         let server = MockServer::start().await;
@@ -1082,9 +1006,6 @@ pub(crate) mod tests {
         );
     }
 
-    // T-175: incremental harvest self-heals when state was previously corrupted
-    //        (e.g., total_count overwritten with 0 by an earlier buggy run).
-    //        local_count acts as a floor on the effective remote total.
     #[tokio::test]
     async fn incremental_self_heals_corrupt_total() {
         let server = MockServer::start().await;
@@ -1119,8 +1040,6 @@ pub(crate) mod tests {
         assert_eq!(state.total_count, 7, "saved state must be self-healed");
     }
 
-    // T-176: effective_total decision table — one row per branch of the
-    //        full / incremental / local_floor matrix. See fn rustdoc for the rule.
     #[test]
     fn effective_total_resolver() {
         assert_eq!(
@@ -1151,9 +1070,6 @@ pub(crate) mod tests {
         );
     }
 
-    // T-353: SyncError::is_retryable() returns true for transient SQLite busy
-    // (WAL contention). Without this, the catch-all CantCreat (73) routing
-    // blocks AI-agent auto-retry on recoverable contention (#138 subtask 2).
     #[test]
     fn is_retryable_true_for_sqlite_busy() {
         let busy = sqlite_failure(ErrorCode::DatabaseBusy, 5);
@@ -1161,7 +1077,6 @@ pub(crate) mod tests {
         assert!(err.is_retryable(), "SQLITE_BUSY must be retryable");
     }
 
-    // T-354: SyncError::is_retryable() returns true for SQLITE_LOCKED.
     #[test]
     fn is_retryable_true_for_sqlite_locked() {
         let locked = sqlite_failure(ErrorCode::DatabaseLocked, 6);
@@ -1169,8 +1084,6 @@ pub(crate) mod tests {
         assert!(err.is_retryable(), "SQLITE_LOCKED must be retryable");
     }
 
-    // T-355: SyncError::is_retryable() returns true for transient I/O kinds
-    // (WouldBlock / Interrupted / TimedOut).
     #[test]
     fn is_retryable_true_for_transient_io() {
         use std::io;
@@ -1184,8 +1097,6 @@ pub(crate) mod tests {
         }
     }
 
-    // T-356: SyncError::is_retryable() returns false for non-retryable
-    // storage variants (Open failure, non-busy SQLite, permanent I/O).
     #[test]
     fn is_retryable_false_for_non_retryable_storage() {
         use std::io;
@@ -1203,9 +1114,6 @@ pub(crate) mod tests {
         assert!(!perm.is_retryable());
     }
 
-    // T-357: SyncError::is_retryable() always returns false for Client
-    // variants — Client retryability is classified separately in
-    // SaeError::error_code (per-variant Network / MaxRetries / Api routing).
     #[test]
     fn is_retryable_false_for_client_variants() {
         let token = SyncError::Client(ClientError::TokenNotSet);

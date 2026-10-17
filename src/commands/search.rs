@@ -40,9 +40,6 @@ pub(crate) fn run_search(
     let updated_before = parse_date_arg(before, "before")?;
     let team = config.resolve_team(team)?;
     let db = require_db(config, team)?;
-    // `embedder_load_failed` distinguishes intentional FTS (`no_embed`) from
-    // a silent fallback (loader returned `DegradedReason`). Only the latter
-    // populates `degraded=true` + notes in the success envelope.
     if !no_embed && storage::has_embeddings(db.conn()) {
         storage::validate_embedding_index(db.conn())?;
     }
@@ -84,13 +81,8 @@ pub(crate) fn run_search(
     for w in &search_output.warnings {
         tracing::warn!("{w}");
     }
-    // `semantic` reflects whether vector search actually ran, not just whether
-    // the embedder loaded: hybrid_search skips vectors when nothing is embedded
-    // yet (e.g. indexed before `model download`), so report FTS — not a
-    // misleading "hybrid" — in that case. Mirrors hybrid_search's own guard.
+    // A loaded model does not imply vector search ran: the index may have no vectors.
     let semantic = query_embedding.is_some() && storage::has_embeddings(db.conn());
-    // Search is read-only — no auto-embed, no background index. Build the
-    // index explicitly with `sae index` / `sae rebuild` (mirrors yomu).
     output::search(
         &search_output.results,
         query,
@@ -165,19 +157,16 @@ mod tests {
         )
     }
 
-    // T-144: resolve_value reads query from piped stdin when no argument given
     #[test]
     fn resolve_value_reads_piped_stdin_when_missing() {
         assert_eq!(resolve_search(None, "認証\n", false).unwrap(), "認証");
     }
 
-    // T-145: resolve_value reads query from stdin when "-" is passed as argument
     #[test]
     fn resolve_value_reads_stdin_when_dash_is_passed() {
         assert_eq!(resolve_search(Some("-"), "認証\n", true).unwrap(), "認証");
     }
 
-    // T-146: resolve_value returns the provided argument value directly
     #[test]
     fn resolve_value_returns_value_when_present() {
         assert_eq!(
@@ -186,7 +175,6 @@ mod tests {
         );
     }
 
-    // T-147: resolve_value errors when "-" is passed but stdin is empty
     #[test]
     fn resolve_value_rejects_dash_with_empty_stdin() {
         let err = resolve_search(Some("-"), "", true).unwrap_err();
@@ -196,7 +184,6 @@ mod tests {
         );
     }
 
-    // T-148: resolve_value errors when piped stdin contains only whitespace
     #[test]
     fn resolve_value_rejects_whitespace_only_piped_stdin() {
         let err = resolve_search(None, "  \n  \t  ", false).unwrap_err();
@@ -206,7 +193,6 @@ mod tests {
         );
     }
 
-    // T-149: resolve_value errors with usage hint when argument missing on terminal
     #[test]
     fn resolve_value_rejects_missing_on_terminal() {
         let err = resolve_search(None, "", true).unwrap_err();
@@ -221,13 +207,11 @@ mod tests {
         );
     }
 
-    // T-070: parse_date_arg returns None when no value provided
     #[test]
     fn parse_date_arg_returns_none_when_absent() {
         assert!(parse_date_arg(None, "after").unwrap().is_none());
     }
 
-    // T-071: parse_date_arg parses valid YYYY-MM-DD into DateTime<Utc>
     #[test]
     fn parse_date_arg_parses_valid_date() {
         let dt = parse_date_arg(Some("2025-06-30"), "after")
@@ -236,7 +220,6 @@ mod tests {
         assert_eq!(dt.strftime("%Y-%m-%d").to_string(), "2025-06-30");
     }
 
-    // T-072: parse_date_arg returns Input error for non-ISO8601 date
     #[test]
     fn parse_date_arg_rejects_invalid_date() {
         let err = parse_date_arg(Some("30/06/2025"), "after").unwrap_err();
