@@ -4,6 +4,7 @@ use std::env;
 use std::ffi;
 use std::io::{ErrorKind, stdout};
 use std::iter;
+use std::panic::{self, UnwindSafe};
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -18,7 +19,7 @@ use sae::io::write_output;
 use sae::model::handle_probe_if_needed;
 use sae::tools::{CreateArgs, Sae, SaeError, SearchArgs, UpdateArgs};
 use sae::{CommandOutput, render_error, render_parse_error, render_success};
-use tokio::task::spawn_blocking;
+use tokio::task::{block_in_place, spawn_blocking};
 
 #[derive(Parser)]
 #[command(name = "sae", about = "esa semantic search CLI")]
@@ -285,11 +286,7 @@ async fn run(cli: Cli, config: Config) -> Result<CommandOutput, SaeError> {
                 .await
                 .map_err(|e| SaeError::Internal(format!("Migration task failed: {e}")))?,
             ModelCommand::Rollback { team } => rollback(&config, &team),
-            ModelCommand::Download => {
-                spawn_blocking(Sae::model_download).await.map_err(|error| {
-                    SaeError::Internal(format!("Model download task failed: {error}"))
-                })?
-            }
+            ModelCommand::Download => run_model_download(Sae::model_download),
         };
     }
     let sae = Sae::new(config);
@@ -334,6 +331,16 @@ async fn run(cli: Cli, config: Config) -> Result<CommandOutput, SaeError> {
         Command::TestForceSearchWarning => sae::__test_search_with_warnings(),
         Command::Model { .. } => unreachable!("handled before Sae::new()"),
     }
+}
+
+fn run_model_download(
+    download: impl FnOnce() -> Result<CommandOutput, SaeError> + UnwindSafe,
+) -> Result<CommandOutput, SaeError> {
+    // The CLI uses the multi-thread Tokio runtime required by block_in_place.
+    // Keep native probe children on the caller's scheduling context, as search
+    // does. block_in_place still permits the blocking HTTP client's runtime.
+    block_in_place(|| panic::catch_unwind(download))
+        .map_err(|_| SaeError::Internal("Model download task panicked".into()))?
 }
 
 fn emit_success(out: &CommandOutput, json_mode: bool) -> ExitCode {
@@ -413,6 +420,64 @@ mod tests {
     use super::*;
     use clap::CommandFactory;
     use ffi::OsString;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn model_download_runs_blocking_http_on_caller_thread_and_preserves_output() {
+        use reqwest::blocking::Client;
+        use std::thread;
+
+        let caller = thread::current().id();
+        let output = run_model_download(|| {
+            assert_eq!(thread::current().id(), caller);
+            let client = Client::builder()
+                .build()
+                .expect("blocking HTTP client must build inside the production runtime");
+            drop(client);
+            Ok(CommandOutput {
+                markdown: "download complete".into(),
+                data: serde_json::json!({"status": "ok", "fixture": 7}),
+                degraded: true,
+                notes: vec!["preserved callback note".into()],
+            })
+        })
+        .expect("callback must complete without a nested-runtime panic");
+
+        assert_eq!(output.markdown, "download complete");
+        assert_eq!(
+            output.data,
+            serde_json::json!({"status": "ok", "fixture": 7})
+        );
+        assert!(output.degraded);
+        assert_eq!(output.notes, ["preserved callback note"]);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn model_download_preserves_typed_failures_and_their_exit_classification() {
+        use sae::model::ModelDownloadError;
+
+        for (failure, code) in [
+            (ModelDownloadError::DownloadFailed("HTTP 503".into()), 75),
+            (ModelDownloadError::ProbeFailed("probe rejected".into()), 70),
+            (ModelDownloadError::BackendUnavailable, 70),
+        ] {
+            let expected_message = failure.to_string();
+            let error = run_model_download(|| Err(SaeError::ModelDownload(failure)))
+                .err()
+                .expect("typed callback error must remain an error");
+            assert!(matches!(&error, SaeError::ModelDownload(_)));
+            assert_eq!(error.to_string(), expected_message);
+            assert_eq!(error.exit_code(), ExitCode::from(code));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn model_download_callback_panic_is_contained_as_internal_error() {
+        let error = run_model_download(|| panic!("injected download callback panic"))
+            .err()
+            .expect("callback panic must become a command error");
+        assert!(matches!(&error, SaeError::Internal(message) if !message.is_empty()));
+        assert_eq!(error.exit_code(), ExitCode::from(codes::INTERNAL));
+    }
 
     fn os(s: &[&str]) -> Vec<OsString> {
         s.iter().map(|&a| a.into()).collect()

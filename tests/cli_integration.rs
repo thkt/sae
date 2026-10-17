@@ -919,39 +919,17 @@ fn real_model_download_reuses_verified_cache_and_reports_hardware_result() {
     assert_eq!(digest(&weights), spec.model_sha256);
     assert_eq!(digest(&tokenizer), spec.tokenizer_sha256);
     let gpu = model::gpu_available().expect("backend hardware diagnostic");
-    if gpu {
-        // This case verifies installed-cache reuse and the CLI's real probe
-        // after native runtime preparation. GPU discovery alone does not
-        // create the inference pipelines. Prepare the actual workload first, as
-        // the semantic-search test prepares its real document fixture.
-        let embedder = model::load_verified().expect("pinned real model must be available");
-        let query = embedder
-            .embed_query("model probe")
-            .expect("real query fixture preparation must succeed");
-        assert_eq!(query.len(), spec.dimensions);
-        assert!(query.iter().all(|value| value.is_finite()));
-        let norm = query
-            .iter()
-            .map(|value| f64::from(*value).powi(2))
-            .sum::<f64>()
-            .sqrt();
-        assert!((norm - 1.0).abs() < 1e-4, "query fixture L2 norm={norm}");
-    }
-    // Release fixture weights before the child loads its own real model.
     let home = tempdir().unwrap();
-    let probe_trace = home.path().join("probe-trace.log");
     let output = sae_command_with_binary(home.path(), Path::new(env!("CARGO_BIN_EXE_sae")))
         .env("SAE_MODEL_DIR", &artifacts)
-        .env("__SAE_TEST_PROBE_TRACE", &probe_trace)
         .args(["--json", "model", "download"])
         .output()
         .unwrap();
     assert_eq!(
         output.status.code(),
         Some(if gpu { 0 } else { 70 }),
-        "stderr={}; probe_trace={}",
-        String::from_utf8_lossy(&output.stderr),
-        fs::read_to_string(&probe_trace).unwrap_or_else(|error| format!("unavailable: {error}"))
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
     );
     if gpu {
         let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
