@@ -63,20 +63,17 @@ jobs:
     # branches) cannot merge untested. No overall-percent floor (which would
     # flag existing unreachable code); no base-vs-PR double measurement.
     # Rationale: ported from yomu (Issue #223), THRESHOLDS.md "Coverage".
-    # Runs on macos like the test job to exercise the native Metal build.
+    # Run all native contracts on a CPU host; hosted macOS only exposes a
+    # virtual Metal device. The macOS test job retains Metal build checks.
     # --features test-support mirrors the test job (hidden-seam tests) so
     # coverage matches what is tested.
-    runs-on: macos-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     if: github.event_name == 'pull_request'
     env:
       CARGO_INCREMENTAL: "0"
       CARGO_PROFILE_DEV_DEBUG: "0"
       CARGO_PROFILE_TEST_DEBUG: "0"
-      # Keep real-model hashing/host work practical under instrumentation.
-      # Debug assertions and overflow checks retain the dev/test defaults.
-      CARGO_PROFILE_DEV_OPT_LEVEL: "1"
-      CARGO_PROFILE_TEST_OPT_LEVEL: "1"
     permissions:
       contents: read
 
