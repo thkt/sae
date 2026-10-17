@@ -9,6 +9,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Rustの必要バージョンとCIを1.99.1へ揃え、rusqliteを0.40.2（bundled SQLite 3.53.2）へ更新。
+  Tokioで有効にする機能を使用中のものに絞る。
+- **BREAKING**: 旧MLX用の`compat::ProbeError`、`compat::SetupReason`、`SaeError::Probe`を削除。
+  現行Gemmaの検証・ロード失敗は`SaeError::ModelLoadFailed(String)`で表し、
+  CLIの`INTERNAL` (70)とエラーメッセージ形式を維持する。
+
 - **BREAKING**: 埋め込みをEmbeddingGemma 2 BF16（768次元）へ変更し、rerankerと
   MLX依存を廃止。`SAE_RERANK`は無視する。既存Ruri索引はGemmaと互換性がないため、
   `sae model download`後に`sae model migrate <team>`でローカルコピーから移行する。

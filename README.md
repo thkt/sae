@@ -8,7 +8,7 @@ esaの検索は全文検索だが、ローカルで高速に検索したい場�
 
 ## セットアップ
 
-初回ビルドにはRust、CMake、C/C++コンパイラが必要。macOSではXcode Command Line Toolsを導入する。Apple SiliconではMetalを使用する。
+初回ビルドにはRust 1.99.1、CMake、C/C++コンパイラが必要。macOSではXcode Command Line Toolsを導入する。Apple SiliconではMetalを使用する。`rust-toolchain.toml`でローカルのRustを指定し、CIも同じ版で検証する。
 
 ```bash
 git submodule update --init --recursive
@@ -168,9 +168,9 @@ sysexits.h の symbolic name (`EX_USAGE`, `EX_SOFTWARE` 等) は数値の出典�
 | 0    | (none)         | 正常終了         |                                                          |             |
 | 64   | USAGE_ERROR    | 入力エラー       | 不明なチーム、トークン未設定、未 index 実行              | しない      |
 | 65   | DATA_ERROR     | データ形式不正   | `--after` / `--before` の日付形式不正 (`YYYY-MM-DD` 以外)、esa API 404 (指定 post 番号がチームに存在しない)、埋め込み索引のモデル不一致 | しない      |
-| 70   | INTERNAL       | 内部エラー       | JSON parse 失敗、esa API の 404 以外の HTTP エラー (5xx および 401/403/422 等の 4xx)、native backend 不在 (`sae index` / `sae model download` 共通)、model download 検証失敗 (`ModelDownloadError::ProbeFailed`)、`ProbeError` (HandlerNotInstalled / ModelLoadFailed / SetupRejected)、embedder invariant 違反 (例: batch count mismatch) | しない      |
+| 70   | INTERNAL       | 内部エラー       | JSON parse 失敗、esa API の 404 以外の HTTP エラー (5xx および 401/403/422 等の 4xx)、native backend 不在 (`sae index` / `sae model download` 共通)、model download 検証失敗 (`ModelDownloadError::ProbeFailed`)、Gemmaの検証・ロード失敗 (`SaeError::ModelLoadFailed`)、embedder invariant 違反 (例: batch count mismatch) | しない      |
 | 73   | CANT_CREAT     | データ層エラー   | DB open 失敗、ファイル作成不可                           | 状況による  |
-| 74   | IO_ERROR       | I/O エラー       | ファイル読み書き失敗、`ProbeError::SubprocessFailed`     | 状況による  |
+| 74   | IO_ERROR       | I/O エラー       | ファイル読み書き失敗     | 状況による  |
 | 75   | TEMP_FAILURE   | 一時的エラー     | esa API rate limit、ネットワーク障害、model download 一時的失敗 (429, 5xx, timeout)、embedding モデル未インストールで `sae index` / `rebuild` が埋め込み不能 (`EmbedderUnavailable`、`sae model download` で解消) | する  |
 | 104  | UNKNOWN        | 分類不能         | 未型化のランタイムエラー (`anyhow::Error` 経由)、その他の想定外例外。分類済み 70 と区別する ADR-0066 L136 の意図に対応 | しない |
 

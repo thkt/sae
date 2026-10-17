@@ -26,7 +26,7 @@ pub use tools::{Sae, SaeError};
 /// Hidden test seam: builds a [`CommandOutput`] by running `output::search`
 /// with a synthetic search result and a non-empty `search_warnings` slice so
 /// `tests/cli_integration.rs` can pin the `--json` envelope wiring for #140
-/// without seeding a SQLite DB or loading a real reranker. The production
+/// without seeding a SQLite DB or loading a native model. The production
 /// binary built with `cargo install` never exposes this symbol.
 #[cfg(feature = "test-support")]
 pub fn __test_search_with_warnings() -> Result<CommandOutput, SaeError> {

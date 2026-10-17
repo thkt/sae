@@ -466,7 +466,7 @@ mod tests {
     // reach the envelope notes[] without depending on embedder_load_failed.
     #[test]
     fn search_warnings_alone_set_degraded_and_populate_notes() {
-        let warnings = vec!["reranker failed (boom), falling back to RRF order".to_owned()];
+        let warnings = vec!["vector search failed (boom), falling back to FTS".to_owned()];
         let out = search(&[], "q", true, false, &warnings).unwrap();
         assert!(
             out.degraded,
@@ -474,7 +474,7 @@ mod tests {
         );
         assert_eq!(out.notes.len(), 1);
         assert!(
-            out.notes[0].contains("reranker failed"),
+            out.notes[0].contains("vector search failed"),
             "warning should be surfaced in notes[0]; got: {:?}",
             out.notes
         );
@@ -485,7 +485,7 @@ mod tests {
     // agents that read notes[0] keep the same upstream-first semantics.
     #[test]
     fn search_warnings_with_embedder_failure_preserve_order() {
-        let warnings = vec!["reranker failed (boom), falling back to RRF order".to_owned()];
+        let warnings = vec!["vector search failed (boom), falling back to FTS".to_owned()];
         let out = search(&[], "q", false, true, &warnings).unwrap();
         assert!(out.degraded);
         assert_eq!(out.notes.len(), 2);
@@ -495,7 +495,7 @@ mod tests {
             out.notes
         );
         assert!(
-            out.notes[1].contains("reranker failed"),
+            out.notes[1].contains("vector search failed"),
             "storage warning should come second (downstream); got: {:?}",
             out.notes
         );
