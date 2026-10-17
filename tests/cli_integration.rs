@@ -748,11 +748,20 @@ fn real_semantic_search_exits_successfully_after_emitting_json() {
     // The real model used for setup is released before the child acquires it.
     let before = fs::read(&path).unwrap();
     let mut command = sae_command_with_binary(home.path(), Path::new(env!("CARGO_BIN_EXE_sae")));
+    #[cfg(feature = "test-support")]
+    let probe_trace = home.path().join("probe-trace.jsonl");
+    #[cfg(feature = "test-support")]
+    command.env("__SAE_TEST_PROBE_TRACE", &probe_trace);
     let output = command
         .env("SAE_MODEL_DIR", artifacts)
         .args(["--json", "search", "Rust API の認証", "--team", "alpha"])
         .output()
         .expect("spawn real sae CLI");
+    #[cfg(feature = "test-support")]
+    eprintln!(
+        "probe trace [real_semantic_search_exits_successfully_after_emitting_json]:\n{}",
+        fs::read_to_string(&probe_trace).unwrap_or_else(|error| format!("unavailable: {error}"))
+    );
     let envelope: serde_json::Value =
         serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
             panic!(
@@ -920,11 +929,21 @@ fn real_model_download_reuses_verified_cache_and_reports_hardware_result() {
     assert_eq!(digest(&tokenizer), spec.tokenizer_sha256);
     let gpu = model::gpu_available().expect("backend hardware diagnostic");
     let home = tempdir().unwrap();
-    let output = sae_command_with_binary(home.path(), Path::new(env!("CARGO_BIN_EXE_sae")))
+    let mut command = sae_command_with_binary(home.path(), Path::new(env!("CARGO_BIN_EXE_sae")));
+    #[cfg(feature = "test-support")]
+    let probe_trace = home.path().join("probe-trace.jsonl");
+    #[cfg(feature = "test-support")]
+    command.env("__SAE_TEST_PROBE_TRACE", &probe_trace);
+    let output = command
         .env("SAE_MODEL_DIR", &artifacts)
         .args(["--json", "model", "download"])
         .output()
         .unwrap();
+    #[cfg(feature = "test-support")]
+    eprintln!(
+        "probe trace [real_model_download_reuses_verified_cache_and_reports_hardware_result]:\n{}",
+        fs::read_to_string(&probe_trace).unwrap_or_else(|error| format!("unavailable: {error}"))
+    );
     assert_eq!(
         output.status.code(),
         Some(if gpu { 0 } else { 70 }),

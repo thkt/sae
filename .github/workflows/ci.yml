@@ -107,6 +107,7 @@ jobs:
       - name: Generate lcov coverage including real native contracts
         env:
           SAE_MODEL_DIR: ${{ runner.temp }}/sae-coverage-model
+          RUST_TEST_NOCAPTURE: "1"
         run: cargo llvm-cov --no-clean --features test-support --lcov --output-path lcov.info -- --include-ignored --test-threads=1
 
       - name: Diff coverage gate (changed lines >= 95%)

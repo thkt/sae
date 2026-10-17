@@ -1,3 +1,5 @@
+#[cfg(feature = "test-support")]
+use crate::model::record_probe_stage;
 use crate::{
     embedding::{ChunkedEmbedding, EMBEDDING_DIMS, Embed, EmbedError, EmbedOptions},
     model::ModelSpec,
@@ -106,12 +108,20 @@ impl Gemma {
             .with_embeddings(true)
             .with_pooling_type(LlamaPoolingType::Mean)
             .with_attention_type(LlamaAttentionType::NonCausal);
+        #[cfg(feature = "test-support")]
+        record_probe_stage("context-create-start");
         let mut ctx = model.new_context(backend()?, params)?;
+        #[cfg(feature = "test-support")]
+        record_probe_stage("context-create-complete");
         let mut batch = LlamaBatch::new(total, 1);
         for (i, tokens) in inputs.iter().enumerate() {
             batch.add_sequence(tokens, i32::try_from(i)?, true)?;
         }
+        #[cfg(feature = "test-support")]
+        record_probe_stage("encode-start");
         ctx.encode(&mut batch)?;
+        #[cfg(feature = "test-support")]
+        record_probe_stage("encode-complete");
         let result = (0..inputs.len())
             .map(|i| {
                 let v = ctx.embeddings_seq_ith(i32::try_from(i)?)?;
