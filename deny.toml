@@ -1,7 +1,7 @@
 [advisories]
 version = 2
 ignore = [
-    # paste v1.0.15 は rurico→tokenizers→macro_rules_attribute 経由の推移的依存。
+    # paste v1.0.15 は tokenizers→macro_rules_attribute 経由の推移的依存。
     # 直接置き換え不可のため upstream 対応まで抑制。
     "RUSTSEC-2024-0436",
 ]
@@ -32,7 +32,4 @@ wildcards = "allow"
 unknown-registry = "deny"
 unknown-git = "deny"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = [
-    "https://github.com/thkt/amici",
-    "https://github.com/thkt/rurico",
-]
+allow-git = []

@@ -103,6 +103,10 @@ impl TeamStatus {
 
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
+    #[error(
+        "Embedding index is incompatible: {0}. Run `sae model migrate <team>`; use `--no-embed` for FTS-only search."
+    )]
+    IndexMismatch(String),
     #[error("Failed to open database: {0}")]
     Open(String),
 
@@ -123,6 +127,7 @@ impl StorageError {
     /// (#138 subtask 2).
     pub fn is_retryable(&self) -> bool {
         match self {
+            Self::IndexMismatch(_) => false,
             Self::Open(_) => false,
             Self::Db(e) => is_retryable_sqlite_error(e),
             Self::Io(e) => is_retryable_io_error(e),
@@ -259,5 +264,15 @@ mod tests {
         assert_eq!(v["total_count"], 100);
         assert_eq!(v["local_count"], 50);
         assert_eq!(v["last_page"], 3);
+    }
+
+    #[test]
+    fn incompatible_encoder_is_permanent_and_explains_recovery() {
+        let error = StorageError::IndexMismatch("legacy Ruri vector space".into());
+        assert!(!error.is_retryable());
+        let message = error.to_string();
+        assert!(message.contains("legacy Ruri vector space"));
+        assert!(message.contains("sae model migrate <team>"));
+        assert!(message.contains("--no-embed"));
     }
 }

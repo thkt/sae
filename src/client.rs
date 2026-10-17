@@ -1,7 +1,7 @@
 use std::fmt;
 use std::time::Duration;
 
-use amici::cli::env_lookup;
+use crate::compat::env_lookup;
 use reqwest::Client;
 use reqwest::header::{AUTHORIZATION, HeaderValue};
 use serde::de::DeserializeOwned;

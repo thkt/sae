@@ -1,14 +1,13 @@
 use std::collections::HashMap;
 use std::f64::consts::LN_2;
 
-use amici::storage::{
+use crate::compat::query::{normalize_for_fts, prepare_match_query};
+use crate::compat::{
     fetch_by_in_clause,
     filter::{append_eq_filter, append_in_filter, append_timestamp_day_cutoff_filter},
     fts::clean_for_trigram,
 };
 use jiff::Timestamp;
-use rurico::reranker::Rerank;
-use rurico::storage::{normalize_for_fts, prepare_match_query};
 use rusqlite::Connection;
 use rusqlite::types::ToSql;
 use tracing::warn;
@@ -73,7 +72,7 @@ struct PostMeta {
 /// Strip general punctuation while preserving technical term characters
 /// (`+`, `#`, `.`, `/`, `_`, `@`).
 ///
-/// `:` and `-` are stripped to work around rurico double-quoting in
+/// `:` and `-` are stripped to preserve quoting behavior in
 /// `sanitize_fts_query` + `fts_expand_short_terms` (produces FTS5
 /// queries that match nothing).
 fn normalize_punctuation(query: &str) -> String {
@@ -92,7 +91,7 @@ fn normalize_punctuation(query: &str) -> String {
         .join(" ")
 }
 
-/// `EXISTS + json_each` shape does not fit `amici::storage::filter::append_in_filter`
+/// `EXISTS + json_each` shape does not fit the ordinary IN filter helper
 /// (which emits `AND {col} IN (...)`), so the subquery is built inline.
 fn append_tags_filter(sql: &mut String, params: &mut Vec<Box<dyn ToSql>>, tags: Option<&[&str]>) {
     if let Some(tags) = tags
@@ -165,11 +164,7 @@ const RECENCY_WEIGHT: f64 = 0.2;
 const SECS_PER_DAY: f64 = 86_400.0;
 const RRF_K: f64 = 60.0;
 
-/// Reciprocal Rank Fusion: rank-only merge of two ranked lists.
-/// Replaces `rurico::storage::rrf_merge` after its removal upstream
-/// (folded into `retrieval::WeightedRrf::default()`). sae keeps the
-/// pre-rerank rank-only fusion here because applying recency in the
-/// merge step would change the recency-after-rerank semantics.
+/// Rank-only Reciprocal Rank Fusion, followed by recency boosting.
 fn rrf_merge(fts_hits: &[(u32, f64)], vec_hits: &[(u32, f64)]) -> Vec<(u32, f64)> {
     let mut scores: HashMap<u32, f64> = HashMap::new();
     for (rank, (key, _)) in fts_hits.iter().enumerate() {
@@ -183,11 +178,7 @@ fn rrf_merge(fts_hits: &[(u32, f64)], vec_hits: &[(u32, f64)]) -> Vec<(u32, f64)
     results
 }
 
-/// Exponential recency decay: 1.0 at age=0, 0.5 at one half-life.
-/// Replaces `rurico::storage::recency_decay` after it was demoted to
-/// `pub(crate)` upstream. Applied after the cross-encoder rerank, so
-/// `WeightedRrf::merge_with_recency` (which acts pre-rerank) cannot
-/// be substituted without changing observable ranking.
+/// Exponential recency decay: 1.0 at age zero, 0.5 at one half-life.
 fn recency_decay(age_days: f64, half_life_days: f64) -> f64 {
     if half_life_days <= 0.0 {
         return 0.0;
@@ -363,12 +354,7 @@ pub(crate) fn vec_search(
     Ok(hits)
 }
 
-// Candidate pool multipliers: fetch more candidates than the user-requested
-// `limit` so RRF merging and recency boost have headroom. The reranker case
-// pulls 4× because cross-encoder reordering can promote any of the 4× pool;
-// the non-rerank case pulls 3× since RRF + recency only reshuffle relative
-// rank inside the pool.
-const RERANK_CANDIDATE_MULT: u32 = 4;
+// Preserve the no-reranker retrieval pool used by the existing CLI.
 const BASE_CANDIDATE_MULT: u32 = 3;
 
 pub fn hybrid_search(
@@ -378,13 +364,11 @@ pub fn hybrid_search(
     limit: u32,
     now: Timestamp,
     filter: &SearchFilter<'_>,
-    reranker: Option<&dyn Rerank>,
 ) -> Result<SearchOutput, StorageError> {
-    let candidate_limit = if reranker.is_some() {
-        limit * RERANK_CANDIDATE_MULT
-    } else {
-        limit * BASE_CANDIDATE_MULT
-    };
+    if query_embedding.is_some() && super::has_embeddings(conn) {
+        super::validate_embedding_index(conn)?;
+    }
+    let candidate_limit = limit.saturating_mul(BASE_CANDIDATE_MULT);
 
     let fts_hits = fts_search(conn, query, candidate_limit, filter)?;
 
@@ -413,8 +397,7 @@ pub fn hybrid_search(
     let candidate_numbers: Vec<u32> = merged.iter().map(|(pn, _)| *pn).collect();
     let post_meta = batch_fetch_post_meta(conn, &candidate_numbers)?;
 
-    // P1: keep the first (highest-ranked) chunk per post so the reranker sees
-    // the most relevant content, not whichever chunk happened to be last.
+    // Keep the highest-ranked chunk for snippets.
     let mut fts_map: HashMap<u32, &FtsHit> = HashMap::new();
     for h in &fts_hits {
         fts_map.entry(h.post_number).or_insert(h);
@@ -424,39 +407,7 @@ pub fn hybrid_search(
         vec_map.entry(h.post_number).or_insert(h);
     }
 
-    // P2: apply recency boost in every path so it is never discarded.
-    // When the cross-encoder is active it re-scores first, then recency
-    // is added on top; the fallback and no-reranker paths behave as before.
-    let scored = if let Some(ranker) = reranker {
-        let pairs: Vec<(&str, &str)> = merged
-            .iter()
-            .map(|(pn, _)| {
-                let content = fts_map
-                    .get(pn)
-                    .map(|h| h.content.as_str())
-                    .or_else(|| vec_map.get(pn).map(|h| h.content.as_str()))
-                    .unwrap_or("");
-                (query, content)
-            })
-            .collect();
-        match ranker.score_batch(&pairs) {
-            Ok(scores) => {
-                let cross_scored: Vec<(u32, f64)> = merged
-                    .into_iter()
-                    .zip(scores)
-                    .map(|((pn, _), s)| (pn, s as f64))
-                    .collect();
-                apply_recency_boost(cross_scored, &post_meta, now)
-            }
-            Err(e) => {
-                warn!(%e, "cross-encoder reranking failed, keeping heuristic order");
-                warnings.push(format!("reranker failed ({e}), falling back to RRF order"));
-                apply_recency_boost(merged, &post_meta, now)
-            }
-        }
-    } else {
-        apply_recency_boost(merged, &post_meta, now)
-    };
+    let scored = apply_recency_boost(merged, &post_meta, now);
 
     #[allow(clippy::cast_possible_truncation)]
     let results = scored
@@ -591,7 +542,6 @@ mod tests {
             10,
             Timestamp::now(),
             &SearchFilter::default(),
-            None,
         )
         .unwrap()
         .results;
@@ -614,7 +564,6 @@ mod tests {
             10,
             Timestamp::now(),
             &SearchFilter::default(),
-            None,
         )
         .unwrap()
         .results;
@@ -793,7 +742,6 @@ mod tests {
             10,
             now,
             &SearchFilter::default(),
-            None,
         )
         .unwrap()
         .results;
@@ -827,7 +775,6 @@ mod tests {
             10,
             now,
             &SearchFilter::default(),
-            None,
         )
         .unwrap()
         .results;
@@ -982,7 +929,7 @@ mod tests {
     // T-193: hybrid_search uses vector search when embeddings are present
     #[test]
     fn hybrid_search_with_embeddings() {
-        use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
+        use crate::embedding::{ChunkedEmbedding, EMBEDDING_DIMS};
 
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
@@ -1003,7 +950,6 @@ mod tests {
             10,
             Timestamp::now(),
             &SearchFilter::default(),
-            None,
         )
         .unwrap()
         .results;
@@ -1016,7 +962,7 @@ mod tests {
     // T-194: vec_search ranks the chunk with the closer embedding first
     #[test]
     fn vec_search_ranks_closer_embedding_first() {
-        use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
+        use crate::embedding::{ChunkedEmbedding, EMBEDDING_DIMS};
 
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
@@ -1050,7 +996,6 @@ mod tests {
             10,
             Timestamp::now(),
             &SearchFilter::default(),
-            None,
         )
         .unwrap()
         .results;
@@ -1070,7 +1015,7 @@ mod tests {
     // T-195: vec_search deduplicates chunks and keeps only the best sub-embedding
     #[test]
     fn maxsim_dedup_selects_best_sub_embedding() {
-        use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
+        use crate::embedding::{ChunkedEmbedding, EMBEDDING_DIMS};
 
         let db = Db::open_memory().unwrap();
         setup_db_with_posts(&db);
@@ -1108,7 +1053,6 @@ mod tests {
             10,
             Timestamp::now(),
             &SearchFilter::default(),
-            None,
         )
         .unwrap()
         .results;
@@ -1140,7 +1084,7 @@ mod tests {
     // T-105: MaxSim selects the sub-embedding with the lower distance (closer to query)
     #[test]
     fn vec_search_maxsim_picks_closer_sub_embedding() {
-        use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
+        use crate::embedding::{ChunkedEmbedding, EMBEDDING_DIMS};
 
         let db = Db::open_memory().unwrap();
         let body = "# Rust\nOwnership and borrowing";
@@ -1341,7 +1285,6 @@ mod tests {
                 category: Some("backend"),
                 ..Default::default()
             },
-            None,
         )
         .unwrap()
         .results;
@@ -1392,17 +1335,9 @@ mod tests {
             updated_after: Some(date_utc("2025-03-01")),
             ..Default::default()
         };
-        let results = hybrid_search(
-            db.conn(),
-            "ガイド",
-            None,
-            10,
-            Timestamp::now(),
-            &filter,
-            None,
-        )
-        .unwrap()
-        .results;
+        let results = hybrid_search(db.conn(), "ガイド", None, 10, Timestamp::now(), &filter)
+            .unwrap()
+            .results;
 
         assert_eq!(results.len(), 1, "only the newer post should be returned");
         assert_eq!(results[0].post_number, 2);
@@ -1418,17 +1353,9 @@ mod tests {
             updated_before: Some(date_utc("2025-03-01")),
             ..Default::default()
         };
-        let results = hybrid_search(
-            db.conn(),
-            "ガイド",
-            None,
-            10,
-            Timestamp::now(),
-            &filter,
-            None,
-        )
-        .unwrap()
-        .results;
+        let results = hybrid_search(db.conn(), "ガイド", None, 10, Timestamp::now(), &filter)
+            .unwrap()
+            .results;
 
         assert_eq!(results.len(), 1, "only the older post should be returned");
         assert_eq!(results[0].post_number, 1);
@@ -1446,17 +1373,9 @@ mod tests {
             updated_before: Some(date_utc("2025-03-01")),
             ..Default::default()
         };
-        let results = hybrid_search(
-            db.conn(),
-            "ガイド",
-            None,
-            10,
-            Timestamp::now(),
-            &filter,
-            None,
-        )
-        .unwrap()
-        .results;
+        let results = hybrid_search(db.conn(), "ガイド", None, 10, Timestamp::now(), &filter)
+            .unwrap()
+            .results;
 
         assert_eq!(
             results.len(),
@@ -1478,17 +1397,9 @@ mod tests {
             updated_before: Some(date_utc("2025-03-01")),
             ..Default::default()
         };
-        let results = hybrid_search(
-            db.conn(),
-            "ガイド",
-            None,
-            10,
-            Timestamp::now(),
-            &filter,
-            None,
-        )
-        .unwrap()
-        .results;
+        let results = hybrid_search(db.conn(), "ガイド", None, 10, Timestamp::now(), &filter)
+            .unwrap()
+            .results;
         assert_eq!(
             results.len(),
             1,
@@ -1508,110 +1419,13 @@ mod tests {
             updated_after: Some(date_utc("2025-03-01")),
             ..Default::default()
         };
-        let results = hybrid_search(
-            db.conn(),
-            "ガイド",
-            None,
-            10,
-            Timestamp::now(),
-            &filter,
-            None,
-        )
-        .unwrap()
-        .results;
+        let results = hybrid_search(db.conn(), "ガイド", None, 10, Timestamp::now(), &filter)
+            .unwrap()
+            .results;
         assert_eq!(
             results.len(),
             1,
             "updated_after cutoff day is inclusive against T-suffixed timestamps"
-        );
-    }
-
-    // T-107: hybrid_search with MockReranker applies cross-encoder scores to results
-    #[test]
-    fn hybrid_search_reranker_applies_cross_encoder_scores() {
-        use rurico::reranker::MockReranker;
-
-        let db = Db::open_memory().unwrap();
-        setup_db_with_posts(&db);
-
-        let reranker = MockReranker::with_score(0.99);
-        let results = hybrid_search(
-            db.conn(),
-            "認証の仕組み",
-            None,
-            10,
-            Timestamp::now(),
-            &SearchFilter::default(),
-            Some(&reranker),
-        )
-        .unwrap()
-        .results;
-        assert!(!results.is_empty(), "reranker search should return results");
-        for r in &results {
-            assert!(
-                r.score >= 0.99,
-                "score should be cross-encoder (0.99) × recency boost (≥1.0); got {}",
-                r.score
-            );
-        }
-    }
-
-    // T-221: hybrid_search with a failing reranker pushes a degraded-warning note
-    // symmetric with the vec_search failure path so AI agents see the same
-    // `warnings[]` signal regardless of which hybrid component degraded.
-    #[test]
-    fn hybrid_search_failing_reranker_pushes_warning() {
-        use rurico::reranker::{RankedResult, Rerank, RerankerError};
-
-        struct FailingReranker;
-
-        impl Rerank for FailingReranker {
-            fn score(&self, _query: &str, _document: &str) -> Result<f32, RerankerError> {
-                Err(RerankerError::Inference(
-                    "forced failure for T-221".to_owned(),
-                ))
-            }
-            fn score_batch(&self, _pairs: &[(&str, &str)]) -> Result<Vec<f32>, RerankerError> {
-                Err(RerankerError::Inference(
-                    "forced failure for T-221".to_owned(),
-                ))
-            }
-            fn rerank(
-                &self,
-                _query: &str,
-                _documents: &[&str],
-            ) -> Result<Vec<RankedResult>, RerankerError> {
-                Err(RerankerError::Inference(
-                    "forced failure for T-221".to_owned(),
-                ))
-            }
-        }
-
-        let db = Db::open_memory().unwrap();
-        setup_db_with_posts(&db);
-
-        let reranker = FailingReranker;
-        let output = hybrid_search(
-            db.conn(),
-            "認証の仕組み",
-            None,
-            10,
-            Timestamp::now(),
-            &SearchFilter::default(),
-            Some(&reranker),
-        )
-        .unwrap();
-        assert!(
-            !output.results.is_empty(),
-            "fallback path should still produce results"
-        );
-        assert!(
-            output
-                .warnings
-                .iter()
-                .any(|w| w.contains("reranker failed") && w.contains("falling back")),
-            "expected warnings to include reranker failure note, got: {:?}",
-            output.warnings
         );
     }
 }

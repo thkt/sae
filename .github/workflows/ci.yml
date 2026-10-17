@@ -21,6 +21,7 @@ jobs:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
         with:
           persist-credentials: false
+          submodules: recursive
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
@@ -62,13 +63,17 @@ jobs:
     # branches) cannot merge untested. No overall-percent floor (which would
     # flag existing unreachable code); no base-vs-PR double measurement.
     # Rationale: ported from yomu (Issue #223), THRESHOLDS.md "Coverage".
-    # Runs on macos like the test job: the rurico dependency pulls mlx-sys
-    # (MLX FFI), which needs BLAS + Apple silicon and cannot build on Linux.
+    # Runs on macos like the test job to exercise the native Metal build.
     # --features test-support mirrors the test job (hidden-seam tests) so
     # coverage matches what is tested.
     runs-on: macos-latest
     timeout-minutes: 30
     if: github.event_name == 'pull_request'
+    env:
+      SAE_MODEL_DIR: ${{ runner.temp }}/sae-coverage-model
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
+      CARGO_PROFILE_TEST_DEBUG: "0"
     permissions:
       contents: read
 
@@ -77,6 +82,7 @@ jobs:
         with:
           persist-credentials: false
           fetch-depth: 0
+          submodules: recursive
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@e97e2d8cc328f1b50210efc529dca0028893a2d9 # stable
@@ -92,8 +98,13 @@ jobs:
         with:
           tool: cargo-llvm-cov
 
-      - name: Generate lcov coverage
-        run: cargo llvm-cov --features test-support --lcov --output-path lcov.info
+      - name: Prepare pinned public model for native coverage
+        run: |
+          cargo llvm-cov clean --workspace
+          cargo llvm-cov run --no-report --features test-support --example prepare_model
+
+      - name: Generate lcov coverage including real native contracts
+        run: cargo llvm-cov --no-clean --features test-support --lcov --output-path lcov.info -- --include-ignored --test-threads=1
 
       - name: Diff coverage gate (changed lines >= 95%)
         run: |

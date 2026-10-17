@@ -10,7 +10,7 @@
 //! envelopes ([`SuccessEnvelope`] / [`ErrorEnvelope`]) emitted when
 //! `--json` is set.
 
-use amici::cli::exit_code::codes;
+use crate::compat::codes;
 use serde::Serialize;
 
 /// JSON-serializable error classification per ADR-0060 / ADR-0066 Group 2.
@@ -33,8 +33,7 @@ pub(crate) enum ErrorCode {
 }
 
 impl ErrorCode {
-    /// Delegates to `amici::cli::exit_code::codes::*` so the sysexits numbers
-    /// are single-sourced in amici; T-EN002 still pins them as a regression net.
+    /// Uses the CLI sysexits constants; T-EN002 pins the wire values.
     pub(crate) fn exit_code(self) -> u8 {
         match self {
             Self::UsageError => codes::USAGE,

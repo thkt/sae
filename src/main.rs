@@ -6,16 +6,19 @@ use std::io::{ErrorKind, stdout};
 use std::iter;
 use std::process::ExitCode;
 
-use amici::cli::exit_code::{CliError, codes};
-use amici::cli::{exit_error, hint_arrow, try_expand_shorthand};
-use amici::logging::init_subscriber;
 use clap::{Parser, Subcommand};
 #[cfg(feature = "test-support")]
 use sae::client::ClientError;
+use sae::compat::init_subscriber;
+use sae::compat::{CliError, codes};
+use sae::compat::{exit_error, hint_arrow, try_expand_shorthand};
 use sae::config::Config;
+use sae::index::{migrate, rollback};
 use sae::io::write_output;
+use sae::model::handle_probe_if_needed;
 use sae::tools::{CreateArgs, Sae, SaeError, SearchArgs, UpdateArgs};
 use sae::{CommandOutput, render_error, render_parse_error, render_success};
+use tokio::task::spawn_blocking;
 
 #[derive(Parser)]
 #[command(name = "sae", about = "esa semantic search CLI")]
@@ -161,7 +164,7 @@ Examples:
     TestForceUnknown,
     /// Hidden test seam: force `SaeError::BackendUnavailable` so
     /// `tests/cli_integration.rs` can pin the INTERNAL (70) envelope for the
-    /// MLX backend missing path on a hermetic spawn (#127 CHX-001).
+    /// native backend missing path on a hermetic spawn (#127 CHX-001).
     /// `test-support` feature only.
     #[cfg(feature = "test-support")]
     #[command(name = "__test_force_backend_unavailable", hide = true)]
@@ -196,6 +199,10 @@ Examples:
 enum ModelCommand {
     /// Download embedding model from Hugging Face Hub
     Download,
+    /// Re-embed a consistent local snapshot with Gemma, then activate it
+    Migrate { team: String },
+    /// Restore the previous local index selection
+    Rollback { team: String },
 }
 
 // User-facing subcommand list, used as the `candidates` array for
@@ -274,7 +281,15 @@ where
 async fn run(cli: Cli, config: Config) -> Result<CommandOutput, SaeError> {
     if let Command::Model { command } = cli.command {
         return match command {
-            ModelCommand::Download => Sae::model_download(),
+            ModelCommand::Migrate { team } => spawn_blocking(move || migrate(&config, &team))
+                .await
+                .map_err(|e| SaeError::Internal(format!("Migration task failed: {e}")))?,
+            ModelCommand::Rollback { team } => rollback(&config, &team),
+            ModelCommand::Download => {
+                spawn_blocking(Sae::model_download).await.map_err(|error| {
+                    SaeError::Internal(format!("Model download task failed: {error}"))
+                })?
+            }
         };
     }
     let sae = Sae::new(config);
@@ -363,7 +378,7 @@ fn handle_parse_error(e: &clap::Error, json_mode: bool) -> ExitCode {
 
 #[tokio::main]
 async fn main() -> ExitCode {
-    rurico::handle_probe_if_needed();
+    handle_probe_if_needed();
 
     init_subscriber("sae=info");
 
@@ -705,6 +720,7 @@ mod tests {
         match cli.command {
             Command::Model { command } => match command {
                 ModelCommand::Download => {}
+                other => panic!("expected Download, got {other:?}"),
             },
             other => panic!("expected Model {{ Download }}, got {other:?}"),
         }
@@ -728,6 +744,7 @@ mod tests {
         match cli.command {
             Command::Model { command } => match command {
                 ModelCommand::Download => {}
+                other => panic!("expected Download, got {other:?}"),
             },
             other => panic!("expected Model {{ Download }}, got {other:?}"),
         }

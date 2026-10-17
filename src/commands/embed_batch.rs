@@ -1,4 +1,4 @@
-use rurico::embed::ChunkedEmbedding;
+use crate::embedding::ChunkedEmbedding;
 
 use crate::storage;
 use crate::storage::embed::insert_new_embeddings;
@@ -85,8 +85,8 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::{ChunkedEmbedding, EMBEDDING_DIMS};
     use crate::storage::{self, Db};
-    use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
 
     fn db_with_chunks(n: u32) -> Db {
         let db = Db::open_memory().unwrap();

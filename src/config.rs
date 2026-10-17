@@ -2,7 +2,8 @@ use std::fs;
 use std::io;
 use std::path::PathBuf;
 
-use amici::cli::env_lookup;
+use crate::compat::env_lookup;
+use crate::index::resolve_at;
 use serde::Deserialize;
 
 #[derive(Debug, Clone, Deserialize)]
@@ -73,7 +74,7 @@ impl Config {
     }
 
     pub fn team_db_path(&self, team: &str) -> Result<PathBuf, ConfigError> {
-        Ok(data_dir()?.join(format!("{team}.db")))
+        resolve_at(&data_dir()?, team)
     }
 }
 

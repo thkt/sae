@@ -1,9 +1,17 @@
+#[cfg(not(target_endian = "little"))]
+compile_error!("sae sqlite-vec indexes require a little-endian target");
+
 pub(crate) mod chunker;
 pub mod client;
 pub mod commands;
+pub mod compat;
 pub mod config;
+pub mod embedding;
 pub mod envelope;
+pub mod index;
 pub mod io;
+pub mod model;
+mod native;
 pub(crate) mod output;
 pub(crate) mod redact;
 pub mod storage;
@@ -22,7 +30,9 @@ pub use tools::{Sae, SaeError};
 /// binary built with `cargo install` never exposes this symbol.
 #[cfg(feature = "test-support")]
 pub fn __test_search_with_warnings() -> Result<CommandOutput, SaeError> {
-    let warnings = vec!["reranker failed (forced for test), falling back to RRF order".to_owned()];
+    let warnings = vec![
+        "search component unavailable (forced for test), falling back to text search".to_owned(),
+    ];
     let result = storage::SearchResult {
         post_number: 1,
         post_name: "test post".to_owned(),
