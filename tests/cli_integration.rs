@@ -939,16 +939,19 @@ fn real_model_download_reuses_verified_cache_and_reports_hardware_result() {
     }
     // Release fixture weights before the child loads its own real model.
     let home = tempdir().unwrap();
+    let probe_trace = home.path().join("probe-trace.log");
     let output = sae_command_with_binary(home.path(), Path::new(env!("CARGO_BIN_EXE_sae")))
         .env("SAE_MODEL_DIR", &artifacts)
+        .env("__SAE_TEST_PROBE_TRACE", &probe_trace)
         .args(["--json", "model", "download"])
         .output()
         .unwrap();
     assert_eq!(
         output.status.code(),
         Some(if gpu { 0 } else { 70 }),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
+        "stderr={}; probe_trace={}",
+        String::from_utf8_lossy(&output.stderr),
+        fs::read_to_string(&probe_trace).unwrap_or_else(|error| format!("unavailable: {error}"))
     );
     if gpu {
         let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
