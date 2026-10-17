@@ -186,9 +186,9 @@ Examples:
     #[command(name = "__test_force_client_api_404", hide = true)]
     TestForceClientApi404,
     /// Hidden test seam: emit a `CommandOutput` whose `notes[]` contains a
-    /// reranker-failure warning so `tests/cli_integration.rs` can pin the
+    /// search-component warning so `tests/cli_integration.rs` can pin the
     /// `--json` envelope wiring for #140 (storage warnings → envelope notes)
-    /// without seeding a SQLite DB or loading a real reranker. `test-support`
+    /// without seeding a SQLite DB or loading a native model. `test-support`
     /// feature only.
     #[cfg(feature = "test-support")]
     #[command(name = "__test_force_search_warning", hide = true)]

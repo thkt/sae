@@ -2,9 +2,7 @@ use std::io;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-#[cfg(test)]
-use crate::compat::ModelInitError;
-use crate::compat::{CliError, ProbeError, embed_with_spinners, env_lookup};
+use crate::compat::{CliError, embed_with_spinners};
 use crate::embedding::Embed;
 #[cfg(feature = "test-support")]
 use crate::embedding::MockEmbedder;
@@ -104,11 +102,6 @@ pub struct Sae {
 
 impl Sae {
     pub fn new(config: Config) -> Self {
-        Self::with_env(config, env_lookup())
-    }
-
-    pub(crate) fn with_env(config: Config, get_var: impl Fn(&str) -> Option<String>) -> Self {
-        let _ = get_var; // SAE_RERANK is no longer consulted.
         Self { config }
     }
 
@@ -233,10 +226,10 @@ pub enum SaeError {
     Io(#[from] io::Error),
     #[error(transparent)]
     ModelDownload(#[from] ModelDownloadError),
-    /// Carries the typed `ProbeError` recovered from `ModelInitError`'s source
-    /// chain so [`Self::error_code`] can classify per-variant (ADR-0066 Group 2).
-    #[error(transparent)]
-    Probe(#[from] ProbeError),
+    /// Verified Gemma artifacts are corrupt or the native model failed to load.
+    /// Maps to `INTERNAL` (sysexits 70), preserving the CLI load-failure contract.
+    #[error("model load failed: {0}")]
+    ModelLoadFailed(String),
     /// User action required (e.g., run `sae index` or `sae model download` first,
     /// or pass a missing flag). Maps to `USAGE_ERROR` (sysexits 64).
     #[error("{0}")]
@@ -250,7 +243,7 @@ pub enum SaeError {
     /// (was split between 104 and 70 before #127 CHX-001).
     #[error("Gemma native backend is unavailable")]
     BackendUnavailable,
-    /// The embedding model is absent or failed to load when an
+    /// The embedding model is not installed when an
     /// embedding-dependent command (e.g. `sae index`) needs to embed pending
     /// chunks. Maps to `TEMP_FAIL` (sysexits 75) and is retryable because
     /// `sae model download` clears it — distinct from the non-retryable
@@ -344,15 +337,7 @@ impl SaeError {
             // Programmer-detectable invariant violation (embedder bug, etc.).
             // Routed to `INTERNAL` so it stays distinguishable from anyhow-swallow
             // `Other(=UNKNOWN)` per ADR-0066 L136 (#127).
-            Self::Internal(_) => ErrorCode::Internal,
-            // PROBE_EXIT_* (3–8) wire codes stay sealed inside ProbeError;
-            // only the sysexits classification reaches the process exit code.
-            Self::Probe(
-                ProbeError::HandlerNotInstalled
-                | ProbeError::ModelLoadFailed { .. }
-                | ProbeError::SetupRejected { .. },
-            ) => ErrorCode::Internal,
-            Self::Probe(ProbeError::SubprocessFailed(_)) => ErrorCode::IoError,
+            Self::Internal(_) | Self::ModelLoadFailed(_) => ErrorCode::Internal,
             // Remaining Client/Sync (Network connect/timeout, MaxRetries) are retry-eligible.
             // Explicit arms (no wildcard) so future client variants force a compile-time review.
             Self::Client(_) | Self::Sync(_) => ErrorCode::TempFailure,
@@ -418,7 +403,7 @@ impl SaeError {
             | Self::Json(_)
             | Self::Io(_)
             | Self::ModelDownload(_)
-            | Self::Probe(_)
+            | Self::ModelLoadFailed(_)
             | Self::Internal(_)
             | Self::Other(_) => None,
         }
@@ -529,38 +514,11 @@ impl CliError for SaeError {
     }
 }
 
-/// Reverse [`From<ProbeError> for ModelInitError`] so per-variant `ProbeError`
-/// routing in [`SaeError::error_code`] stays available for legacy error clients.
-/// Returns `None` only when `Backend.source` carries a non-`ProbeError`
-/// payload — kept open so an unrelated backend error does not silently
-/// misclassify.
-///
-/// Its only non-test caller is the real-model [`load_embedder`], `cfg`'d out
-/// under `--features test-support`. The routing logic stays exercised by
-/// T-332..T-334; `allow(dead_code)` covers the test-support build where the
-/// production caller is absent.
-#[cfg(test)]
-fn extract_probe_error(init_err: ModelInitError) -> Option<ProbeError> {
-    match init_err {
-        ModelInitError::ModelCorrupt { reason } => Some(ProbeError::ModelLoadFailed { reason }),
-        ModelInitError::Backend {
-            source: Some(boxed),
-            ..
-        } => boxed.downcast::<ProbeError>().ok().map(|b| *b),
-        ModelInitError::Backend {
-            source: None,
-            message,
-        } => Some(ProbeError::SubprocessFailed(message)),
-    }
-}
-
 /// Loads the verified Gemma model only when pending chunks need embedding.
 #[cfg(not(feature = "test-support"))]
 pub(crate) fn load_embedder() -> Result<Arc<dyn Embed>, SaeError> {
     let cached = model::cached_artifacts().map_err(|error| {
-        SaeError::Probe(ProbeError::ModelLoadFailed {
-            reason: format!("Failed to validate model cache: {error}"),
-        })
+        SaeError::ModelLoadFailed(format!("Failed to validate model cache: {error}"))
     })?;
     if cached.is_none() {
         return Err(SaeError::EmbedderUnavailable(
@@ -573,9 +531,9 @@ pub(crate) fn load_embedder() -> Result<Arc<dyn Embed>, SaeError> {
         Err(model::DegradedReason::NotInstalled) => Err(SaeError::EmbedderUnavailable(
             "embedding model not installed".to_owned(),
         )),
-        Err(_) => Err(SaeError::Probe(ProbeError::ModelLoadFailed {
-            reason: "Gemma model failed validation or isolated loading".to_owned(),
-        })),
+        Err(_) => Err(SaeError::ModelLoadFailed(
+            "Gemma model failed validation or isolated loading".to_owned(),
+        )),
     }
 }
 
@@ -861,21 +819,6 @@ mod tests {
         use rusqlite::ErrorCode;
         let busy = sqlite_failure(ErrorCode::DatabaseBusy, 5);
         assert_code(&SaeError::Storage(StorageError::Db(busy)), codes::TEMP_FAIL);
-    }
-
-    // The removed reranker setting must not initialize a second model path.
-    #[test]
-    fn with_env_does_not_read_removed_reranker_setting() {
-        let looked_up = Cell::new(false);
-        let _sae = Sae::with_env(Config::default(), |key| {
-            if key == "SAE_RERANK" {
-                looked_up.set(true);
-                Some("1".into())
-            } else {
-                None
-            }
-        });
-        assert!(!looked_up.get(), "SAE_RERANK must have no effect");
     }
 
     // T-310: input_no_data_for_team_pins_next_step_index_hint
@@ -1204,112 +1147,20 @@ mod tests {
         }
     }
 
-    // T-326: every ProbeError variant routes per ADR-0066 Group 2
+    // Gemma validation and isolated native loading failures remain terminal.
     #[test]
-    fn exit_code_probe_variants_route_per_adr_0066() {
-        use crate::compat::SetupReason;
-        let internal_cases = [
-            ProbeError::HandlerNotInstalled,
-            ProbeError::ModelLoadFailed {
-                reason: "weight tensor missing".into(),
-            },
-            ProbeError::SetupRejected {
-                reason: SetupReason::EnvIncomplete,
-            },
-            ProbeError::SetupRejected {
-                reason: SetupReason::CanonicalizeFailed,
-            },
-            ProbeError::SetupRejected {
-                reason: SetupReason::PathOutsideCache,
-            },
-            ProbeError::SetupRejected {
-                reason: SetupReason::CacheRootInvalid,
-            },
-        ];
-        for probe in internal_cases {
-            assert_code(&SaeError::Probe(probe), codes::INTERNAL);
-        }
-        assert_code(
-            &SaeError::Probe(ProbeError::SubprocessFailed(
-                "probe spawn failed: ENOENT".into(),
-            )),
-            codes::IO_ERR,
-        );
-    }
-
-    // T-330: PROBE_EXIT_* wire format (3-8) cannot leak through SaeError::exit_code.
-    // Wire codes encode rurico's internal IPC contract; surfacing them as the
-    // process exit code would confuse agents expecting sysexits classifications.
-    #[test]
-    fn exit_code_probe_setup_rejected_does_not_leak_wire_code() {
-        use crate::compat::SetupReason;
-        let reason = SetupReason::PathOutsideCache;
+    fn model_load_failure_preserves_internal_exit_and_error_envelope() {
+        let err = SaeError::ModelLoadFailed("checksum mismatch".into());
+        assert_code(&err, codes::INTERNAL);
+        let envelope = err.to_error_envelope(None);
+        assert_eq!(envelope.error.code, ErrorCode::Internal);
         assert_eq!(
-            reason.code(),
-            5,
-            "test premise: PathOutsideCache wire code is 5"
+            envelope.error.message,
+            "model load failed: checksum mismatch"
         );
-        let err = SaeError::Probe(ProbeError::SetupRejected { reason });
-        assert_eq!(
-            err.exit_code(),
-            ExitCode::from(codes::INTERNAL),
-            "wire code 5 must be sealed; exit must be INTERNAL (70)"
-        );
-        assert_ne!(
-            err.exit_code(),
-            ExitCode::from(5),
-            "PROBE_EXIT_PATH_OUTSIDE_CACHE (5) must not leak as the process exit code"
-        );
-    }
-
-    // T-331: extract_probe_error recovers ModelLoadFailed from ModelCorrupt.
-    #[test]
-    fn extract_probe_error_model_corrupt_maps_to_model_load_failed() {
-        let init = ModelInitError::ModelCorrupt {
-            reason: "checksum mismatch".into(),
-        };
-        let probe = extract_probe_error(init).expect("ModelCorrupt yields ProbeError");
-        match probe {
-            ProbeError::ModelLoadFailed { reason } => assert_eq!(reason, "checksum mismatch"),
-            other => panic!("expected ModelLoadFailed, got {other:?}"),
-        }
-    }
-
-    // T-332: extract_probe_error recovers the typed variant from Backend.source
-    #[test]
-    fn extract_probe_error_backend_with_source_recovers_typed_variant() {
-        let init: ModelInitError = ProbeError::HandlerNotInstalled.into();
-        let probe = extract_probe_error(init).expect("Backend with source yields ProbeError");
-        assert!(
-            matches!(probe, ProbeError::HandlerNotInstalled),
-            "expected HandlerNotInstalled, got {probe:?}"
-        );
-    }
-
-    // T-333: extract_probe_error maps source-less Backend to SubprocessFailed
-    // (round-trips From<ProbeError> for ModelInitError on SubprocessFailed).
-    #[test]
-    fn extract_probe_error_backend_without_source_maps_to_subprocess_failed() {
-        let init: ModelInitError = ProbeError::SubprocessFailed("spawn failed".into()).into();
-        let probe = extract_probe_error(init).expect("Backend message yields ProbeError");
-        match probe {
-            ProbeError::SubprocessFailed(msg) => assert_eq!(msg, "spawn failed"),
-            other => panic!("expected SubprocessFailed, got {other:?}"),
-        }
-    }
-
-    // T-334: extract_probe_error returns None for non-ProbeError sources so
-    // the Sae::embed Other fallback runs instead of misclassifying as probe.
-    #[test]
-    fn extract_probe_error_backend_with_non_probe_source_returns_none() {
-        let init = ModelInitError::Backend {
-            message: "MLX kernel launch failed".into(),
-            source: Some(Box::new(io::Error::other("MLX kernel launch failed"))),
-        };
-        assert!(
-            extract_probe_error(init).is_none(),
-            "non-ProbeError source must fall through to None so the Other fallback runs"
-        );
+        assert!(!envelope.error.retryable);
+        assert!(envelope.error.next_step.is_none());
+        assert!(envelope.error.candidates.is_empty());
     }
 
     // T-338: BackendUnavailable variant maps to INTERNAL (70) — mirrors

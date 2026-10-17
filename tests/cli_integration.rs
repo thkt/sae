@@ -174,8 +174,7 @@ fn malformed_date_with_json_emits_data_error_envelope() {
 // `error.code = "UNKNOWN"`. Pins the process-boundary contract for
 // `SaeError::Other` per ADR-0066 L136 (#127 OPS-005). The hidden
 // `__test_force_unknown` subcommand is the only hermetic UNKNOWN trigger;
-// production sites (MLX backend, opaque embedder errors, model cache check)
-// require real hardware / network state we cannot stage in tests.
+// opaque runtime embedding failures are otherwise dependent on inference state.
 #[cfg(feature = "test-support")]
 #[test]
 fn force_unknown_with_json_emits_unknown_envelope() {
@@ -203,7 +202,7 @@ fn force_unknown_with_json_emits_unknown_envelope() {
 
 // T-CI007: synthetic BackendUnavailable path exits 70 (INTERNAL) with
 // `error.code = "INTERNAL"`. Pins the BREAKING `104 → 70` routing for the
-// MLX backend missing path (#127 CHX-001) at the process boundary, mirroring
+// native backend missing path (#127 CHX-001) at the process boundary, mirroring
 // T-CI005's role for DATA_ERROR. Without this pin, the contract only lives in
 // unit tests (T-338 / T-342) and could regress silently across the
 // `error_code()` → `exit_code()` → process exit translation layers.
@@ -568,35 +567,62 @@ fn seed_search_db(home: &Path, legacy: bool) -> PathBuf {
 
 #[test]
 fn no_embed_search_reads_legacy_index_without_loading_corrupt_model_or_writing() {
+    use sae::storage::Db;
+
     let dir = tempdir().unwrap();
     write_config_with_teams(dir.path(), &["alpha"]);
     let path = seed_search_db(dir.path(), true);
+    {
+        let db = Db::open(&path).unwrap();
+        // Future dates clamp recency age to zero, so separate processes have
+        // identical scores while we compare SAE_RERANK values.
+        db.conn()
+            .execute("UPDATE posts SET updated_at='9999-01-01T00:00:00Z'", [])
+            .unwrap();
+        db.conn()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+    }
     let before = fs::read(&path).unwrap();
     let model = dir.path().join("corrupt-model");
     fs::create_dir(&model).unwrap();
     fs::write(model.join("model.gguf"), b"corrupt weights").unwrap();
     fs::write(model.join("tokenizer.json"), b"corrupt tokenizer").unwrap();
-    let output = sae_command(dir.path())
-        .env("SAE_MODEL_DIR", &model)
-        .env("SAE_RERANK", "1")
-        .args(["--json", "search", "認証", "--no-embed"])
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(envelope["degraded"], false);
-    assert_eq!(envelope["notes"], serde_json::json!([]));
-    assert!(String::from_utf8_lossy(&output.stdout).contains("認証ガイド"));
-    assert!(!String::from_utf8_lossy(&output.stderr).contains("checksum"));
-    assert_eq!(
-        fs::read(path).unwrap(),
-        before,
-        "search must preserve DB bytes"
-    );
+    let mut baseline = None;
+    for rerank in [None, Some("0"), Some("1"), Some("invalid")] {
+        let mut command = sae_command(dir.path());
+        command.env("SAE_MODEL_DIR", &model);
+        if let Some(value) = rerank {
+            command.env("SAE_RERANK", value);
+        }
+        let output = command
+            .args(["--json", "search", "認証", "--no-embed"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["degraded"], false);
+        assert_eq!(envelope["notes"], serde_json::json!([]));
+        assert!(String::from_utf8_lossy(&output.stdout).contains("認証ガイド"));
+        assert!(!String::from_utf8_lossy(&output.stderr).contains("checksum"));
+        if let Some(expected) = &baseline {
+            assert_eq!(
+                envelope, *expected,
+                "SAE_RERANK={rerank:?} must have no effect"
+            );
+        } else {
+            baseline = Some(envelope);
+        }
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            before,
+            "search must preserve DB bytes"
+        );
+    }
 }
 
 #[test]
@@ -671,11 +697,18 @@ fn migrate_without_model_keeps_local_source_and_returns_error_envelope() {
     let path = seed_search_db(dir.path(), true);
     let before = fs::read(&path).unwrap();
     let output = sae_command(dir.path())
+        .env("SAE_MODEL_DIR", dir.path().join("missing-model"))
         .args(["--json", "model", "migrate", "alpha"])
         .output()
         .unwrap();
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(75));
     let envelope = parse_stderr_envelope(&String::from_utf8_lossy(&output.stderr));
+    assert_eq!(envelope["error"]["code"], "TEMP_FAILURE");
+    assert_eq!(envelope["error"]["retryable"], true);
+    assert_eq!(
+        envelope["error"]["next_step"],
+        "Run `sae model download` to fetch the embedding model."
+    );
     assert!(envelope["error"]["message"].is_string());
     assert_eq!(fs::read(&path).unwrap(), before);
     assert!(!path.with_file_name("alpha.active.json").exists());

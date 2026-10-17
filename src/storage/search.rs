@@ -589,7 +589,7 @@ mod tests {
         assert_eq!(normalize_punctuation(".NET"), ".NET");
         assert_eq!(normalize_punctuation("user@example"), "user@example");
 
-        // : and - are stripped (rurico double-quoting bug workaround)
+        // Colons and hyphens are stripped before FTS token quoting.
         assert_eq!(normalize_punctuation("std::io"), "std io");
         assert_eq!(normalize_punctuation("rate-limit"), "rate limit");
     }
@@ -625,7 +625,7 @@ mod tests {
             storage::rechunk_post(db.conn(), *num, body).unwrap();
         }
 
-        // C++ should match post 10 (+ is preserved, no rurico quoting issue)
+        // C++ should match post 10 because plus signs remain in FTS tokens.
         let hits = fts_search(db.conn(), "C++", 10, &SearchFilter::default()).unwrap();
         assert!(!hits.is_empty(), "C++ should match");
         assert!(hits.iter().any(|h| h.post_number == 10));
