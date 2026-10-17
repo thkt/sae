@@ -1,4 +1,3 @@
-// Pure helper retained from the previous dependency to preserve behavior.
 use std::io::{IsTerminal, Write, stderr};
 use std::sync::{
     Arc, Mutex,

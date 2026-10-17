@@ -1,4 +1,3 @@
-// Pure helper retained from the previous dependency to preserve behavior.
 use rusqlite::Connection;
 
 use super::query_normalize::{QueryNormalizationConfig, normalize_for_fts};
@@ -144,9 +143,7 @@ fn expand_token_via_vocab(
     }
 }
 
-// SQLite reports missing tables via `SqliteFailure` with an English `errmsg`
-// containing "no such table". The extended code (`SQLITE_ERROR = 1`) covers
-// many other causes, so the message substring is the only portable signal.
+// SQLite has no distinct missing-table code, so inspect its error message.
 fn is_missing_table_error(err: &rusqlite::Error) -> bool {
     matches!(
         err,
@@ -184,7 +181,6 @@ pub(crate) fn fts_expand_short_terms(
 
     let mut parts = Vec::new();
     for token in query.as_str().split_whitespace() {
-        // Length check covers AND/NOT (3 chars); operator guard adds OR (2 chars).
         if token.chars().count() >= 3 || is_fts5_operator(token) {
             parts.push(fts_quote(token));
             continue;

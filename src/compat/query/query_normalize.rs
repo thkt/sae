@@ -1,5 +1,3 @@
-// Pure helper retained from the previous dependency to preserve behavior.
-
 use serde::{Deserialize, Serialize};
 use unicode_normalization::UnicodeNormalization;
 

@@ -4,11 +4,6 @@ use crate::storage::{SearchResult, SyncStatus, TeamStatus};
 use crate::sync::HarvestResult;
 use crate::tools::SaeError;
 
-/// Renders the combined `index` / `rebuild` result: the harvest summary plus
-/// the embed outcome. `embedded` is `Some(n)` when chunks were embedded this
-/// run (omitted from markdown when zero), `None` when nothing was pending. The
-/// count lives under a nested `embed` key so it never collides with harvest
-/// fields, keeping the `--json` envelope shape stable.
 pub(crate) fn index(
     harvest: &HarvestResult,
     embedded: Option<u32>,
@@ -69,11 +64,12 @@ pub(crate) fn search(
         notes.push("semantic search unavailable, falling back to FTS".to_owned());
     }
     notes.extend(search_warnings.iter().cloned());
-    if notes.is_empty() {
-        Ok(CommandOutput::ok(markdown, data))
-    } else {
-        Ok(CommandOutput::with_notes(markdown, data, true, notes))
-    }
+    Ok(CommandOutput::with_notes(
+        markdown,
+        data,
+        !notes.is_empty(),
+        notes,
+    ))
 }
 
 pub(crate) fn get(post: &EsaPost, with_body: bool) -> Result<CommandOutput, SaeError> {
@@ -132,8 +128,6 @@ pub(crate) fn action_result(action: &str, post: &EsaPost) -> Result<CommandOutpu
     Ok(CommandOutput::ok(markdown, data))
 }
 
-/// Dry-run is always envelope-wrapped (consistent shape regardless of `--json`).
-/// `markdown` carries the pretty-printed payload for default-mode visibility.
 pub(crate) fn dry_run(payload: &serde_json::Value) -> Result<CommandOutput, SaeError> {
     let markdown = serde_json::to_string_pretty(payload)?;
     Ok(CommandOutput::ok(markdown, payload.clone()))
@@ -279,7 +273,6 @@ mod tests {
         }
     }
 
-    // T-079: status human-readable empty list → empty markdown
     #[test]
     fn status_human_empty_returns_empty_string() {
         let out = status(&[]).unwrap();
@@ -289,7 +282,6 @@ mod tests {
         );
     }
 
-    // T-080: status human-readable synced team → expected lines
     #[test]
     fn status_human_synced_contains_expected_lines() {
         let out = status(&[make_synced("team-a", 10)]).unwrap();
@@ -298,9 +290,6 @@ mod tests {
         assert!(out.markdown.contains("Last sync: 2025-01-01 00:00:00"));
     }
 
-    // T-415: status human-readable surfaces the pending-embed hint when a
-    // synced team has unembedded chunks (covers the `pending_embed > 0` branch
-    // that points the user at `sae index`).
     #[test]
     fn status_human_synced_with_pending_embed_shows_index_hint() {
         let ts = TeamStatus {
@@ -321,7 +310,6 @@ mod tests {
         );
     }
 
-    // T-081: status human-readable not-synced team → expected lines
     #[test]
     fn status_human_not_synced_contains_expected_lines() {
         let out = status(&[make_not_synced("team-b")]).unwrap();
@@ -339,9 +327,6 @@ mod tests {
         }
     }
 
-    // T-407: index merges harvest stats with the embed result — the embed count
-    // is appended to markdown and nested under a dedicated `embed` data key,
-    // kept separate from harvest fields so the envelope shape stays stable (#3).
     #[test]
     fn index_merges_harvest_and_embed_result() {
         let out = index(&make_harvest(2), Some(3)).unwrap();
@@ -359,8 +344,6 @@ mod tests {
         assert_eq!(out.data["embed"]["chunks_embedded"], 3);
     }
 
-    // T-408: index with nothing to embed (pending == 0) omits the embed line
-    // but keeps the `embed` key at zero so agents read a stable shape.
     #[test]
     fn index_without_pending_embed_keeps_zero_embed_key() {
         let out = index(&make_harvest(0), None).unwrap();
@@ -377,7 +360,6 @@ mod tests {
         assert_eq!(out.data["embed"]["chunks_embedded"], 0);
     }
 
-    // T-085: status error variant — error field displayed
     #[test]
     fn status_error_variant_serializes_message() {
         let statuses = vec![make_error("broken", "db missing")];
@@ -387,7 +369,6 @@ mod tests {
         assert_eq!(v[0]["error"], "db missing");
     }
 
-    // T-086: status with checkpoint (interrupted sync) — last_page serialized
     #[test]
     fn status_synced_with_checkpoint_serializes_last_page() {
         let ts = TeamStatus {
@@ -410,7 +391,6 @@ mod tests {
         assert_eq!(v["sync_state"]["last_page"], 3);
     }
 
-    // T-087: search data includes search_mode hybrid
     #[test]
     fn search_json_hybrid_includes_search_mode() {
         let out = search(&[], "test", true, false, &[]).unwrap();
@@ -418,14 +398,12 @@ mod tests {
         assert!(out.data["results"].is_array());
     }
 
-    // T-088: search data includes search_mode fts
     #[test]
     fn search_json_fts_includes_search_mode() {
         let out = search(&[], "test", false, false, &[]).unwrap();
         assert_eq!(out.data["search_mode"], "fts");
     }
 
-    // T-089: search human fts fallback shows notice
     #[test]
     fn search_human_fts_fallback_shows_notice() {
         let results = vec![make_result(1, "Test", None, 0.5, "", MatchSource::Fts)];
@@ -433,7 +411,6 @@ mod tests {
         assert!(out.markdown.contains("semantic search unavailable"));
     }
 
-    // T-090: search human hybrid does not show fallback notice
     #[test]
     fn search_human_hybrid_no_fallback_notice() {
         let results = vec![make_result(1, "Test", None, 0.5, "", MatchSource::Fts)];
@@ -441,7 +418,6 @@ mod tests {
         assert!(!out.markdown.contains("semantic search unavailable"));
     }
 
-    // T-260: search degraded fallback populates notes
     #[test]
     fn search_degraded_fallback_populates_notes() {
         let out = search(&[], "q", false, true, &[]).unwrap();
@@ -453,7 +429,6 @@ mod tests {
         assert!(out.notes[0].contains("semantic search unavailable"));
     }
 
-    // T-261: search no-embed (FTS without load failure) leaves notes empty
     #[test]
     fn search_no_embed_does_not_degrade() {
         let out = search(&[], "q", false, false, &[]).unwrap();
@@ -461,9 +436,6 @@ mod tests {
         assert!(out.notes.is_empty());
     }
 
-    // T-262: non-empty search_warnings alone (no embedder failure) sets degraded
-    // and surfaces the warnings as notes. Pins #140 wiring: storage warnings
-    // reach the envelope notes[] without depending on embedder_load_failed.
     #[test]
     fn search_warnings_alone_set_degraded_and_populate_notes() {
         let warnings = vec!["vector search failed (boom), falling back to FTS".to_owned()];
@@ -480,9 +452,6 @@ mod tests {
         );
     }
 
-    // T-263: embedder_load_failed + non-empty search_warnings produces ordered
-    // notes (embedder note first, then storage warnings). Order pinned so
-    // agents that read notes[0] keep the same upstream-first semantics.
     #[test]
     fn search_warnings_with_embedder_failure_preserve_order() {
         let warnings = vec!["vector search failed (boom), falling back to FTS".to_owned()];
@@ -501,15 +470,12 @@ mod tests {
         );
     }
 
-    // T-401: format_post_frontmatter typical post → frontmatter snapshot.
-    // Out of scope: wip:true / updated_by != created_by (separate pin if needed).
     #[test]
     fn format_post_frontmatter_typical_post_snapshot() {
         let post = make_post();
         insta::assert_snapshot!(format_post_frontmatter(&post));
     }
 
-    // T-402: search hybrid with section_title present vs absent → markdown snapshot.
     #[test]
     fn search_semantic_hybrid_two_results_snapshot() {
         let results = vec![

@@ -137,28 +137,24 @@ mod tests {
     use std::io::Cursor;
     use tempfile::tempdir;
 
-    // T-060: resolve_body(Some, None) → inline body
     #[test]
     fn resolve_body_inline_text() {
         let result = resolve_body(Some("inline text"), None).unwrap();
         assert_eq!(result.as_deref(), Some("inline text"));
     }
 
-    // T-061: resolve_body(None, None) → no body
     #[test]
     fn resolve_body_none_returns_none() {
         let result = resolve_body(None, None).unwrap();
         assert_eq!(result, None);
     }
 
-    // T-062: resolve_body with nonexistent file → error
     #[test]
     fn resolve_body_nonexistent_file_is_error() {
         let result = resolve_body(None, Some("/nonexistent/path.md"));
         assert!(result.is_err(), "nonexistent file should return error");
     }
 
-    // T-063: resolve_body_with_reader(`-`) reads from stdin
     #[test]
     fn resolve_body_with_reader_reads_stdin_when_dash() {
         let result = resolve_body_with_reader(None, Some("-"), &mut Cursor::new("本文\n")).unwrap();
@@ -169,7 +165,6 @@ mod tests {
         );
     }
 
-    // T-064: resolve_body_with_reader(`-`) with empty stdin → Some("")
     #[test]
     fn resolve_body_with_reader_empty_stdin_returns_empty_body() {
         let result = resolve_body_with_reader(None, Some("-"), &mut Cursor::new("")).unwrap();
@@ -180,7 +175,6 @@ mod tests {
         );
     }
 
-    // T-039: --body-file <tempfile> with create → file content becomes body
     #[test]
     fn body_file_reads_from_file() {
         let dir = tempdir().unwrap();
@@ -195,7 +189,6 @@ mod tests {
         );
     }
 
-    // T-040: --body-file - with create → stdin content becomes body
     #[test]
     fn body_file_dash_reads_from_stdin() {
         let mut stdin = Cursor::new("# Hello\nBody from stdin\n");
@@ -244,7 +237,6 @@ mod tests {
         }
     }
 
-    // T-310: create_via_client reflects API response into local DB
     #[tokio::test]
     async fn create_via_client_writes_through_to_local_db() {
         use wiremock::matchers::{method, path};
@@ -278,7 +270,6 @@ mod tests {
         assert_eq!(name, "Created Post", "post should be persisted locally");
     }
 
-    // T-311: update_via_client overwrites local row with the API response
     #[tokio::test]
     async fn update_via_client_overwrites_local_post() {
         use wiremock::matchers::{method, path};
@@ -318,7 +309,6 @@ mod tests {
         assert_eq!(name, "Renamed");
     }
 
-    // T-312: create_via_client succeeds even when db=None (write-through skipped)
     #[tokio::test]
     async fn create_via_client_works_without_db() {
         use wiremock::matchers::{method, path};

@@ -1,4 +1,3 @@
-//! Persistence contracts use only disposable databases and deterministic vectors.
 use sae::model::load_verified;
 use std::{fs, iter};
 
@@ -109,7 +108,6 @@ fn unmanifested_vectors_block_semantic_reads_and_appends_but_keep_fts() {
 
 #[test]
 fn each_manifest_contract_change_is_incompatible() {
-    // Every field contributes to query/document comparability or reproducibility.
     let base: serde_json::Value = serde_json::from_str(&storage::embedding_manifest()).unwrap();
     for field in [
         "version",
@@ -132,7 +130,6 @@ fn each_manifest_contract_change_is_incompatible() {
         add_chunked_embeddings(db.conn(), &[(id, embedding())]).unwrap();
         let mut altered = base.clone();
         let object = altered.as_object_mut().expect("manifest object");
-        // Storage may wrap the model spec along with chunk policy.
         let object = if object.contains_key(field) {
             object
         } else {
@@ -268,7 +265,6 @@ fn reopening_legacy_database_does_not_label_existing_vectors_as_gemma() {
     assert_eq!(vectors, 1);
 }
 
-/// Runs only with the pinned model installed into an isolated SAE_MODEL_DIR.
 #[test]
 #[ignore = "requires the pinned real Gemma artifacts; no network download"]
 fn real_gemma_japanese_code_and_long_documents_are_normalized_768_vectors() {

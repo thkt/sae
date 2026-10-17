@@ -1,5 +1,3 @@
-// Pure helper retained from the previous dependency to preserve behavior.
-
 use std::iter;
 
 use rusqlite::{Connection, Row, params_from_iter, types::ToSql};

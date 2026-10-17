@@ -109,7 +109,7 @@ fn find_headings(lines: &[&str]) -> Vec<(usize, String)> {
 
 fn parse_heading(line: &str) -> Option<String> {
     let trimmed = line.trim_start();
-    // Markdown spec: up to 3 spaces of indentation allowed
+    // Markdown permits at most three leading spaces.
     if line.len() - trimmed.len() > 3 {
         return None;
     }
@@ -129,7 +129,6 @@ fn parse_heading(line: &str) -> Option<String> {
 mod tests {
     use super::*;
 
-    // T-234: empty_body_returns_empty
     #[test]
     fn empty_body_returns_empty() {
         assert!(chunk_markdown("").is_empty());
@@ -137,7 +136,6 @@ mod tests {
         assert!(chunk_markdown("\n\n").is_empty());
     }
 
-    // T-235: no_headings_returns_full_chunk
     #[test]
     fn no_headings_returns_full_chunk() {
         let chunks = chunk_markdown("Just some text\nwithout headings");
@@ -146,7 +144,6 @@ mod tests {
         assert!(chunks[0].section_title.is_none());
     }
 
-    // T-128: three_headings_three_chunks
     #[test]
     fn three_headings_three_chunks() {
         let md = "# Introduction\nHello world\n# Details\nSome details\n# Conclusion\nGoodbye";
@@ -158,7 +155,6 @@ mod tests {
         assert!(chunks.iter().all(|c| c.chunk_type == ChunkType::Section));
     }
 
-    // T-129: preamble_before_first_heading
     #[test]
     fn preamble_before_first_heading() {
         let md = "Some preamble\n\n# First Section\nContent";
@@ -169,7 +165,6 @@ mod tests {
         assert_eq!(chunks[1].section_title.as_deref(), Some("First Section"));
     }
 
-    // T-236: respects_code_fences
     #[test]
     fn respects_code_fences() {
         let md = "# Real Heading\nContent\n```\n# Not A Heading\n```\n# Another Heading\nMore";
@@ -180,7 +175,6 @@ mod tests {
         assert_eq!(chunks[1].section_title.as_deref(), Some("Another Heading"));
     }
 
-    // T-237: nested_headings
     #[test]
     fn nested_headings() {
         let md = "# H1\nText1\n## H2\nText2\n### H3\nText3";
@@ -190,21 +184,18 @@ mod tests {
         assert!(chunks[0].content.contains("Text1"));
     }
 
-    // T-238: heading_only_returns_empty
     #[test]
     fn heading_only_returns_empty() {
         let chunks = chunk_markdown("# Title Only");
         assert!(chunks.is_empty());
     }
 
-    // T-239: headings_only_no_body_returns_empty
     #[test]
     fn headings_only_no_body_returns_empty() {
         let chunks = chunk_markdown("# H1\n## H2\n### H3");
         assert!(chunks.is_empty());
     }
 
-    // T-240: heading_with_trailing_hashes
     #[test]
     fn heading_with_trailing_hashes() {
         let md = "# Title ##\nContent";
@@ -212,7 +203,6 @@ mod tests {
         assert_eq!(chunks[0].section_title.as_deref(), Some("Title"));
     }
 
-    // T-241: rejects_invalid_headings
     #[test]
     fn rejects_invalid_headings() {
         assert!(parse_heading("#NoSpace").is_none());
@@ -220,11 +210,9 @@ mod tests {
         assert!(parse_heading("    # Indented").is_none());
     }
 
-    // T-026: oversized section is split
     #[test]
     fn oversized_chunk_is_split() {
-        // 20KB section with paragraph breaks
-        let paragraph = "あ".repeat(500); // ~1500 bytes in UTF-8
+        let paragraph = "あ".repeat(500);
         let mut body = "# Big Section\n".to_owned();
         for i in 0..15 {
             body.push_str(&format!("Paragraph {i}: {paragraph}\n\n"));
@@ -240,7 +228,6 @@ mod tests {
         }
     }
 
-    // T-027: normal chunk is not split, heading excluded from content
     #[test]
     fn normal_chunk_not_split() {
         let md = "# Normal\nSmall content here";
@@ -251,7 +238,6 @@ mod tests {
         assert!(chunks[0].content.contains("Small content here"));
     }
 
-    // T-028: split chunks preserve section_title; heading excluded from content
     #[test]
     fn split_chunks_preserve_section_title() {
         let paragraph = "あ".repeat(500);
@@ -271,11 +257,9 @@ mod tests {
         }
     }
 
-    // T-032: exactly MAX_CHUNK_BYTES is NOT split (threshold is >, not >=)
     #[test]
     fn exact_threshold_not_split() {
-        // Content excludes the heading line, so build body content of exactly
-        // MAX_CHUNK_BYTES after the heading.
+        // The heading is excluded from the chunk byte limit.
         let padding = "a".repeat(MAX_CHUNK_BYTES);
         let body = format!("# E\n{padding}");
         let chunks = chunk_markdown(&body);
@@ -287,7 +271,6 @@ mod tests {
         assert_eq!(chunks.len(), 1, "exactly at threshold should not split");
     }
 
-    // T-242: tilde_fences
     #[test]
     fn tilde_fences() {
         let md = "# Before\nText\n~~~\n# Inside Fence\n~~~\n# After\nMore";

@@ -3,7 +3,7 @@ use crate::model::ModelSpec;
 use rusqlite::{Connection, OptionalExtension};
 use serde_json::json;
 
-/// Full encoder and stored-text contract, rather than dimensionality alone.
+/// Persist the full encoder and chunking contract, not only dimensions.
 pub fn embedding_manifest() -> String {
     json!({
         "version": 1,

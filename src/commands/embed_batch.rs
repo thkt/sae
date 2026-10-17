@@ -18,7 +18,6 @@ pub(crate) struct EmbedAllResult {
     pub(crate) total_chunks: u32,
 }
 
-/// Loops [`embed_one_batch`] until no chunks remain, calling `on_progress(total_chunks)` after each batch.
 pub(crate) fn embed_all<F, G>(
     conn: &rusqlite::Connection,
     embed_fn: F,
@@ -64,10 +63,6 @@ where
     let batch_len = u32::try_from(batch.len()).expect("batch size exceeds u32::MAX");
     let embs = embed_fn(&texts)?;
     if embs.len() != batch.len() {
-        // Programmer-detectable invariant violation: embedder returned a
-        // vector count that does not match the requested batch. Surfaces as
-        // `INTERNAL` so agents can distinguish bug signals from the
-        // `anyhow`-swallow `Other` (=UNKNOWN) path (#127 CHX-001).
         return Err(SaeError::Internal(format!(
             "Embedding count mismatch: expected {}, got {}",
             batch.len(),
@@ -104,7 +99,6 @@ mod tests {
             .collect())
     }
 
-    // T-411: embed_one_batch embeds pending chunks within budget and clears them
     #[test]
     fn embed_one_batch_embeds_pending() {
         let db = db_with_chunks(1);
@@ -115,7 +109,6 @@ mod tests {
         assert_eq!(storage::count_unembedded_chunks(db.conn()).unwrap(), 0);
     }
 
-    // T-412: embed_all loops embed_one_batch until every pending chunk is embedded
     #[test]
     fn embed_all_embeds_all_pending() {
         let db = db_with_chunks(2);
@@ -126,9 +119,6 @@ mod tests {
         assert_eq!(storage::count_unembedded_chunks(db.conn()).unwrap(), 0);
     }
 
-    // T-413: embed_one_batch rejects an embedding-count mismatch as Internal
-    // (#127 invariant: embedder returning the wrong vector count is a
-    // programmer-detectable bug, routed to INTERNAL not the anyhow-swallow path).
     #[test]
     fn embed_one_batch_rejects_count_mismatch() {
         let db = db_with_chunks(1);

@@ -1,6 +1,3 @@
-//! Small local utilities retained when removing the MLX dependency chain.
-//! Pure text/SQL helpers preserve the existing index and CLI contracts.
-
 pub(crate) mod filter;
 pub(crate) mod fts;
 pub(crate) mod query;

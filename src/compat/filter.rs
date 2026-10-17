@@ -1,4 +1,3 @@
-// Pure helper retained from the previous dependency to preserve behavior.
 use rusqlite::types::ToSql;
 
 pub(crate) fn in_placeholders(len: usize) -> String {

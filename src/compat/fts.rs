@@ -1,5 +1,3 @@
-// Pure helper retained from the previous dependency to preserve behavior.
-
 use crate::compat::query::MatchFtsQuery;
 
 const MAX_COMBOS: usize = 100;
@@ -17,8 +15,7 @@ fn clean_impl(match_query: &str) -> Option<String> {
         return fixed_only();
     }
 
-    // Estimate Π m_i without materializing cross_product. Saturates at
-    // usize::MAX on overflow so the threshold check still fires.
+    // Bound expansion before building the Cartesian product; saturate on overflow.
     let estimated_combos = or_groups
         .iter()
         .map(Vec::len)
@@ -72,9 +69,7 @@ fn parse_fts_segments(cleaned: &str) -> (Vec<String>, Vec<Vec<String>>) {
                     break;
                 }
             }
-            // Trigram tokenizer cannot index <3 char terms; apply the same
-            // filter used inside OR-groups so the Option<String> contract
-            // stays honest across all input shapes.
+            // Trigram FTS cannot index terms shorter than three characters.
             if term.trim_matches('"').chars().count() >= 3 {
                 fixed.push(term);
             }

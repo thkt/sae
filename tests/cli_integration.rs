@@ -1,8 +1,3 @@
-//! End-to-end checks for the `--json` envelope shape.
-//!
-//! Spawns the real binary so the envelope rendering, exit code, and stream
-//! routing (stdout vs stderr) are all exercised together.
-
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -10,18 +5,14 @@ use std::process::Command;
 
 use tempfile::tempdir;
 
-/// Path to the binary cargo just built for this test run.
 fn sae_bin() -> PathBuf {
     let mut path = env::current_exe().unwrap();
-    // current_exe → target/<profile>/deps/cli_integration-<hash>
-    path.pop(); // → target/<profile>/deps
-    path.pop(); // → target/<profile>
+    path.pop();
+    path.pop();
     path.push(format!("sae{}", env::consts::EXE_SUFFIX));
     path
 }
 
-/// Builds a `Command` with isolated HOME/XDG dirs so the binary sees an
-/// empty config (no leakage from the developer's real `~/.config/sae`).
 fn sae_command(home: &Path) -> Command {
     sae_command_with_binary(home, &sae_bin())
 }
@@ -33,20 +24,13 @@ fn sae_command_with_binary(home: &Path, binary: &Path) -> Command {
         .env("XDG_CONFIG_HOME", home.join(".config"))
         .env("XDG_DATA_HOME", home.join(".local/share"))
         .env("PATH", env::var_os("PATH").unwrap_or_default());
-    // cargo-llvm-cov instruments the spawned binary and directs its profile
-    // output via LLVM_PROFILE_FILE; the env_clear() above drops it, leaving the
-    // binary unable to write a profraw — so every integration-only path (the
-    // `__test_*` seams, search) reads as uncovered. Restore it when present.
-    // yomu sidesteps this by never calling env_clear().
+    // Preserve child-process coverage after clearing the environment.
     if let Some(profile) = env::var_os("LLVM_PROFILE_FILE") {
         cmd.env("LLVM_PROFILE_FILE", profile);
     }
     cmd
 }
 
-/// Extracts the first parseable JSON line from `stderr`. Mirror of the
-/// envelope-rendering contract: `--json` failures emit one JSON line on
-/// stderr. Panics on missing JSON to give a readable failure message.
 fn parse_stderr_envelope(stderr: &str) -> serde_json::Value {
     stderr
         .lines()
@@ -54,7 +38,6 @@ fn parse_stderr_envelope(stderr: &str) -> serde_json::Value {
         .unwrap_or_else(|| panic!("no JSON line on stderr; got: {stderr}"))
 }
 
-// T-CI001: `sae --json` (missing subcommand) → JSON UsageError envelope on stderr
 #[test]
 fn missing_subcommand_with_json_emits_usage_envelope() {
     let dir = tempdir().unwrap();
@@ -73,7 +56,6 @@ fn missing_subcommand_with_json_emits_usage_envelope() {
     );
 }
 
-// T-CI002: `sae --json status` (empty config) → SuccessEnvelope on stdout
 #[test]
 fn status_with_json_emits_success_envelope() {
     let dir = tempdir().unwrap();
@@ -100,7 +82,6 @@ fn status_with_json_emits_success_envelope() {
     assert_eq!(env["notes"], serde_json::json!([]));
 }
 
-// T-CI003: default mode (no --json) emits markdown, not JSON
 #[test]
 fn status_without_json_emits_markdown() {
     let dir = tempdir().unwrap();
@@ -117,8 +98,6 @@ fn status_without_json_emits_markdown() {
     );
 }
 
-// T-CI004: `sae --json --help` prints help on stdout, exits SUCCESS
-// (clap returns Err with use_stderr()=false; --json must NOT override this)
 #[test]
 fn help_with_json_exits_success_with_help_text() {
     let dir = tempdir().unwrap();
@@ -139,10 +118,6 @@ fn help_with_json_exits_success_with_help_text() {
     );
 }
 
-// T-CI005: malformed `--after` value exits 65 (DATA_ERROR) with
-// `error.code = "DATA_ERROR"` per ADR-0066 Group 2 baseline.
-// Pins the binary-side contract: process-boundary exit code and JSON
-// envelope code both reach the consumer for the new DATA_ERROR path.
 #[test]
 fn malformed_date_with_json_emits_data_error_envelope() {
     let dir = tempdir().unwrap();
@@ -170,11 +145,6 @@ fn malformed_date_with_json_emits_data_error_envelope() {
     );
 }
 
-// T-CI006: synthetic UNKNOWN path exits 104 (UNKNOWN) with
-// `error.code = "UNKNOWN"`. Pins the process-boundary contract for
-// `SaeError::Other` per ADR-0066 L136 (#127 OPS-005). The hidden
-// `__test_force_unknown` subcommand is the only hermetic UNKNOWN trigger;
-// opaque runtime embedding failures are otherwise dependent on inference state.
 #[cfg(feature = "test-support")]
 #[test]
 fn force_unknown_with_json_emits_unknown_envelope() {
@@ -200,12 +170,6 @@ fn force_unknown_with_json_emits_unknown_envelope() {
     );
 }
 
-// T-CI007: synthetic BackendUnavailable path exits 70 (INTERNAL) with
-// `error.code = "INTERNAL"`. Pins the BREAKING `104 → 70` routing for the
-// native backend missing path (#127 CHX-001) at the process boundary, mirroring
-// T-CI005's role for DATA_ERROR. Without this pin, the contract only lives in
-// unit tests (T-338 / T-342) and could regress silently across the
-// `error_code()` → `exit_code()` → process exit translation layers.
 #[cfg(feature = "test-support")]
 #[test]
 fn force_backend_unavailable_with_json_emits_internal_envelope() {
@@ -229,16 +193,10 @@ fn force_backend_unavailable_with_json_emits_internal_envelope() {
         env["error"]["message"],
         "Gemma native backend is unavailable"
     );
-    // Exact-equality assertion mirrors T-340 unit test so the wire-level hint
-    // and the in-process hint cannot drift independently. T-340 / T-344 pin
-    // the source-side const; this anchors the binary-boundary surface to the
-    // same literal.
     assert_eq!(
         env["error"]["next_step"],
         "Install a build with the Gemma native backend, or pass `--no-embed` for FTS-only search."
     );
-    // `candidates` must be present and empty in the envelope (matches the
-    // `to_error_envelope` composition pinned by T-342).
     assert!(
         env["error"].get("candidates").is_none()
             || env["error"]["candidates"]
@@ -249,12 +207,6 @@ fn force_backend_unavailable_with_json_emits_internal_envelope() {
     );
 }
 
-// T-CI008: synthetic Internal path exits 70 (INTERNAL) with
-// `error.code = "INTERNAL"`. Pins the `SaeError::Internal` routing at the
-// process boundary, parallel to T-CI007 for `BackendUnavailable` (#127
-// CHX-001 audit follow-up). Without this pin, the `Internal` ↔ `Other` split
-// (70 vs 104) only lives in unit tests (T-339 / T-343) and could regress
-// silently across the `error_code()` → `exit_code()` → process exit chain.
 #[cfg(feature = "test-support")]
 #[test]
 fn force_internal_with_json_emits_internal_envelope() {
@@ -274,7 +226,6 @@ fn force_internal_with_json_emits_internal_envelope() {
     let env = parse_stderr_envelope(&stderr);
     assert_eq!(env["error"]["code"], "INTERNAL");
     assert_eq!(env["error"]["retryable"], false);
-    // Internal variant returns no canned next_step (T-341 pins this).
     assert!(
         env["error"].get("next_step").is_none() || env["error"]["next_step"].is_null(),
         "next_step must be absent for Internal; got: {}",
@@ -286,14 +237,6 @@ fn force_internal_with_json_emits_internal_envelope() {
     );
 }
 
-// T-CI009: synthetic esa API 404 path exits 65 (DATA_ERROR) with
-// `error.code = "DATA_ERROR"`. Pins the binary-boundary routing for the
-// esa-404 reclassification (#136): the `ClientError::Api { status: 404, .. }`
-// → DATA_ERROR mapping must survive the `error_code()` → `exit_code()` →
-// process exit chain. Without this pin, the routing only lives in unit tests
-// (T-346 / T-348 / T-352) and could regress silently. The hint string is
-// exact-equality matched so the wire-level surface cannot drift from the
-// in-process surface pinned by T-349 / T-352.
 #[cfg(feature = "test-support")]
 #[test]
 fn force_client_api_404_with_json_emits_data_error_envelope() {
@@ -326,12 +269,6 @@ fn force_client_api_404_with_json_emits_data_error_envelope() {
     );
 }
 
-// T-CI010: synthetic search warning emits a success envelope
-// with `degraded=true` and the storage-layer warning surfaced in `notes[]`.
-// Pins #140 wiring: `SearchOutput.warnings` reaches the `--json` envelope so
-// AI agents can detect degraded search. Unit tests T-262 / T-263
-// (output transform) cover the pieces; this test pins the
-// end-to-end process-boundary shape.
 #[cfg(feature = "test-support")]
 #[test]
 fn force_search_warning_with_json_emits_degraded_envelope() {
@@ -362,9 +299,6 @@ fn force_search_warning_with_json_emits_degraded_envelope() {
     );
 }
 
-/// Writes a `config.json` with the given teams into the test home so the
-/// binary's `Config::load()` picks it up. Pairs with [`sae_command`] which
-/// already sets `XDG_CONFIG_HOME=home/.config`.
 fn write_config_with_teams(home: &Path, teams: &[&str]) {
     let dir = home.join(".config").join("sae");
     fs::create_dir_all(&dir).expect("config dir");
@@ -372,10 +306,6 @@ fn write_config_with_teams(home: &Path, teams: &[&str]) {
     fs::write(dir.join("config.json"), body).expect("write config.json");
 }
 
-// T-CI013: `--team unknownteam` against a multi-team config emits a JSON
-// envelope whose `error.candidates` lists every team verbatim (config order,
-// no fuzzy filter). Closes #139: agents recover from a typo in one
-// roundtrip instead of re-running `sae status` for the team list.
 #[test]
 fn unknown_team_envelope_lists_known_teams_as_candidates() {
     let dir = tempdir().unwrap();
@@ -399,10 +329,6 @@ fn unknown_team_envelope_lists_known_teams_as_candidates() {
     );
 }
 
-// T-CI014: when no `--team` is provided AND the config has multiple teams
-// without a default, the resulting `NoTeamSpecified` envelope also surfaces
-// the team list. The two recoverable team failures share the same
-// candidates contract (#139).
 #[test]
 fn no_team_envelope_lists_known_teams_as_candidates() {
     let dir = tempdir().unwrap();
@@ -426,9 +352,6 @@ fn no_team_envelope_lists_known_teams_as_candidates() {
     );
 }
 
-// T-CI015: end-to-end — a typo subcommand emits a `--json` envelope whose
-// `error.candidates` lists the user-facing subcommands without any
-// `__test_*` seam leaking. Closes #148.
 #[test]
 fn invalid_subcommand_envelope_lists_public_subcommands() {
     let dir = tempdir().unwrap();
@@ -466,11 +389,6 @@ fn invalid_subcommand_envelope_lists_public_subcommands() {
     }
 }
 
-// T-CI011: SSRF guard rejects http://127.0.0.1 base_url at construction time.
-// Integration tests cannot see `with_base_url_unchecked` (gated on `cfg(test)`
-// in the lib build), so they exercise the strict `with_base_url` path.
-// Pins #138 subtask 3: AI agents that read a misconfigured `base_url` from
-// config / env should never be able to steer the esa client at a private host.
 #[test]
 fn esa_client_rejects_private_ip_base_url() {
     use sae::client::{ClientError, EsaClient};
@@ -482,9 +400,6 @@ fn esa_client_rejects_private_ip_base_url() {
     );
 }
 
-// T-CI012: SSRF guard rejects arbitrary attacker-controlled hosts even with
-// https. Companion to T-CI011 pinning the .esa.io allowlist at the binary
-// boundary (strict path, no cfg(test) exemption).
 #[test]
 fn esa_client_rejects_non_esa_host() {
     use sae::client::{ClientError, EsaClient};
@@ -496,11 +411,6 @@ fn esa_client_rejects_non_esa_host() {
     );
 }
 
-// T-CI012: `search --no-embed` against a seeded DB drives run_search's
-// read-only path end to end — covering the semantic-flag decision and the
-// success-envelope wiring (search.rs:102,105). Seeds via the public storage
-// API because sae cannot run `index` offline (esa fetch), unlike yomu's
-// local-file index.
 #[test]
 fn search_no_embed_against_seeded_db_exits_success() {
     use sae::storage::{Db, rechunk_post, test_post_row, upsert_post};
@@ -509,8 +419,6 @@ fn search_no_embed_against_seeded_db_exits_success() {
     let home = dir.path();
     write_config_with_teams(home, &["myteam"]);
 
-    // Db::open creates the parent data dir; seed one post + its chunks so FTS
-    // has something to match.
     let db_path = home.join(".local/share/sae/myteam.db");
     let db = Db::open(&db_path).expect("open seed db");
     upsert_post(db.conn(), &test_post_row(1)).expect("seed post");
@@ -574,8 +482,7 @@ fn no_embed_search_reads_legacy_index_without_loading_corrupt_model_or_writing()
     let path = seed_search_db(dir.path(), true);
     {
         let db = Db::open(&path).unwrap();
-        // Future dates clamp recency age to zero, so separate processes have
-        // identical scores while we compare SAE_RERANK values.
+        // Clamp recency to zero so scores match across separate CLI processes.
         db.conn()
             .execute("UPDATE posts SET updated_at='9999-01-01T00:00:00Z'", [])
             .unwrap();
@@ -687,8 +594,7 @@ fn missing_and_corrupt_models_degrade_search_with_success_envelope() {
     }
 }
 
-// test-support intentionally substitutes a model-free migration embedder.
-// Run this production-loader contract in the default-feature suite.
+// test-support bypasses model loading; this contract needs the production loader.
 #[cfg(not(feature = "test-support"))]
 #[test]
 fn migrate_without_model_keeps_local_source_and_returns_error_envelope() {
@@ -743,7 +649,7 @@ fn migrate_corrupt_model_emits_internal_error_and_preserves_active_source() {
     assert!(!path.with_file_name("alpha.active.json").exists());
 }
 
-/// A valid envelope is insufficient if native model teardown aborts afterward.
+// Check process exit too: native teardown can abort after JSON is emitted.
 #[test]
 #[ignore = "requires pinned Gemma artifacts in SAE_MODEL_DIR; launches the real CLI"]
 fn real_semantic_search_exits_successfully_after_emitting_json() {
@@ -778,10 +684,9 @@ fn real_semantic_search_exits_successfully_after_emitting_json() {
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
             .unwrap();
     }
-    // The real model used for setup is released before the child acquires it.
+    // Release the setup model before the child loads it.
     let before = fs::read(&path).unwrap();
-    let mut command = sae_command_with_binary(home.path(), Path::new(env!("CARGO_BIN_EXE_sae")));
-    let output = command
+    let output = sae_command_with_binary(home.path(), Path::new(env!("CARGO_BIN_EXE_sae")))
         .env("SAE_MODEL_DIR", artifacts)
         .args(["--json", "search", "Rust API の認証", "--team", "alpha"])
         .output()
