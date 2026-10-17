@@ -45,7 +45,7 @@ fn collect_team_statuses(config: &Config, teams: &[&str]) -> Vec<TeamStatus> {
 }
 
 fn query_team_status(team: &str, path: &Path) -> Result<TeamStatus, SaeError> {
-    let db = storage::Db::open(path)?;
+    let db = storage::Db::open_read_only(path)?;
     let count = storage::count_posts(db.conn())?;
     let state = storage::get_sync_state(db.conn())?;
     let pending_embed = storage::count_unembedded_chunks(db.conn())?;

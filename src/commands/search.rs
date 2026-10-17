@@ -3,14 +3,11 @@ use std::io::{self, IsTerminal, Read};
 use crate::config::Config;
 use crate::envelope::CommandOutput;
 use crate::storage;
-use amici::model::{ModelLoad, record_degraded};
 use jiff::Timestamp;
 use jiff::civil::Date;
 use jiff::tz::TimeZone;
-use rurico::reranker::Rerank;
 
 use super::embedder::try_load_embedder;
-use super::reranker::try_load_reranker;
 use crate::output;
 use crate::tools::{SaeError, require_db};
 
@@ -38,7 +35,6 @@ pub(crate) fn run_search(
     after: Option<&str>,
     before: Option<&str>,
     no_embed: bool,
-    rerank_enabled: bool,
 ) -> Result<CommandOutput, SaeError> {
     let updated_after = parse_date_arg(after, "after")?;
     let updated_before = parse_date_arg(before, "before")?;
@@ -47,37 +43,31 @@ pub(crate) fn run_search(
     // `embedder_load_failed` distinguishes intentional FTS (`no_embed`) from
     // a silent fallback (loader returned `DegradedReason`). Only the latter
     // populates `degraded=true` + notes in the success envelope.
-    let (embedder, embedder_load_failed) = if no_embed {
+    if !no_embed && storage::has_embeddings(db.conn()) {
+        storage::validate_embedding_index(db.conn())?;
+    }
+    let (embedder, mut embedder_load_failed) = if no_embed {
         (None, false)
     } else {
         let result = try_load_embedder();
         if let Err(reason) = result {
-            record_degraded(*reason, "search: embedder load");
+            tracing::warn!(?reason, "search: embedding model unavailable; using FTS");
         }
-        (result.as_ref().ok(), result.is_err())
+        let failed = result.is_err();
+        (result.ok(), failed)
     };
     let query_embedding = if let Some(e) = embedder {
         match e.embed_query(query) {
             Ok(v) => Some(v),
             Err(e) => {
                 tracing::warn!(error = %e, %query, "embed_query failed, falling back to FTS");
+                embedder_load_failed = true;
                 None
             }
         }
     } else {
         None
     };
-    let reranker: Option<ModelLoad<Box<dyn Rerank>>> = rerank_enabled.then(try_load_reranker);
-    if let Some(ref r) = reranker {
-        r.emit_load_hint(
-            "reranker model not cached; unset SAE_RERANK=1 to skip reranking",
-            "reranker",
-        );
-    }
-    let reranker_ref: Option<&dyn Rerank> = reranker
-        .as_ref()
-        .and_then(|r| r.as_ref())
-        .map(|b| b.as_ref() as &dyn Rerank);
     let filter = storage::SearchFilter {
         updated_after,
         updated_before,
@@ -90,7 +80,6 @@ pub(crate) fn run_search(
         limit,
         Timestamp::now(),
         &filter,
-        reranker_ref,
     )?;
     for w in &search_output.warnings {
         tracing::warn!("{w}");

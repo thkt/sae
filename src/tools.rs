@@ -1,29 +1,23 @@
-#[cfg(not(feature = "test-support"))]
-use std::convert::Infallible;
 use std::io;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use amici::cli::embed_with_spinners;
-use amici::cli::env_lookup;
-use amici::cli::exit_code::CliError;
-#[cfg(not(feature = "test-support"))]
-use amici::model::embedder::{DegradedReason, try_load_embedder_with};
-use amici::model::{ModelDownloadError, download_and_verify_model};
-use rurico::embed::Embed;
+#[cfg(test)]
+use crate::compat::ModelInitError;
+use crate::compat::{CliError, ProbeError, embed_with_spinners, env_lookup};
+use crate::embedding::Embed;
 #[cfg(feature = "test-support")]
-use rurico::embed::MockEmbedder;
+use crate::embedding::MockEmbedder;
 #[cfg(not(feature = "test-support"))]
-use rurico::embed::{ModelId, cached_artifacts};
-use rurico::model_init::ModelInitError;
-use rurico::model_probe::ProbeError;
+use crate::model;
+use crate::model::{ModelDownloadError, download_and_verify_model};
 
 use crate::client::{ClientError, EsaClient};
 use crate::commands;
 use crate::config::{Config, ConfigError};
 use crate::envelope::{CommandOutput, ErrorCode, ErrorEnvelope, ErrorPayload};
 use crate::output;
-use crate::storage::{Db, StorageError, count_unembedded_chunks};
+use crate::storage::{Db, StorageError, count_unembedded_chunks, validate_embedding_index};
 use crate::sync::{self, SyncError};
 
 pub use crate::commands::search::resolve_search_query;
@@ -106,7 +100,6 @@ pub struct UpdateArgs {
 
 pub struct Sae {
     config: Config,
-    rerank_enabled: bool,
 }
 
 impl Sae {
@@ -115,11 +108,8 @@ impl Sae {
     }
 
     pub(crate) fn with_env(config: Config, get_var: impl Fn(&str) -> Option<String>) -> Self {
-        let rerank_enabled = get_var("SAE_RERANK").as_deref() == Some("1");
-        Self {
-            config,
-            rerank_enabled,
-        }
+        let _ = get_var; // SAE_RERANK is no longer consulted.
+        Self { config }
     }
 
     pub fn config(&self) -> &Config {
@@ -138,6 +128,7 @@ impl Sae {
         let (team, client) = resolve_client(&self.config, Some(team))?;
         let db_path = self.config.team_db_path(team)?;
         let db = Db::open(&db_path)?;
+        validate_embedding_index(db.conn())?;
         let result = sync::harvest(&client, &db, team, full).await?;
         // Embed pending chunks unconditionally — even when harvest fetched
         // nothing — so a backlog left by an earlier model-less run clears on the
@@ -217,7 +208,6 @@ impl Sae {
             args.after.as_deref(),
             args.before.as_deref(),
             args.no_embed,
-            self.rerank_enabled,
         )
     }
 
@@ -255,11 +245,10 @@ pub enum SaeError {
     /// Maps to `DATA_ERROR` (sysexits 65) per ADR-0066 Group 2.
     #[error("{0}")]
     InputData(String),
-    /// MLX backend missing in the runtime hardware (e.g., running on a host
-    /// without Apple Silicon). Maps to `INTERNAL` (sysexits 70) so `sae index`
+    /// Gemma native backend unavailable. Maps to `INTERNAL` (sysexits 70) so `sae index`
     /// and `sae model download` surface the same hardware-mismatch signal
     /// (was split between 104 and 70 before #127 CHX-001).
-    #[error("MLX backend is unavailable")]
+    #[error("Gemma native backend is unavailable")]
     BackendUnavailable,
     /// The embedding model is absent or failed to load when an
     /// embedding-dependent command (e.g. `sae index`) needs to embed pending
@@ -291,7 +280,7 @@ const NO_DATA_PREFIX: &str = "No data for team ";
 /// (model download path). Lives as a single const so the unit tests, the
 /// integration test, and the production arm cannot drift.
 const BACKEND_UNAVAILABLE_HINT: &str =
-    "Install the MLX backend (Apple Silicon required), or pass `--no-embed` for FTS-only search.";
+    "Install a build with the Gemma native backend, or pass `--no-embed` for FTS-only search.";
 
 /// Shared `next_step` hint for `ClientError::Api { status: 404, .. }`
 /// (post-not-found path). Centralised so the production arm and unit tests
@@ -318,6 +307,7 @@ impl SaeError {
             // Retryable storage failures (SQLite WAL contention, transient I/O)
             // route to `TempFailure` (75) instead of the `CantCreat` (73) default
             // so AI agents auto-retry recoverable conditions (#138 subtask 2).
+            Self::Storage(StorageError::IndexMismatch(_)) => ErrorCode::DataError,
             Self::Storage(e) if e.is_retryable() => ErrorCode::TempFailure,
             Self::Sync(e) if e.is_retryable() => ErrorCode::TempFailure,
             Self::Storage(_) | Self::Sync(SyncError::Storage(_)) => ErrorCode::CantCreat,
@@ -364,7 +354,7 @@ impl SaeError {
             ) => ErrorCode::Internal,
             Self::Probe(ProbeError::SubprocessFailed(_)) => ErrorCode::IoError,
             // Remaining Client/Sync (Network connect/timeout, MaxRetries) are retry-eligible.
-            // Explicit arms (no wildcard) so future amici variants force a compile-time review.
+            // Explicit arms (no wildcard) so future client variants force a compile-time review.
             Self::Client(_) | Self::Sync(_) => ErrorCode::TempFailure,
             // Catch-all: anyhow-style swallowing surfaces as UNKNOWN (104) to
             // distinguish it from classified INTERNAL (70) per ADR-0066 L136.
@@ -413,6 +403,9 @@ impl SaeError {
             Self::BackendUnavailable => Some(BACKEND_UNAVAILABLE_HINT),
             Self::EmbedderUnavailable(_) => {
                 Some("Run `sae model download` to fetch the embedding model.")
+            }
+            Self::Storage(StorageError::IndexMismatch(_)) => {
+                Some("Run `sae model migrate <team>` to build a compatible Gemma index.")
             }
             // Explicit catch-all arms per variant. Adding a new SaeError variant
             // must force a compile-time review (no wildcard).
@@ -498,7 +491,7 @@ pub(crate) fn require_db(config: &Config, team: &str) -> Result<Db, SaeError> {
     if !db_path.exists() {
         return Err(SaeError::input_no_data_for_team(team));
     }
-    Ok(Db::open(&db_path)?)
+    Ok(Db::open_read_only(&db_path)?)
 }
 
 /// Best-effort DB open for mutation commands. Returns `None` when the team
@@ -512,7 +505,13 @@ pub(crate) fn try_open_team_db(config: &Config, team: Option<&str>) -> Option<Db
         return None;
     }
     match Db::open(&db_path) {
-        Ok(db) => Some(db),
+        Ok(db) => match validate_embedding_index(db.conn()) {
+            Ok(()) => Some(db),
+            Err(error) => {
+                tracing::warn!(team, %error, "incompatible local index; write-through skipped");
+                None
+            }
+        },
         Err(e) => {
             tracing::warn!(
                 team,
@@ -531,16 +530,16 @@ impl CliError for SaeError {
 }
 
 /// Reverse [`From<ProbeError> for ModelInitError`] so per-variant `ProbeError`
-/// routing in [`SaeError::error_code`] survives amici's collapse boundary.
+/// routing in [`SaeError::error_code`] stays available for legacy error clients.
 /// Returns `None` only when `Backend.source` carries a non-`ProbeError`
-/// payload — left open so a future amici/rurico change does not silently
+/// payload — kept open so an unrelated backend error does not silently
 /// misclassify.
 ///
 /// Its only non-test caller is the real-model [`load_embedder`], `cfg`'d out
 /// under `--features test-support`. The routing logic stays exercised by
 /// T-332..T-334; `allow(dead_code)` covers the test-support build where the
 /// production caller is absent.
-#[cfg_attr(feature = "test-support", allow(dead_code))]
+#[cfg(test)]
 fn extract_probe_error(init_err: ModelInitError) -> Option<ProbeError> {
     match init_err {
         ModelInitError::ModelCorrupt { reason } => Some(ProbeError::ModelLoadFailed { reason }),
@@ -555,69 +554,33 @@ fn extract_probe_error(init_err: ModelInitError) -> Option<ProbeError> {
     }
 }
 
-/// Production embedder loader for the embed path: resolves the model cache and
-/// loads the backend, classifying failures. Absent model → recoverable
-/// `EmbedderUnavailable` (75); hardware/OS backend missing → `BackendUnavailable`
-/// (70); corrupt model / probe failure → typed `Probe`.
-///
-/// Compiled out under `--features test-support`; the coverage build uses that
-/// feature, so the real-model loader is excluded from diff coverage (mirrors
-/// yomu's `try_load_embedder` cfg split). The test-support variant below
-/// returns a deterministic [`MockEmbedder`] so `index` / `rebuild` populate
-/// embeddings without a real model on CI runners.
+/// Loads the verified Gemma model only when pending chunks need embedding.
 #[cfg(not(feature = "test-support"))]
-fn load_embedder() -> Result<Arc<dyn Embed>, SaeError> {
-    // Resolve the model cache lazily (only when chunks are pending, since
-    // `embed_with_spinners` skips the loader at pending == 0). Absent model is
-    // recoverable, so route to retryable `EmbedderUnavailable` (75) rather than
-    // the old non-retryable `InputUsage` (64) path.
-    let paths = match cached_artifacts(ModelId::default()) {
-        Ok(Some(p)) => p,
-        Ok(None) => {
-            return Err(SaeError::EmbedderUnavailable(
-                "embedding model not installed".to_owned(),
-            ));
-        }
-        // Other (UNKNOWN): `cached_artifacts` returns an opaque `anyhow::Error`
-        // covering filesystem / cache-layout edges.
-        Err(e) => return Err(SaeError::Other(format!("Failed to check model cache: {e}"))),
-    };
-    // Ok = typed probe variant; Err = fallback Display for the non-ProbeError
-    // path; None = callback never fired.
-    let mut captured: Option<Result<ProbeError, String>> = None;
-    match try_load_embedder_with(
-        || Ok::<_, Infallible>(Some(paths)),
-        |e| tracing::warn!(error = %e, "failed to delete corrupt model files"),
-        |e| {
-            let display = e.to_string();
-            captured = Some(extract_probe_error(e).ok_or(display));
-        },
-    ) {
-        Ok(e) => Ok(e),
-        // Mirrors `ModelDownload(BackendUnavailable)` routing via
-        // `SaeError::BackendUnavailable` so embed and model download surface the
-        // same INTERNAL signal for hardware mismatch (#127 CHX-001).
-        Err(DegradedReason::BackendUnavailable) => Err(SaeError::BackendUnavailable),
-        Err(reason) => match captured {
-            Some(Ok(probe)) => Err(SaeError::Probe(probe)),
-            // Other (UNKNOWN): `extract_probe_error` returned a non-`ProbeError`
-            // payload that we surfaced via `Display`.
-            Some(Err(detail)) => Err(SaeError::Other(format!(
-                "Model probe failed: {reason:?}: {detail}"
-            ))),
-            // Other (UNKNOWN): probe callback never fired.
-            None => Err(SaeError::Other(format!("Model probe failed: {reason:?}"))),
-        },
+pub(crate) fn load_embedder() -> Result<Arc<dyn Embed>, SaeError> {
+    let cached = model::cached_artifacts().map_err(|error| {
+        SaeError::Probe(ProbeError::ModelLoadFailed {
+            reason: format!("Failed to validate model cache: {error}"),
+        })
+    })?;
+    if cached.is_none() {
+        return Err(SaeError::EmbedderUnavailable(
+            "embedding model not installed".to_owned(),
+        ));
+    }
+    match model::try_load_embedder_default_logging() {
+        Ok(embedder) => Ok(embedder),
+        Err(model::DegradedReason::BackendUnavailable) => Err(SaeError::BackendUnavailable),
+        Err(model::DegradedReason::NotInstalled) => Err(SaeError::EmbedderUnavailable(
+            "embedding model not installed".to_owned(),
+        )),
+        Err(_) => Err(SaeError::Probe(ProbeError::ModelLoadFailed {
+            reason: "Gemma model failed validation or isolated loading".to_owned(),
+        })),
     }
 }
 
-/// Test-support embedder loader: returns a deterministic in-memory
-/// [`MockEmbedder`] so `index` / `rebuild` populate embeddings without a real
-/// model (CI runners have none). Compiled only under `--features test-support`;
-/// the production binary loads the real model via the `cfg(not(...))` variant
-/// above.
 #[cfg(feature = "test-support")]
-fn load_embedder() -> Result<Arc<dyn Embed>, SaeError> {
+pub(crate) fn load_embedder() -> Result<Arc<dyn Embed>, SaeError> {
     Ok(Arc::new(MockEmbedder::default()))
 }
 
@@ -646,7 +609,7 @@ where
                     embedder
                         .embed_documents_batch(texts)
                         // Other (UNKNOWN): embedder's runtime error is an opaque
-                        // `anyhow::Error` (no typed variant from amici/rurico).
+                        // runtime error is not further classified here.
                         .map_err(|e| SaeError::Other(format!("Batch embedding failed: {e}")))
                 },
                 |n| update(&format!("Embedding... {n}/{pending} chunks")),
@@ -664,7 +627,7 @@ fn embed_pending(db: &Db) -> Result<Option<commands::embed_batch::EmbedAllResult
 
 #[cfg(test)]
 mod tests {
-    use amici::cli::exit_code::codes;
+    use crate::compat::codes;
 
     use super::*;
     use std::cell::Cell;
@@ -900,36 +863,19 @@ mod tests {
         assert_code(&SaeError::Storage(StorageError::Db(busy)), codes::TEMP_FAIL);
     }
 
-    // T-300: Sae::with_env enables rerank when SAE_RERANK="1"
+    // The removed reranker setting must not initialize a second model path.
     #[test]
-    fn with_env_enables_rerank_when_one() {
-        let sae = Sae::with_env(Config::default(), |key| match key {
-            "SAE_RERANK" => Some("1".into()),
-            _ => None,
+    fn with_env_does_not_read_removed_reranker_setting() {
+        let looked_up = Cell::new(false);
+        let _sae = Sae::with_env(Config::default(), |key| {
+            if key == "SAE_RERANK" {
+                looked_up.set(true);
+                Some("1".into())
+            } else {
+                None
+            }
         });
-        assert!(sae.rerank_enabled);
-    }
-
-    // T-301: Sae::with_env disables rerank when SAE_RERANK is absent
-    #[test]
-    fn with_env_disables_rerank_when_absent() {
-        let sae = Sae::with_env(Config::default(), |_| None);
-        assert!(!sae.rerank_enabled);
-    }
-
-    // T-302: Sae::with_env disables rerank for any non-"1" value (e.g. "0", "true")
-    #[test]
-    fn with_env_disables_rerank_for_non_one_values() {
-        for value in ["0", "true", "yes", ""] {
-            let sae = Sae::with_env(Config::default(), |key| match key {
-                "SAE_RERANK" => Some(value.into()),
-                _ => None,
-            });
-            assert!(
-                !sae.rerank_enabled,
-                "SAE_RERANK={value:?} should not enable rerank"
-            );
-        }
+        assert!(!looked_up.get(), "SAE_RERANK must have no effect");
     }
 
     // T-310: input_no_data_for_team_pins_next_step_index_hint
@@ -1261,7 +1207,7 @@ mod tests {
     // T-326: every ProbeError variant routes per ADR-0066 Group 2
     #[test]
     fn exit_code_probe_variants_route_per_adr_0066() {
-        use rurico::model_probe::SetupReason;
+        use crate::compat::SetupReason;
         let internal_cases = [
             ProbeError::HandlerNotInstalled,
             ProbeError::ModelLoadFailed {
@@ -1296,7 +1242,7 @@ mod tests {
     // process exit code would confuse agents expecting sysexits classifications.
     #[test]
     fn exit_code_probe_setup_rejected_does_not_leak_wire_code() {
-        use rurico::model_probe::SetupReason;
+        use crate::compat::SetupReason;
         let reason = SetupReason::PathOutsideCache;
         assert_eq!(
             reason.code(),
@@ -1427,7 +1373,7 @@ mod tests {
             Some(BACKEND_UNAVAILABLE_HINT)
         );
         assert!(env.error.candidates.is_empty());
-        assert_eq!(env.error.message, "MLX backend is unavailable");
+        assert_eq!(env.error.message, "Gemma native backend is unavailable");
     }
 
     // T-343: to_error_envelope(Internal) composes code=INTERNAL with no hint.

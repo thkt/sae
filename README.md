@@ -8,9 +8,14 @@ esaの検索は全文検索だが、ローカルで高速に検索したい場�
 
 ## セットアップ
 
+初回ビルドにはRust、CMake、C/C++コンパイラが必要。macOSではXcode Command Line Toolsを導入する。Apple SiliconではMetalを使用する。
+
 ```bash
+git submodule update --init --recursive
 cargo install --path .
 ```
+
+既存のRuri版から更新する場合は、インストール前に現在のバイナリを別名で保存する（例: `cp "$(command -v sae)" /保存先/sae-ruri`）。索引の移行手順は後述。
 
 ### 環境変数
 
@@ -119,9 +124,22 @@ sae search "認証フローの設計方針"
 # embedder のロードコストを避けて FTS のみで検索（CI / スクリプト用途）
 sae search "認証" --no-embed
 
-# reranker を有効化（モデル別途キャッシュ必要）
-SAE_RERANK=1 sae search "認証フローの設計方針"
+# 旧Ruri索引をローカルコピーからGemmaへ移行（esa API取得なし）
+sae model migrate myteam
+
+# 直前の索引へ戻す
+sae model rollback myteam
 ```
+
+埋め込みは **EmbeddingGemma 2のBF16版（768次元）** を使用し、rerankerは使わない。従来の`SAE_RERANK`は無視する。モデルとtokenizerは固定版・SHA-256を検証して導入する。キャッシュは通常`~/.cache/sae/models/<identity>/`、`XDG_CACHE_HOME`指定時はその配下、`HF_HOME`指定時は`<HF_HOME>/sae/models/<identity>/`となる。`SAE_MODEL_DIR`で重みとtokenizerを置いたディレクトリを明示できる。
+
+#### 旧索引からの移行
+
+更新後は`sae model download`、`sae model migrate myteam`の順に実行する。既存のRuri索引は同じ768次元でもGemmaと互換性がない。旧索引への埋め込み追記やGemmaによるベクトル検索は拒否し、移行前も`--no-embed`によるFTS検索は使える。`index`/`rebuild`は旧索引を移行しない。
+
+`model migrate`はSQLiteの整合したローカルコピーを別DBに作り、既存のMarkdownチャンクを埋め込み直す。512チャンクごとにベクトルと本文hashを保存し、中断後は同じコマンドで再開する。モデルmanifest、件数、本文hash、ベクトルの次元・有限値・単位長を検証してから参照先を原子的に切り替える。失敗時は元の索引を選択したままにする。処理中に元の投稿・チャンクが変わった場合も切り替えを拒否する。
+
+元のDBとモデルは削除しない。`sae model rollback myteam`は直前のDBを再選択する。Ruri索引に戻した場合、Gemma版ではFTS検索のみ利用できる。セマンティック検索も戻すには、保存したRuri版バイナリを使う。`rollback`をもう一度実行すると切り替え前の選択へ戻る。索引への更新と移行・復帰は同時実行しない。
 
 ### 同期状態の確認
 
@@ -133,7 +151,9 @@ sae --json status
 
 ## データ
 
-- DB: `~/.local/share/sae/{team}.db`（SQLite）
+- 初期・旧DB: `~/.local/share/sae/{team}.db`（SQLite）
+- 移行DB: `~/.local/share/sae/{team}.gemma-<manifest>-<snapshot>.db`
+- 索引の選択: `~/.local/share/sae/{team}.active.json`（現行・直前のDB名）
 - 設定: `~/.config/sae/config.json`
 
 ## Exit code
@@ -147,18 +167,18 @@ sysexits.h の symbolic name (`EX_USAGE`, `EX_SOFTWARE` 等) は数値の出典�
 | ---- | -------------- | ---------------- | -------------------------------------------------------- | ----------- |
 | 0    | (none)         | 正常終了         |                                                          |             |
 | 64   | USAGE_ERROR    | 入力エラー       | 不明なチーム、トークン未設定、未 index 実行              | しない      |
-| 65   | DATA_ERROR     | データ形式不正   | `--after` / `--before` の日付形式不正 (`YYYY-MM-DD` 以外)、esa API 404 (指定 post 番号がチームに存在しない) | しない      |
-| 70   | INTERNAL       | 内部エラー       | JSON parse 失敗、esa API の 404 以外の HTTP エラー (5xx および 401/403/422 等の 4xx)、MLX backend 不在 (`sae index` / `sae model download` 共通)、model download 検証失敗 (`ModelDownloadError::ProbeFailed`)、`ProbeError` (HandlerNotInstalled / ModelLoadFailed / SetupRejected)、embedder invariant 違反 (例: batch count mismatch) | しない      |
+| 65   | DATA_ERROR     | データ形式不正   | `--after` / `--before` の日付形式不正 (`YYYY-MM-DD` 以外)、esa API 404 (指定 post 番号がチームに存在しない)、埋め込み索引のモデル不一致 | しない      |
+| 70   | INTERNAL       | 内部エラー       | JSON parse 失敗、esa API の 404 以外の HTTP エラー (5xx および 401/403/422 等の 4xx)、native backend 不在 (`sae index` / `sae model download` 共通)、model download 検証失敗 (`ModelDownloadError::ProbeFailed`)、`ProbeError` (HandlerNotInstalled / ModelLoadFailed / SetupRejected)、embedder invariant 違反 (例: batch count mismatch) | しない      |
 | 73   | CANT_CREAT     | データ層エラー   | DB open 失敗、ファイル作成不可                           | 状況による  |
 | 74   | IO_ERROR       | I/O エラー       | ファイル読み書き失敗、`ProbeError::SubprocessFailed`     | 状況による  |
 | 75   | TEMP_FAILURE   | 一時的エラー     | esa API rate limit、ネットワーク障害、model download 一時的失敗 (429, 5xx, timeout)、embedding モデル未インストールで `sae index` / `rebuild` が埋め込み不能 (`EmbedderUnavailable`、`sae model download` で解消) | する  |
-| 104  | UNKNOWN        | 分類不能         | model probe fallback、未型化の embedder ランタイムエラー (`anyhow::Error` 経由)、その他の想定外例外。分類済み 70 と区別する ADR-0066 L136 の意図に対応 | しない |
+| 104  | UNKNOWN        | 分類不能         | 未型化のランタイムエラー (`anyhow::Error` 経由)、その他の想定外例外。分類済み 70 と区別する ADR-0066 L136 の意図に対応 | しない |
 
 > ⚠️ 破壊的変更（issue #91 / amici #34 migration）: 旧 schema (`1` / `2` / `4`) からの切り替え。スクリプト / CI で specific number に branch している場合は更新が必要。
 
 > ⚠️ 破壊的変更（issue #126 / ADR-0066 Group 2 baseline）: 日付形式不正が 64 → 65、catch-all (`SaeError::Other`) が 70 → 104 に変化。`--json` の `error.code` も同様に `USAGE_ERROR` → `DATA_ERROR`、`INTERNAL` → `UNKNOWN`。
 
-> ⚠️ 破壊的変更（issue #127 / `SaeError::Other` routing audit）: #126 で catch-all が 70 → 104 に動いた一方、以下の 2 種の失敗は **70 (INTERNAL) に分類される** — `sae index` / `sae search` での MLX backend 不在 (`SaeError::BackendUnavailable`)、`sae index` / `sae search` での embedder invariant 違反 (`SaeError::Internal`、例: batch count mismatch)。`sae model download` 側 (既に 70) と routing を揃え、agent が「ハードウェア / 環境不一致 or プログラム不変条件違反」シグナルとして検知できるようにする。**net 状態**: agent retry policy は `error.code` (= `"INTERNAL"` か `"UNKNOWN"`) で分岐すれば #126 / #127 双方の変更を吸収できる。
+> ⚠️ 破壊的変更（issue #127 / `SaeError::Other` routing audit）: #126 で catch-all が 70 → 104 に動いた一方、以下の 2 種の失敗は **70 (INTERNAL) に分類される** — `sae index` / `sae search` での native backend 不在 (`SaeError::BackendUnavailable`)、`sae index` / `sae search` での embedder invariant 違反 (`SaeError::Internal`、例: batch count mismatch)。`sae model download` 側 (既に 70) と routing を揃え、agent が「ハードウェア / 環境不一致 or プログラム不変条件違反」シグナルとして検知できるようにする。**net 状態**: agent retry policy は `error.code` (= `"INTERNAL"` か `"UNKNOWN"`) で分岐すれば #126 / #127 双方の変更を吸収できる。
 
 > ⚠️ 破壊的変更（issue #136 / esa API 404 reclassify）: esa API が 404 (post not found) を返したときの exit code が `70` → `65`、`--json` の `error.code` が `"INTERNAL"` → `"DATA_ERROR"` に変化。`next_step` に「Verify the post number exists in esa, or run `sae search <keyword>` to find it.」が付くため、agent が「入力 post 番号間違い」と「サーバ起因 5xx」を判別できる。**net 状態**: 404 (入力データ起因) は 65、404 以外の HTTP error (5xx および 401/403/422 等) は 70 のまま。`error.code` で分岐していれば変更は自動吸収される。
 
@@ -168,10 +188,10 @@ sysexits.h の symbolic name (`EX_USAGE`, `EX_SOFTWARE` 等) は数値の出典�
 
 | 環境 | filter | 例 |
 |---|---|---|
-| 未設定（default） | `sae=info,rurico=warn` | sae の通常ログ + rurico の degraded path warn |
+| 未設定（default） | `sae=info` | saeの通常ログと検索フォールバックの警告 |
 | 任意指定 | `RUST_LOG=<directives>` | env var の値が完全に default を上書き |
 
-degraded path（embedder/reranker fallback、MLX cache 復旧、probe timeout 等）は rurico 側で `tracing::warn!` を発行する。default filter で `rurico=warn` を含めることで operator が観測可能。
+モデル欠損・破損、隔離したモデルプローブの失敗、ベクトル検索の失敗は警告をstderrに出す。検索のFTSフォールバックはJSONの`degraded`と`notes`でも確認できる。
 
 > ⚠️ 破壊的変更（issue #85 / amici #36 migration）: 旧挙動「`RUST_LOG` 設定時も常に `sae=info` を layer」を廃止。`RUST_LOG` 設定時は env 優先、未設定時のみ default を使う。`RUST_LOG=sae=info` を export する運用へ移行が必要な場合は明示指定。
 

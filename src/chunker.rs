@@ -1,4 +1,4 @@
-use rurico::text::split_text;
+use crate::compat::text::split_text;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChunkType {

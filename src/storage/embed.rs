@@ -1,9 +1,11 @@
 use std::collections::HashSet;
 
-use rurico::embed::ChunkedEmbedding;
+use crate::embedding::{ChunkedEmbedding, EMBEDDING_DIMS};
+use crate::model::digest_hex;
 use rusqlite::Connection;
+use sha2::{Digest, Sha256};
 
-use amici::storage::fetch_by_in_clause;
+use crate::compat::fetch_by_in_clause;
 
 use super::{StorageError, collect_storage_rows, f32_as_bytes};
 
@@ -11,6 +13,7 @@ pub fn add_chunked_embeddings(
     conn: &Connection,
     embeddings: &[(i64, ChunkedEmbedding)],
 ) -> Result<u32, StorageError> {
+    super::validate_embedding_index(conn)?;
     if embeddings.is_empty() {
         return Ok(0);
     }
@@ -31,6 +34,7 @@ pub(crate) fn insert_new_embeddings(
     conn: &Connection,
     embeddings: &[(i64, ChunkedEmbedding)],
 ) -> Result<u32, StorageError> {
+    super::validate_embedding_index(conn)?;
     let refs: Vec<_> = embeddings.iter().collect();
     insert_embeddings(conn, &refs)
 }
@@ -42,9 +46,24 @@ fn insert_embeddings(
     if embeddings.is_empty() {
         return Ok(0);
     }
+    super::validate_embedding_index(conn)?;
     let tx = conn.unchecked_transaction()?;
     let mut count = 0u32;
     for (chunk_id, chunked_emb) in embeddings {
+        if chunked_emb.chunks.is_empty()
+            || chunked_emb
+                .chunks
+                .iter()
+                .any(|v| v.len() != EMBEDDING_DIMS || v.iter().any(|x| !x.is_finite()))
+        {
+            return Err(StorageError::IndexMismatch(
+                "invalid embedding shape or value".into(),
+            ));
+        }
+        let content: String =
+            tx.query_row("SELECT content FROM chunks WHERE id=?1", [chunk_id], |r| {
+                r.get(0)
+            })?;
         for (sub_idx, embedding) in chunked_emb.chunks.iter().enumerate() {
             let bytes: &[u8] = f32_as_bytes(embedding);
             tx.execute(
@@ -58,10 +77,18 @@ fn insert_embeddings(
                 rusqlite::params![chunk_id, sub_idx as i64, vec_rowid],
             )?;
         }
+        tx.execute(
+            "INSERT OR REPLACE INTO embedding_content_hashes VALUES (?1, ?2)",
+            rusqlite::params![chunk_id, content_hash(&content)],
+        )?;
         count += 1;
     }
     tx.commit()?;
     Ok(count)
+}
+
+pub(crate) fn content_hash(content: &str) -> String {
+    digest_hex(&Sha256::digest(content.as_bytes()))
 }
 
 fn existing_embedded_ids(
@@ -117,8 +144,8 @@ pub fn has_embeddings(conn: &Connection) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::embedding::{ChunkedEmbedding, EMBEDDING_DIMS};
     use crate::storage::{self, Db};
-    use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
 
     fn make_chunked(val: f32) -> ChunkedEmbedding {
         ChunkedEmbedding::new(vec![vec![val; EMBEDDING_DIMS]])
@@ -220,5 +247,54 @@ mod tests {
         add_chunked_embeddings(db.conn(), &emb).unwrap();
 
         assert_eq!(count_unembedded_chunks(db.conn()).unwrap(), 0);
+    }
+
+    #[test]
+    fn invalid_vectors_roll_back_prior_valid_items_and_preserve_pending_work() {
+        let mut nonfinite = vec![0.0; EMBEDDING_DIMS];
+        nonfinite[17] = f32::NAN;
+        let mut infinite = vec![0.0; EMBEDDING_DIMS];
+        infinite[31] = f32::INFINITY;
+        for invalid in [
+            ChunkedEmbedding { chunks: vec![] },
+            ChunkedEmbedding {
+                chunks: vec![vec![]],
+            },
+            ChunkedEmbedding::new(vec![vec![0.5; EMBEDDING_DIMS - 1]]),
+            ChunkedEmbedding::new(vec![vec![0.5; EMBEDDING_DIMS + 1]]),
+            ChunkedEmbedding::new(vec![nonfinite]),
+            ChunkedEmbedding::new(vec![infinite]),
+        ] {
+            let db = Db::open_memory().unwrap();
+            for number in 1..=3 {
+                let row = storage::test_post_row(number);
+                storage::upsert_post(db.conn(), &row).unwrap();
+                storage::rechunk_post(db.conn(), number, "# API\nauthentication").unwrap();
+            }
+            let chunks = get_unembedded_chunks(db.conn(), 10).unwrap();
+            assert_eq!(chunks.len(), 3);
+            add_chunked_embeddings(db.conn(), &[(chunks[0].0, make_chunked(0.5))]).unwrap();
+            let error = add_chunked_embeddings(
+                db.conn(),
+                &[(chunks[1].0, make_chunked(0.5)), (chunks[2].0, invalid)],
+            )
+            .unwrap_err();
+            assert!(matches!(error, storage::StorageError::IndexMismatch(_)));
+            assert_eq!(get_unembedded_chunks(db.conn(), 10).unwrap(), chunks[1..]);
+            for table in [
+                "vec_chunks",
+                "embedded_chunk_ids",
+                "embedding_content_hashes",
+            ] {
+                let count: u32 = db
+                    .conn()
+                    .query_row(&format!("SELECT count(*) FROM {table}"), [], |r| r.get(0))
+                    .unwrap();
+                assert_eq!(
+                    count, 1,
+                    "{table} must retain only the previously committed item"
+                );
+            }
+        }
     }
 }

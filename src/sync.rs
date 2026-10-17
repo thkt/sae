@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use amici::cli::progress_step;
+use crate::compat::progress_step;
 use tracing::info;
 
 use crate::client::{ClientError, EsaClient, EsaPost};

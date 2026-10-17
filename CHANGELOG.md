@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **BREAKING**: 埋め込みをEmbeddingGemma 2 BF16（768次元）へ変更し、rerankerと
+  MLX依存を廃止。`SAE_RERANK`は無視する。既存Ruri索引はGemmaと互換性がないため、
+  `sae model download`後に`sae model migrate <team>`でローカルコピーから移行する。
+  モデル不一致・識別情報なしの索引でのベクトル検索・追記は`DATA_ERROR` (65)。
+  移行前も`--no-embed`でFTS検索できる。
+- `sae model migrate <team>`はチェックポイントから再開し、検証後に別DBを選択する。
+  `sae model rollback <team>`で直前のDBへ戻せる。旧DB・旧モデルは削除しない。
+  Ruriのセマンティック検索へ戻すには、更新前に保存したRuri版バイナリを使う。
+- ビルドには固定版llama.cppのsubmoduleが必要。`git submodule update --init --recursive`
+  を実行してからビルドする。CIも同じ固定版を取得する。
 - **BREAKING**: `sae harvest <team>` および `sae harvest <team> --full` を廃止し、
   `sae index <team>`（増分）と `sae rebuild <team>`（全件再構築）の 2 サブコマンドに
   分割。yomu / recall と命名を揃えるため。`--full` の発見性問題も解消する。

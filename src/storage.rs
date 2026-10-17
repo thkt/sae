@@ -6,6 +6,9 @@
 //! lock); moving to multi-process requires schema and lock redesign.
 
 pub(crate) mod embed;
+mod identity;
+mod sqlite_extension;
+pub use identity::{embedding_manifest, validate_embedding_index};
 mod search;
 mod types;
 pub use embed::{
@@ -16,18 +19,17 @@ pub use types::*;
 
 use std::fs;
 use std::path::Path;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 use tracing::warn;
 
-use rurico::embed::EMBEDDING_DIMS;
-use rurico::storage as rurico_storage;
-use rurico::storage::{QueryNormalizationConfig, normalize_for_fts};
+use crate::compat::query::{QueryNormalizationConfig, normalize_for_fts};
+use crate::embedding::EMBEDDING_DIMS;
 
-pub(crate) use amici::storage::{anon_placeholders, as_sql_params, in_placeholders};
+pub(crate) use crate::compat::{anon_placeholders, as_sql_params, in_placeholders};
 
-use amici::storage::collect_rows;
+use crate::compat::collect_rows;
 
 /// `collect_rows` wrapper that fixes `E = StorageError`, removing the
 /// `::<_, _, _, StorageError>` turbofish that the bare helper would otherwise
@@ -49,8 +51,7 @@ pub(crate) fn query_norm_config() -> QueryNormalizationConfig {
 }
 
 /// Zero-copy `&[f32] → &[u8]` for binding embedding vectors to sqlite-vec.
-/// Replaces `rurico::storage::f32_as_bytes` after its removal upstream;
-/// rurico's `compile_error!` for non-little-endian targets is transitive.
+/// Persisted f32 bytes use the little-endian layout supported by sqlite-vec.
 pub(crate) fn f32_as_bytes(v: &[f32]) -> &[u8] {
     bytemuck::cast_slice(v)
 }
@@ -115,10 +116,10 @@ pub struct Db {
 }
 
 pub(crate) fn ensure_sqlite_vec() -> Result<(), StorageError> {
-    rurico_storage::ensure_sqlite_vec().map_err(StorageError::Open)
+    sqlite_extension::register()
 }
 
-fn ddl_vec_chunks() -> String {
+pub(crate) fn ddl_vec_chunks() -> String {
     format!(
         "CREATE VIRTUAL TABLE IF NOT EXISTS vec_chunks USING vec0(\
              embedding FLOAT[{EMBEDDING_DIMS}], \
@@ -129,6 +130,14 @@ fn ddl_vec_chunks() -> String {
 }
 
 impl Db {
+    /// Opens an existing index without schema initialization or recovery writes.
+    pub fn open_read_only(path: &Path) -> Result<Self, StorageError> {
+        ensure_sqlite_vec()?;
+        let conn = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
+        conn.busy_timeout(Duration::from_secs(5))?;
+        Ok(Self { conn })
+    }
+
     pub fn open(path: &Path) -> Result<Self, StorageError> {
         ensure_sqlite_vec()?;
         if let Some(parent) = path.parent() {
@@ -177,6 +186,7 @@ impl Db {
         self.conn.execute_batch(DDL_EMBEDDED_CHUNK_IDS)?;
         self.conn.execute_batch(DDL_FTS)?;
         self.conn.execute_batch(&ddl_vec_chunks())?;
+        identity::initialize(&self.conn)?;
         Ok(())
     }
 }
@@ -346,6 +356,10 @@ pub fn rechunk_post(
                 params.as_slice(),
             )?;
             conn.execute(
+                &format!("DELETE FROM embedding_content_hashes WHERE chunk_id IN ({ph})"),
+                params.as_slice(),
+            )?;
+            conn.execute(
                 &format!("DELETE FROM fts_chunks WHERE rowid IN ({ph})"),
                 params.as_slice(),
             )?;
@@ -416,7 +430,7 @@ pub fn test_post_row(number: u32) -> EsaPostRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rurico::embed::{ChunkedEmbedding, EMBEDDING_DIMS};
+    use crate::embedding::{ChunkedEmbedding, EMBEDDING_DIMS};
     use rusqlite::ffi::{self, ErrorCode};
 
     // T-202: Db::open_memory creates the core tables via init_schema

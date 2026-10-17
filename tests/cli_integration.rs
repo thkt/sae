@@ -23,7 +23,11 @@ fn sae_bin() -> PathBuf {
 /// Builds a `Command` with isolated HOME/XDG dirs so the binary sees an
 /// empty config (no leakage from the developer's real `~/.config/sae`).
 fn sae_command(home: &Path) -> Command {
-    let mut cmd = Command::new(sae_bin());
+    sae_command_with_binary(home, &sae_bin())
+}
+
+fn sae_command_with_binary(home: &Path, binary: &Path) -> Command {
+    let mut cmd = Command::new(binary);
     cmd.env_clear()
         .env("HOME", home)
         .env("XDG_CONFIG_HOME", home.join(".config"))
@@ -222,14 +226,17 @@ fn force_backend_unavailable_with_json_emits_internal_envelope() {
     let env = parse_stderr_envelope(&stderr);
     assert_eq!(env["error"]["code"], "INTERNAL");
     assert_eq!(env["error"]["retryable"], false);
-    assert_eq!(env["error"]["message"], "MLX backend is unavailable");
+    assert_eq!(
+        env["error"]["message"],
+        "Gemma native backend is unavailable"
+    );
     // Exact-equality assertion mirrors T-340 unit test so the wire-level hint
     // and the in-process hint cannot drift independently. T-340 / T-344 pin
     // the source-side const; this anchors the binary-boundary surface to the
     // same literal.
     assert_eq!(
         env["error"]["next_step"],
-        "Install the MLX backend (Apple Silicon required), or pass `--no-embed` for FTS-only search."
+        "Install a build with the Gemma native backend, or pass `--no-embed` for FTS-only search."
     );
     // `candidates` must be present and empty in the envelope (matches the
     // `to_error_envelope` composition pinned by T-342).
@@ -320,11 +327,11 @@ fn force_client_api_404_with_json_emits_data_error_envelope() {
     );
 }
 
-// T-CI010: synthetic reranker-failure search path emits a success envelope
+// T-CI010: synthetic search warning emits a success envelope
 // with `degraded=true` and the storage-layer warning surfaced in `notes[]`.
 // Pins #140 wiring: `SearchOutput.warnings` reaches the `--json` envelope so
-// AI agents can detect the reranker fallback. Unit tests T-221 (storage push)
-// and T-262 / T-263 (output transform) cover the pieces; this test pins the
+// AI agents can detect degraded search. Unit tests T-262 / T-263
+// (output transform) cover the pieces; this test pins the
 // end-to-end process-boundary shape.
 #[cfg(feature = "test-support")]
 #[test]
@@ -349,10 +356,10 @@ fn force_search_warning_with_json_emits_degraded_envelope() {
     );
     let notes = env["notes"].as_array().expect("notes must be an array");
     assert!(
-        notes
-            .iter()
-            .any(|n| n.as_str().is_some_and(|s| s.contains("reranker failed"))),
-        "notes[] must surface the reranker-failure warning; got: {notes:?}"
+        notes.iter().any(|n| n
+            .as_str()
+            .is_some_and(|s| s.contains("search component unavailable"))),
+        "notes[] must surface the search warning; got: {notes:?}"
     );
 }
 
@@ -520,4 +527,425 @@ fn search_no_embed_against_seeded_db_exits_success() {
         "search --no-embed against a seeded DB must exit 0; stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn seed_search_db(home: &Path, legacy: bool) -> PathBuf {
+    use sae::embedding::ChunkedEmbedding;
+    use sae::storage::{self, Db, EsaPostRow};
+    let path = home.join(".local/share/sae/alpha.db");
+    let db = Db::open(&path).unwrap();
+    let post = EsaPostRow {
+        number: 1,
+        name: "認証ガイド".into(),
+        full_name: "dev/認証ガイド".into(),
+        body_md: "Rust API の認証を実装する".into(),
+        category: None,
+        tags: vec![],
+        wip: false,
+        kind: "stock".into(),
+        url: "https://alpha.esa.io/posts/1".into(),
+        created_at: "2026-10-01T00:00:00Z".into(),
+        updated_at: "2026-10-17T00:00:00Z".into(),
+        created_by: "alice".into(),
+        updated_by: "alice".into(),
+        revision_number: 1,
+    };
+    storage::upsert_post(db.conn(), &post).unwrap();
+    storage::rechunk_post(db.conn(), 1, &post.body_md).unwrap();
+    if legacy {
+        let id = storage::get_unembedded_chunks(db.conn(), 1).unwrap()[0].0;
+        let vector = ChunkedEmbedding::new(vec![vec![0.5; 768]]);
+        storage::add_chunked_embeddings(db.conn(), &[(id, vector)]).unwrap();
+        db.conn()
+            .execute("DELETE FROM sae_index_manifest", [])
+            .unwrap();
+    }
+    db.conn()
+        .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+        .unwrap();
+    path
+}
+
+#[test]
+fn no_embed_search_reads_legacy_index_without_loading_corrupt_model_or_writing() {
+    let dir = tempdir().unwrap();
+    write_config_with_teams(dir.path(), &["alpha"]);
+    let path = seed_search_db(dir.path(), true);
+    let before = fs::read(&path).unwrap();
+    let model = dir.path().join("corrupt-model");
+    fs::create_dir(&model).unwrap();
+    fs::write(model.join("model.gguf"), b"corrupt weights").unwrap();
+    fs::write(model.join("tokenizer.json"), b"corrupt tokenizer").unwrap();
+    let output = sae_command(dir.path())
+        .env("SAE_MODEL_DIR", &model)
+        .env("SAE_RERANK", "1")
+        .args(["--json", "search", "認証", "--no-embed"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["degraded"], false);
+    assert_eq!(envelope["notes"], serde_json::json!([]));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("認証ガイド"));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains("checksum"));
+    assert_eq!(
+        fs::read(path).unwrap(),
+        before,
+        "search must preserve DB bytes"
+    );
+}
+
+#[test]
+fn semantic_search_rejects_legacy_vectors_with_json_error_and_preserves_db() {
+    let dir = tempdir().unwrap();
+    write_config_with_teams(dir.path(), &["alpha"]);
+    let path = seed_search_db(dir.path(), true);
+    let before = fs::read(&path).unwrap();
+    let output = sae_command(dir.path())
+        .args(["--json", "search", "認証"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let envelope = parse_stderr_envelope(&String::from_utf8_lossy(&output.stderr));
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("index") || message.contains("Index"),
+        "{message}"
+    );
+    assert!(
+        envelope["error"]["next_step"]
+            .as_str()
+            .is_some_and(|s| s.contains("migrate"))
+    );
+    assert_eq!(fs::read(path).unwrap(), before);
+}
+
+#[test]
+fn missing_and_corrupt_models_degrade_search_with_success_envelope() {
+    for corrupt in [false, true] {
+        let dir = tempdir().unwrap();
+        write_config_with_teams(dir.path(), &["alpha"]);
+        let path = seed_search_db(dir.path(), false);
+        let before = fs::read(&path).unwrap();
+        let model = dir.path().join("model");
+        fs::create_dir(&model).unwrap();
+        if corrupt {
+            fs::write(model.join("model.gguf"), b"not a valid model").unwrap();
+            fs::write(model.join("tokenizer.json"), b"{}").unwrap();
+        }
+        let output = sae_command(dir.path())
+            .env("SAE_MODEL_DIR", &model)
+            .args(["--json", "search", "認証"])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["degraded"], true);
+        assert!(
+            envelope["notes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|note| note.as_str().is_some_and(|s| s.contains("FTS")))
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains("認証ガイド"));
+        assert_eq!(fs::read(path).unwrap(), before);
+    }
+}
+
+// test-support intentionally substitutes a model-free migration embedder.
+// Run this production-loader contract in the default-feature suite.
+#[cfg(not(feature = "test-support"))]
+#[test]
+fn migrate_without_model_keeps_local_source_and_returns_error_envelope() {
+    let dir = tempdir().unwrap();
+    write_config_with_teams(dir.path(), &["alpha"]);
+    let path = seed_search_db(dir.path(), true);
+    let before = fs::read(&path).unwrap();
+    let output = sae_command(dir.path())
+        .args(["--json", "model", "migrate", "alpha"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let envelope = parse_stderr_envelope(&String::from_utf8_lossy(&output.stderr));
+    assert!(envelope["error"]["message"].is_string());
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(!path.with_file_name("alpha.active.json").exists());
+}
+
+#[cfg(not(feature = "test-support"))]
+#[test]
+fn migrate_corrupt_model_emits_internal_error_and_preserves_active_source() {
+    let dir = tempdir().unwrap();
+    write_config_with_teams(dir.path(), &["alpha"]);
+    let path = seed_search_db(dir.path(), true);
+    let before = fs::read(&path).unwrap();
+    let model = dir.path().join("corrupt-model");
+    fs::create_dir(&model).unwrap();
+    fs::write(model.join("model.gguf"), b"invalid weights").unwrap();
+    fs::write(model.join("tokenizer.json"), b"{}").unwrap();
+    let output = sae_command(dir.path())
+        .env("SAE_MODEL_DIR", model)
+        .args(["--json", "model", "migrate", "alpha"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(70));
+    let envelope = parse_stderr_envelope(&String::from_utf8_lossy(&output.stderr));
+    assert_eq!(envelope["error"]["code"], "INTERNAL");
+    assert_eq!(envelope["error"]["retryable"], false);
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("checksum"),
+        "corruption reason must be visible: {message}"
+    );
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(!path.with_file_name("alpha.active.json").exists());
+}
+
+/// A valid envelope is insufficient if native model teardown aborts afterward.
+#[test]
+#[ignore = "requires pinned Gemma artifacts in SAE_MODEL_DIR; launches the real CLI"]
+fn real_semantic_search_exits_successfully_after_emitting_json() {
+    use sae::{
+        model,
+        storage::{self, Db},
+    };
+    let artifacts = env::var_os("SAE_MODEL_DIR").expect("explicit isolated pinned model directory");
+    assert!(
+        Path::new(&artifacts).is_absolute(),
+        "SAE_MODEL_DIR must be absolute"
+    );
+    let gpu = model::gpu_available().expect("backend hardware diagnostic");
+    let home = tempdir().unwrap();
+    write_config_with_teams(home.path(), &["alpha"]);
+    let path = seed_search_db(home.path(), false);
+    if gpu {
+        let db = Db::open(&path).unwrap();
+        let chunks = storage::get_unembedded_chunks(db.conn(), 10).unwrap();
+        assert_eq!(
+            chunks.len(),
+            1,
+            "fixture reaches one real document embedding"
+        );
+        let texts: Vec<_> = chunks.iter().map(|(_, content)| content.as_str()).collect();
+        let embedder = model::load_verified().expect("pinned real model must be available");
+        let vectors = embedder.embed_documents_batch(&texts).unwrap();
+        let embeddings: Vec<_> = chunks.iter().map(|(id, _)| *id).zip(vectors).collect();
+        storage::add_chunked_embeddings(db.conn(), &embeddings).unwrap();
+        storage::validate_embedding_index(db.conn()).unwrap();
+        db.conn()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+    }
+    // The real model used for setup is released before the child acquires it.
+    let before = fs::read(&path).unwrap();
+    let mut command = sae_command_with_binary(home.path(), Path::new(env!("CARGO_BIN_EXE_sae")));
+    let output = command
+        .env("SAE_MODEL_DIR", artifacts)
+        .args(["--json", "search", "Rust API の認証", "--team", "alpha"])
+        .output()
+        .expect("spawn real sae CLI");
+    let envelope: serde_json::Value =
+        serde_json::from_slice(&output.stdout).unwrap_or_else(|error| {
+            panic!(
+                "valid search JSON expected: {error}; stdout={}; stderr={}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            )
+        });
+    assert_eq!(envelope["degraded"], !gpu);
+    assert_eq!(
+        envelope["data"]["search_mode"],
+        if gpu { "hybrid" } else { "fts" }
+    );
+    assert_eq!(
+        envelope["notes"],
+        if gpu {
+            serde_json::json!([])
+        } else {
+            serde_json::json!(["semantic search unavailable, falling back to FTS"])
+        }
+    );
+    assert_eq!(envelope["data"]["results"][0]["post_number"], 1);
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "real search must exit normally after JSON; status={}; stderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read(path).unwrap(),
+        before,
+        "semantic search remains read-only"
+    );
+}
+
+#[test]
+fn migrate_current_index_reports_success_without_model_and_preserves_database() {
+    use sae::embedding::ChunkedEmbedding;
+    use sae::storage::{self, Db};
+    let dir = tempdir().unwrap();
+    write_config_with_teams(dir.path(), &["alpha"]);
+    let path = seed_search_db(dir.path(), false);
+    {
+        let db = Db::open(&path).unwrap();
+        let id = storage::get_unembedded_chunks(db.conn(), 1).unwrap()[0].0;
+        let mut vector = vec![0.0; 768];
+        vector[0] = 1.0;
+        storage::add_chunked_embeddings(db.conn(), &[(id, ChunkedEmbedding::new(vec![vector]))])
+            .unwrap();
+        db.conn()
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE)")
+            .unwrap();
+    }
+    let before = fs::read(&path).unwrap();
+    let output = sae_command(dir.path())
+        .args(["--json", "model", "migrate", "alpha"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["data"]["action"], "already current");
+    assert_eq!(envelope["data"]["model"], "EmbeddingGemma 2");
+    assert_eq!(envelope["data"]["chunks"], 1);
+    assert_eq!(envelope["degraded"], false);
+    assert_eq!(fs::read(&path).unwrap(), before);
+    assert!(!path.with_file_name("alpha.active.json").exists());
+}
+
+#[test]
+fn rollback_command_selects_retained_database_and_keeps_both_files() {
+    let dir = tempdir().unwrap();
+    write_config_with_teams(dir.path(), &["alpha"]);
+    let legacy = seed_search_db(dir.path(), true);
+    let current = legacy.with_file_name("alpha.current.db");
+    fs::copy(&legacy, &current).unwrap();
+    let before_legacy = fs::read(&legacy).unwrap();
+    let before_current = fs::read(&current).unwrap();
+    let pointer = legacy.with_file_name("alpha.active.json");
+    fs::write(
+        &pointer,
+        r#"{"version":1,"active":"alpha.current.db","previous":"alpha.db"}"#,
+    )
+    .unwrap();
+    let output = sae_command(dir.path())
+        .args(["--json", "model", "rollback", "alpha"])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["data"]["action"], "rolled back");
+    assert_eq!(envelope["data"]["chunks"], 1);
+    assert!(envelope["data"]["model"].is_null());
+    assert_eq!(envelope["degraded"], false);
+    let selected: serde_json::Value = serde_json::from_slice(&fs::read(&pointer).unwrap()).unwrap();
+    assert_eq!(selected["active"], "alpha.db");
+    assert_eq!(selected["previous"], "alpha.current.db");
+    assert_eq!(fs::read(legacy).unwrap(), before_legacy);
+    assert_eq!(fs::read(current).unwrap(), before_current);
+}
+
+#[test]
+fn migration_commands_without_local_data_report_errors_and_create_no_database() {
+    let dir = tempdir().unwrap();
+    write_config_with_teams(dir.path(), &["alpha"]);
+    for command in ["migrate", "rollback"] {
+        let output = sae_command(dir.path())
+            .args(["--json", "model", command, "alpha"])
+            .output()
+            .unwrap();
+        assert!(!output.status.success());
+        let envelope = parse_stderr_envelope(&String::from_utf8_lossy(&output.stderr));
+        let message = envelope["error"]["message"].as_str().unwrap();
+        assert!(
+            message.contains(if command == "migrate" {
+                "No local index"
+            } else {
+                "No previous index"
+            }),
+            "{message}"
+        );
+        let data = dir.path().join(".local/share/sae");
+        assert!(!data.join("alpha.db").exists());
+        assert!(!data.join("alpha.active.json").exists());
+    }
+}
+
+#[test]
+#[ignore = "requires pinned Gemma artifacts in SAE_MODEL_DIR; launches the real CLI"]
+fn real_model_download_reuses_verified_cache_and_reports_hardware_result() {
+    use sae::model;
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    fn digest(path: &Path) -> String {
+        let mut file = fs::File::open(path).unwrap();
+        let mut hash = Sha256::new();
+        let mut buffer = [0_u8; 65536];
+        loop {
+            let size = file.read(&mut buffer).unwrap();
+            if size == 0 {
+                break;
+            }
+            hash.update(&buffer[..size]);
+        }
+        hash.finalize()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+    let artifacts = env::var_os("SAE_MODEL_DIR").expect("explicit isolated pinned model directory");
+    let model_dir = Path::new(&artifacts);
+    assert!(model_dir.is_absolute());
+    let spec = model::ModelSpec::default();
+    let weights = model_dir.join("model.gguf");
+    let tokenizer = model_dir.join("tokenizer.json");
+    assert_eq!(digest(&weights), spec.model_sha256);
+    assert_eq!(digest(&tokenizer), spec.tokenizer_sha256);
+    let gpu = model::gpu_available().expect("backend hardware diagnostic");
+    let home = tempdir().unwrap();
+    let output = sae_command_with_binary(home.path(), Path::new(env!("CARGO_BIN_EXE_sae")))
+        .env("SAE_MODEL_DIR", &artifacts)
+        .args(["--json", "model", "download"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(if gpu { 0 } else { 70 }),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if gpu {
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["data"]["status"], "ok");
+        assert_eq!(envelope["degraded"], false);
+    } else {
+        let envelope = parse_stderr_envelope(&String::from_utf8_lossy(&output.stderr));
+        assert_eq!(envelope["error"]["code"], "INTERNAL");
+        assert_eq!(envelope["error"]["retryable"], false);
+        assert!(
+            envelope["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("backend")
+        );
+    }
+    assert_eq!(digest(&weights), spec.model_sha256);
+    assert_eq!(digest(&tokenizer), spec.tokenizer_sha256);
 }
