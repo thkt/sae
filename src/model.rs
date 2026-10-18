@@ -439,17 +439,6 @@ mod tests {
             stderr.flush().unwrap();
             process::exit(17);
         }
-        #[cfg(unix)]
-        if mode == "signal" {
-            eprintln!("SAE_TEST_PROBE_CAUSE: fixture received termination");
-            let status = Command::new("kill")
-                .args(["-TERM", &process::id().to_string()])
-                .status()
-                .unwrap();
-            assert!(status.success());
-            thread::sleep(Duration::from_secs(60));
-            process::exit(98);
-        }
         if mode == "sleep" {
             let path = env::var_os("__SAE_TEST_PROBE_PID").unwrap();
             fs::write(path, process::id().to_string()).unwrap();
@@ -517,8 +506,12 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn isolated_probe_signal_failure_reports_termination_and_cause() {
-        let mut command = child_test("model::tests::isolated_probe_child");
-        command.env("__SAE_TEST_PROBE_MODE", "signal");
+        // Terminate a real child by signal while the instrumented Rust test exits normally.
+        let mut command = Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf '%s\\n' 'SAE_TEST_PROBE_CAUSE: fixture received termination' >&2; kill -TERM \"$$\"",
+        ]);
         let error = super::run_probe(&mut command, Duration::from_secs(5)).unwrap_err();
         let message = format!("{error:#}");
         assert!(
