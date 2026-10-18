@@ -4,13 +4,16 @@ use crate::{
 };
 use anyhow::{Context, Result, ensure};
 use llama_cpp_2::{
+    LlamaBackendDevice, LlamaBackendDeviceType,
     context::params::{LlamaAttentionType, LlamaContextParams, LlamaPoolingType},
+    list_llama_ggml_backend_devices,
     llama_backend::LlamaBackend,
     llama_batch::LlamaBatch,
     model::{LlamaModel, params::LlamaModelParams},
     token::LlamaToken,
 };
 use std::{
+    env,
     num::NonZeroU32,
     path::{Path, PathBuf},
     sync::{Mutex, OnceLock},
@@ -25,7 +28,9 @@ fn backend() -> Result<&'static LlamaBackend> {
         .get_or_init(|| {
             LlamaBackend::init()
                 .map(|mut b| {
-                    b.void_logs();
+                    if env::var_os("__SAE_GEMMA_PROBE").is_none() {
+                        b.void_logs();
+                    }
                     b
                 })
                 .map_err(|e| e.to_string())
@@ -33,8 +38,22 @@ fn backend() -> Result<&'static LlamaBackend> {
         .as_ref()
         .map_err(|e| anyhow::anyhow!(e.clone()))
 }
+fn usable_gpu(device: &LlamaBackendDevice) -> bool {
+    matches!(device.device_type, LlamaBackendDeviceType::Gpu | LlamaBackendDeviceType::IntegratedGpu)
+        // Metal can register an unnamed device even when the OS denies GPU access.
+        && (device.backend != "MTL" || !device.name.is_empty())
+}
+
 pub fn gpu_available() -> Result<bool> {
-    Ok(backend()?.supports_gpu_offload())
+    backend()?;
+    Ok(list_llama_ggml_backend_devices().iter().any(usable_gpu))
+}
+
+pub fn backend_available() -> Result<bool> {
+    Ok(gpu_available()?
+        || list_llama_ggml_backend_devices()
+            .iter()
+            .any(|device| device.device_type == LlamaBackendDeviceType::Cpu))
 }
 
 pub fn capacity_for(tokens: usize) -> Result<u32> {
@@ -60,11 +79,15 @@ impl Gemma {
     pub fn load(path: &Path, tokenizer: &Path, spec: ModelSpec) -> Result<Self> {
         spec.validate()?;
         let b = backend()?;
-        let model = LlamaModel::load_from_file(
-            b,
-            path,
-            &LlamaModelParams::default().with_n_gpu_layers(1000),
-        )?;
+        let devices: Vec<_> = list_llama_ggml_backend_devices()
+            .iter()
+            .filter(|device| usable_gpu(device))
+            .map(|device| device.index)
+            .collect();
+        let params = LlamaModelParams::default()
+            .with_n_gpu_layers(if devices.is_empty() { 0 } else { 1000 })
+            .with_devices(&devices)?;
+        let model = LlamaModel::load_from_file(b, path, &params)?;
         ensure!(
             model.n_embd_out() == i32::try_from(EMBEDDING_DIMS)?,
             "expected projected 768 dimensions"
@@ -286,6 +309,67 @@ impl Embed for Gemma {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn gpu_device_selection_rejects_empty_metal_registration_and_cpu() {
+        use llama_cpp_2::{LlamaBackendDevice, LlamaBackendDeviceType};
+        let device =
+            |device_type, backend: &str, description: &str, memory_total| LlamaBackendDevice {
+                index: 0,
+                name: "device0".into(),
+                description: description.into(),
+                backend: backend.into(),
+                memory_total,
+                memory_free: memory_total / 2,
+                device_type,
+            };
+        // Observed in the restricted environment when no OS Metal device is visible.
+        let empty_metal = LlamaBackendDevice {
+            index: 0,
+            name: String::new(),
+            description: String::new(),
+            backend: "MTL".into(),
+            memory_total: 0,
+            memory_free: 0,
+            device_type: LlamaBackendDeviceType::Gpu,
+        };
+        assert!(
+            !super::usable_gpu(&empty_metal),
+            "a Metal registry entry without a physical device must select CPU"
+        );
+        for gpu in [
+            device(
+                LlamaBackendDeviceType::Gpu,
+                "MTL",
+                "Apple fixture GPU",
+                1_000_000_000,
+            ),
+            device(
+                LlamaBackendDeviceType::Gpu,
+                "CUDA",
+                "fixture GPU",
+                1_000_000_000,
+            ),
+            device(
+                LlamaBackendDeviceType::IntegratedGpu,
+                "Vulkan",
+                "fixture iGPU",
+                500_000_000,
+            ),
+        ] {
+            assert!(
+                super::usable_gpu(&gpu),
+                "available GPU must remain selected: {gpu:?}"
+            );
+        }
+        let cpu = device(
+            LlamaBackendDeviceType::Cpu,
+            "CPU",
+            "fixture CPU",
+            1_000_000_000,
+        );
+        assert!(!super::usable_gpu(&cpu), "a CPU is not a GPU");
+    }
+
     #[test]
     fn native_context_capacity_handles_limit_and_rejects_outside_contract() {
         use super::capacity_for;
