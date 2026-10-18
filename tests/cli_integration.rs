@@ -662,11 +662,10 @@ fn real_semantic_search_exits_successfully_after_emitting_json() {
         Path::new(&artifacts).is_absolute(),
         "SAE_MODEL_DIR must be absolute"
     );
-    let gpu = model::gpu_available().expect("backend hardware diagnostic");
     let home = tempdir().unwrap();
     write_config_with_teams(home.path(), &["alpha"]);
     let path = seed_search_db(home.path(), false);
-    if gpu {
+    {
         let db = Db::open(&path).unwrap();
         let chunks = storage::get_unembedded_chunks(db.conn(), 10).unwrap();
         assert_eq!(
@@ -699,19 +698,9 @@ fn real_semantic_search_exits_successfully_after_emitting_json() {
                 String::from_utf8_lossy(&output.stderr)
             )
         });
-    assert_eq!(envelope["degraded"], !gpu);
-    assert_eq!(
-        envelope["data"]["search_mode"],
-        if gpu { "hybrid" } else { "fts" }
-    );
-    assert_eq!(
-        envelope["notes"],
-        if gpu {
-            serde_json::json!([])
-        } else {
-            serde_json::json!(["semantic search unavailable, falling back to FTS"])
-        }
-    );
+    assert_eq!(envelope["degraded"], false);
+    assert_eq!(envelope["data"]["search_mode"], "hybrid");
+    assert_eq!(envelope["notes"], serde_json::json!([]));
     assert_eq!(envelope["data"]["results"][0]["post_number"], 1);
     assert_eq!(
         output.status.code(),
@@ -856,7 +845,6 @@ fn real_model_download_reuses_verified_cache_and_reports_hardware_result() {
     let tokenizer = model_dir.join("tokenizer.json");
     assert_eq!(digest(&weights), spec.model_sha256);
     assert_eq!(digest(&tokenizer), spec.tokenizer_sha256);
-    let gpu = model::gpu_available().expect("backend hardware diagnostic");
     let home = tempdir().unwrap();
     let output = sae_command_with_binary(home.path(), Path::new(env!("CARGO_BIN_EXE_sae")))
         .env("SAE_MODEL_DIR", &artifacts)
@@ -865,25 +853,90 @@ fn real_model_download_reuses_verified_cache_and_reports_hardware_result() {
         .unwrap();
     assert_eq!(
         output.status.code(),
-        Some(if gpu { 0 } else { 70 }),
+        Some(0),
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    if gpu {
-        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
-        assert_eq!(envelope["data"]["status"], "ok");
-        assert_eq!(envelope["degraded"], false);
-    } else {
-        let envelope = parse_stderr_envelope(&String::from_utf8_lossy(&output.stderr));
-        assert_eq!(envelope["error"]["code"], "INTERNAL");
-        assert_eq!(envelope["error"]["retryable"], false);
-        assert!(
-            envelope["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("backend")
-        );
-    }
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["data"]["status"], "ok");
+    assert_eq!(envelope["degraded"], false);
     assert_eq!(digest(&weights), spec.model_sha256);
     assert_eq!(digest(&tokenizer), spec.tokenizer_sha256);
+}
+
+#[test]
+fn isolated_model_probe_reports_artifact_failure_on_stderr() {
+    use sae::model::ModelSpec;
+    let home = tempdir().unwrap();
+    let model = home.path().join("corrupt-model");
+    fs::create_dir(&model).unwrap();
+    fs::write(model.join("model.gguf"), b"invalid weights").unwrap();
+    fs::write(model.join("tokenizer.json"), b"{}").unwrap();
+    let output = sae_command_with_binary(home.path(), Path::new(env!("CARGO_BIN_EXE_sae")))
+        .env("SAE_MODEL_DIR", &model)
+        .env("__SAE_GEMMA_PROBE", "1")
+        .env(
+            "__SAE_GEMMA_SPEC",
+            serde_json::to_string(&ModelSpec::default()).unwrap(),
+        )
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "corrupt artifacts must fail the probe"
+    );
+    assert!(output.stdout.is_empty(), "probe must keep stdout silent");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("checksum"),
+        "probe must expose artifact validation cause; status={}; stderr={stderr}",
+        output.status
+    );
+    assert_eq!(
+        fs::read(model.join("model.gguf")).unwrap(),
+        b"invalid weights"
+    );
+    assert_eq!(fs::read(model.join("tokenizer.json")).unwrap(), b"{}");
+}
+
+#[test]
+fn isolated_model_probe_reports_native_gguf_parse_failure_on_stderr() {
+    use sae::model::ModelSpec;
+    use sha2::{Digest, Sha256};
+    fn digest(bytes: &[u8]) -> String {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect()
+    }
+    let home = tempdir().unwrap();
+    let model = home.path().join("invalid-gguf-model");
+    fs::create_dir(&model).unwrap();
+    let weights = b"NOPE definitely not a GGUF model";
+    let tokenizer = b"{}";
+    fs::write(model.join("model.gguf"), weights).unwrap();
+    fs::write(model.join("tokenizer.json"), tokenizer).unwrap();
+    let spec = ModelSpec {
+        model_sha256: digest(weights),
+        tokenizer_sha256: digest(tokenizer),
+        ..ModelSpec::default()
+    };
+    spec.validate()
+        .expect("fixture must pass manifest validation");
+    let output = sae_command_with_binary(home.path(), Path::new(env!("CARGO_BIN_EXE_sae")))
+        .env("SAE_MODEL_DIR", &model)
+        .env("__SAE_GEMMA_PROBE", "1")
+        .env("__SAE_GEMMA_SPEC", serde_json::to_string(&spec).unwrap())
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert_eq!(output.status.code(), Some(1), "{stderr}");
+    assert!(output.stdout.is_empty(), "probe must keep stdout silent");
+    assert!(
+        stderr.contains("invalid magic") && stderr.contains("NOPE") && stderr.contains("GGUF"),
+        "probe must expose native parser root cause after checksum validation; status={}; stderr={stderr}",
+        output.status
+    );
+    assert_eq!(fs::read(model.join("model.gguf")).unwrap(), weights);
+    assert_eq!(fs::read(model.join("tokenizer.json")).unwrap(), tokenizer);
 }

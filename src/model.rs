@@ -1,3 +1,4 @@
+use crate::native::backend_available;
 pub use crate::native::gpu_available;
 use crate::{embedding::Embed, native::Gemma};
 use anyhow::{Context, Result, ensure};
@@ -8,7 +9,7 @@ use std::{
     env,
     fmt::{self, Write as _},
     fs,
-    io::{self, Read, Write},
+    io::{self, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     process::{self, Command, Stdio},
     sync::{Arc, OnceLock},
@@ -236,18 +237,26 @@ pub fn handle_probe_if_needed() {
         SELECTED
             .set(spec)
             .map_err(|_| anyhow::anyhow!("model already selected"))?;
-        if !gpu_available()? {
+        if !backend_available()? {
             process::exit(2);
         }
-        let model = load_verified()?;
-        let v = model.embed_query("model probe")?;
+        let model = load_verified().context("loading probe model")?;
+        let v = model
+            .embed_query("model probe")
+            .context("encoding probe query")?;
         ensure!(
             v.len() == 768 && v.iter().all(|x| x.is_finite()),
             "invalid probe embedding"
         );
         Ok(())
     })();
-    process::exit(if result.is_ok() { 0 } else { 1 });
+    match result {
+        Ok(()) => process::exit(0),
+        Err(error) => {
+            eprintln!("model probe failed: {error:#}");
+            process::exit(1);
+        }
+    }
 }
 fn probe() -> Result<bool> {
     let mut command = Command::new(env::current_exe()?);
@@ -258,10 +267,12 @@ fn probe() -> Result<bool> {
 }
 
 fn run_probe(command: &mut Command, timeout: Duration) -> Result<bool> {
+    // A file avoids pipe backpressure and inherited-pipe EOF waits on timeout.
+    let mut stderr = tempfile::tempfile()?;
     let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(stderr.try_clone()?)
         .spawn()?;
     let deadline = Instant::now() + timeout;
     loop {
@@ -269,17 +280,33 @@ fn run_probe(command: &mut Command, timeout: Duration) -> Result<bool> {
             if status.code() == Some(2) {
                 return Ok(false);
             }
-            ensure!(status.success(), "isolated model probe failed");
+            if !status.success() {
+                anyhow::bail!(
+                    "isolated model probe failed ({status}): {}",
+                    probe_diagnostics(&mut stderr)?
+                );
+            }
             return Ok(true);
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
             let _ = child.wait();
-            anyhow::bail!("isolated model probe timed out")
+            anyhow::bail!(
+                "isolated model probe timed out: {}",
+                probe_diagnostics(&mut stderr)?
+            )
         }
         thread::sleep(Duration::from_millis(10));
     }
 }
+fn probe_diagnostics(stderr: &mut fs::File) -> Result<String> {
+    let len = stderr.metadata()?.len();
+    stderr.seek(SeekFrom::Start(len.saturating_sub(8192)))?;
+    let mut bytes = Vec::new();
+    stderr.take(8192).read_to_end(&mut bytes)?;
+    Ok(String::from_utf8_lossy(&bytes).trim().to_owned())
+}
+
 pub fn try_load_embedder_default_logging() -> Result<Arc<dyn Embed>, DegradedReason> {
     match cached_artifacts() {
         Ok(None) => return Err(DegradedReason::NotInstalled),
@@ -401,6 +428,28 @@ mod tests {
         let Ok(mode) = env::var("__SAE_TEST_PROBE_MODE") else {
             return;
         };
+        if mode == "failure" || mode == "large-stderr" {
+            use std::io::Write as _;
+            let mut stderr = io::stderr().lock();
+            if mode == "large-stderr" {
+                // Exceed typical OS pipe capacity before writing the diagnostic tail.
+                stderr.write_all(&vec![b'x'; 256 * 1024]).unwrap();
+            }
+            writeln!(stderr, "\nSAE_TEST_PROBE_CAUSE: fixture backend failed").unwrap();
+            stderr.flush().unwrap();
+            process::exit(17);
+        }
+        #[cfg(unix)]
+        if mode == "signal" {
+            eprintln!("SAE_TEST_PROBE_CAUSE: fixture received termination");
+            let status = Command::new("kill")
+                .args(["-TERM", &process::id().to_string()])
+                .status()
+                .unwrap();
+            assert!(status.success());
+            thread::sleep(Duration::from_secs(60));
+            process::exit(98);
+        }
         if mode == "sleep" {
             let path = env::var_os("__SAE_TEST_PROBE_PID").unwrap();
             fs::write(path, process::id().to_string()).unwrap();
@@ -428,6 +477,58 @@ mod tests {
         }
         let mut missing = Command::new("/sae-test-no-such-program");
         assert!(super::run_probe(&mut missing, Duration::from_secs(1)).is_err());
+    }
+
+    #[test]
+    fn isolated_probe_failure_reports_exit_status_and_stderr_cause() {
+        let mut command = child_test("model::tests::isolated_probe_child");
+        command.env("__SAE_TEST_PROBE_MODE", "failure");
+        let error = super::run_probe(&mut command, Duration::from_secs(5)).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("17"),
+            "exit status must be visible: {message}"
+        );
+        assert!(
+            message.contains("SAE_TEST_PROBE_CAUSE: fixture backend failed"),
+            "child stderr cause must be visible: {message}"
+        );
+    }
+
+    #[test]
+    fn isolated_probe_drains_large_stderr_without_deadlock_and_retains_cause() {
+        let mut command = child_test("model::tests::isolated_probe_child");
+        command.env("__SAE_TEST_PROBE_MODE", "large-stderr");
+        let started = Instant::now();
+        let error = super::run_probe(&mut command, Duration::from_secs(5)).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        assert!(
+            !message.contains("timed out"),
+            "child must finish after writing stderr"
+        );
+        assert!(message.contains("17"), "exit status must be visible");
+        assert!(
+            message.contains("SAE_TEST_PROBE_CAUSE: fixture backend failed"),
+            "diagnostic tail must survive output larger than pipe capacity"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn isolated_probe_signal_failure_reports_termination_and_cause() {
+        let mut command = child_test("model::tests::isolated_probe_child");
+        command.env("__SAE_TEST_PROBE_MODE", "signal");
+        let error = super::run_probe(&mut command, Duration::from_secs(5)).unwrap_err();
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("signal") || message.contains("SIGTERM"),
+            "signal termination must be visible: {message}"
+        );
+        assert!(
+            message.contains("fixture received termination"),
+            "{message}"
+        );
     }
 
     #[cfg(unix)]

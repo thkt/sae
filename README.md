@@ -8,7 +8,7 @@ esaの検索は全文検索だが、ローカルで高速に検索したい場�
 
 ## セットアップ
 
-初回ビルドにはRust 1.99.1、CMake、C/C++コンパイラが必要。macOSではXcode Command Line Toolsを導入する。Apple SiliconではMetalを使用する。`rust-toolchain.toml`でローカルのRustを指定し、CIも同じ版で検証する。
+初回ビルドにはRust 1.99.1、CMake、C/C++コンパイラが必要。macOSではXcode Command Line Toolsを導入する。Apple Siliconでは利用可能ならMetalを使用し、GPUが検出されない環境ではCPUで実行する。`rust-toolchain.toml`でローカルのRustを指定し、CIも同じ版で検証する。
 
 ```bash
 git submodule update --init --recursive
@@ -131,7 +131,7 @@ sae model migrate myteam
 sae model rollback myteam
 ```
 
-埋め込みは **EmbeddingGemma 2のBF16版（768次元）** を使用し、rerankerは使わない。従来の`SAE_RERANK`は無視する。モデルとtokenizerは固定版・SHA-256を検証して導入する。キャッシュは通常`~/.cache/sae/models/<identity>/`、`XDG_CACHE_HOME`指定時はその配下、`HF_HOME`指定時は`<HF_HOME>/sae/models/<identity>/`となる。`SAE_MODEL_DIR`で重みとtokenizerを置いたディレクトリを明示できる。
+埋め込みは **EmbeddingGemma 2のBF16版（768次元）** を使用し、rerankerは使わない。従来の`SAE_RERANK`は無視する。制限付き環境でMetalデバイスが見えない場合も、同じモデルをCPUで検証・実行する。CPU実行はGPU実行より時間がかかる。モデルとtokenizerは固定版・SHA-256を検証して導入する。キャッシュは通常`~/.cache/sae/models/<identity>/`、`XDG_CACHE_HOME`指定時はその配下、`HF_HOME`指定時は`<HF_HOME>/sae/models/<identity>/`となる。`SAE_MODEL_DIR`で重みとtokenizerを置いたディレクトリを明示できる。
 
 #### 旧索引からの移行
 
