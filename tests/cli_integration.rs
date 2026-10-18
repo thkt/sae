@@ -412,6 +412,42 @@ fn esa_client_rejects_non_esa_host() {
 }
 
 #[test]
+fn search_without_index_reports_usage_error_and_creates_no_database() {
+    let home = tempdir().unwrap();
+    write_config_with_teams(home.path(), &["alpha"]);
+    let data_dir = home.path().join(".local/share/sae");
+    fs::create_dir_all(&data_dir).unwrap();
+    assert_eq!(fs::read_dir(&data_dir).unwrap().count(), 0);
+
+    let output = sae_command(home.path())
+        .args(["--json", "search", "認証", "--team", "alpha"])
+        .output()
+        .expect("spawn real sae CLI");
+
+    assert_eq!(
+        output.status.code(),
+        Some(64),
+        "an unindexed team must report USAGE_ERROR; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stdout.is_empty());
+    let envelope = parse_stderr_envelope(&String::from_utf8_lossy(&output.stderr));
+    assert_eq!(envelope["error"]["code"], "USAGE_ERROR");
+    assert_eq!(envelope["error"]["retryable"], false);
+    let message = envelope["error"]["message"].as_str().unwrap();
+    assert!(message.contains("No data for team 'alpha'"), "{message}");
+    assert_eq!(
+        envelope["error"]["next_step"],
+        "Run `sae index <team>` to fetch posts."
+    );
+    assert_eq!(
+        fs::read_dir(&data_dir).unwrap().count(),
+        0,
+        "search must not create a database, schema, or index selection"
+    );
+}
+
+#[test]
 fn search_no_embed_against_seeded_db_exits_success() {
     use sae::storage::{Db, rechunk_post, test_post_row, upsert_post};
 
@@ -647,6 +683,86 @@ fn migrate_corrupt_model_emits_internal_error_and_preserves_active_source() {
     );
     assert_eq!(fs::read(&path).unwrap(), before);
     assert!(!path.with_file_name("alpha.active.json").exists());
+}
+
+#[test]
+#[ignore = "requires pinned Gemma artifacts in SAE_MODEL_DIR; launches the real CLI"]
+fn real_model_search_keeps_unembedded_index_fts_only_and_unchanged() {
+    use std::io::ErrorKind;
+
+    use sae::{
+        model,
+        storage::{self, Db},
+    };
+
+    let artifacts = env::var_os("SAE_MODEL_DIR").expect("explicit isolated pinned model directory");
+    assert!(
+        Path::new(&artifacts).is_absolute(),
+        "SAE_MODEL_DIR must be absolute"
+    );
+    let query = "Rust API の認証";
+    {
+        let embedder = model::load_verified().expect("pinned real model must load");
+        let vector = embedder
+            .embed_query(query)
+            .expect("real query embedding must succeed");
+        assert_eq!(vector.len(), 768);
+        assert!(vector.iter().all(|value| value.is_finite()));
+    }
+    // Release the setup model before the child loads it.
+    let home = tempdir().unwrap();
+    write_config_with_teams(home.path(), &["alpha"]);
+    let path = seed_search_db(home.path(), false);
+    let counts = || {
+        let db = Db::open_read_only(&path).unwrap();
+        (
+            storage::count_posts(db.conn()).unwrap(),
+            storage::count_chunks(db.conn()).unwrap(),
+            storage::count_unembedded_chunks(db.conn()).unwrap(),
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM vec_chunks", [], |row| {
+                    row.get::<_, u32>(0)
+                })
+                .unwrap(),
+            db.conn()
+                .query_row("SELECT COUNT(*) FROM embedded_chunk_ids", [], |row| {
+                    row.get::<_, u32>(0)
+                })
+                .unwrap(),
+        )
+    };
+    let before_counts = counts();
+    assert_eq!(before_counts, (1, 1, 1, 0, 0));
+    let before = fs::read(&path).unwrap();
+    let output = sae_command_with_binary(home.path(), Path::new(env!("CARGO_BIN_EXE_sae")))
+        .env("SAE_MODEL_DIR", artifacts)
+        .args(["--json", "search", query, "--team", "alpha"])
+        .output()
+        .expect("spawn real sae CLI");
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "search must exit normally; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(envelope["degraded"], false);
+    assert_eq!(envelope["notes"], serde_json::json!([]));
+    assert_eq!(envelope["data"]["search_mode"], "fts");
+    assert_eq!(envelope["data"]["results"][0]["post_number"], 1);
+    assert_eq!(counts(), before_counts, "search must not index or embed");
+    assert_eq!(
+        fs::read(&path).unwrap(),
+        before,
+        "search must preserve DB bytes"
+    );
+    // Main-file equality alone would miss writes retained in the WAL.
+    let wal = path.with_file_name("alpha.db-wal");
+    match fs::metadata(wal) {
+        Ok(metadata) => assert_eq!(metadata.len(), 0, "search must not write WAL pages"),
+        Err(error) => assert_eq!(error.kind(), ErrorKind::NotFound),
+    }
 }
 
 // Check process exit too: native teardown can abort after JSON is emitted.
