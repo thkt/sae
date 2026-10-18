@@ -15,8 +15,6 @@ git submodule update --init --recursive
 cargo install --path .
 ```
 
-既存のRuri版から更新する場合は、インストール前に現在のバイナリを別名で保存する（例: `cp "$(command -v sae)" /保存先/sae-ruri`）。索引の移行手順は後述。
-
 ### 環境変数
 
 ```bash
@@ -39,10 +37,10 @@ export ESA_ACCESS_TOKEN="your-token"
 ### 投稿の取得・検索
 
 ```bash
-# チームの投稿をインデックス（増分。旧 `sae harvest myteam` は v0.3.0 で廃止）
+# チームの投稿をインデックス（増分）
 sae index myteam
 
-# 全件再構築（差分追従が破綻したときなど。旧 `sae harvest myteam --full` 相当）
+# 全件再構築（差分追従が破綻したときなど）
 sae rebuild myteam
 
 # 検索（shorthand: 既知サブコマンド以外の単一 positional は `sae search` に展開され、stderr に `→ sae search ...` のヒントが出る）
@@ -131,7 +129,7 @@ sae model migrate myteam
 sae model rollback myteam
 ```
 
-埋め込みは **EmbeddingGemma 2のBF16版（768次元）** を使用し、rerankerは使わない。従来の`SAE_RERANK`は無視する。制限付き環境でMetalデバイスが見えない場合も、同じモデルをCPUで検証・実行する。CPU実行はGPU実行より時間がかかる。モデルとtokenizerは固定版・SHA-256を検証して導入する。キャッシュは通常`~/.cache/sae/models/<identity>/`、`XDG_CACHE_HOME`指定時はその配下、`HF_HOME`指定時は`<HF_HOME>/sae/models/<identity>/`となる。`SAE_MODEL_DIR`で重みとtokenizerを置いたディレクトリを明示できる。
+埋め込みは **EmbeddingGemma 2のBF16版（768次元）** を使用し、rerankerは使わない。`SAE_RERANK`は無視する。制限付き環境でMetalデバイスが見えない場合も、同じモデルをCPUで検証・実行する。CPU実行はGPU実行より時間がかかる。モデルとtokenizerは固定版・SHA-256を検証して導入する。キャッシュは通常`~/.cache/sae/models/<identity>/`、`XDG_CACHE_HOME`指定時はその配下、`HF_HOME`指定時は`<HF_HOME>/sae/models/<identity>/`となる。`SAE_MODEL_DIR`で重みとtokenizerを置いたディレクトリを明示できる。
 
 #### 旧索引からの移行
 
@@ -139,7 +137,7 @@ sae model rollback myteam
 
 `model migrate`はSQLiteの整合したローカルコピーを別DBに作り、既存のMarkdownチャンクを埋め込み直す。512チャンクごとにベクトルと本文hashを保存し、中断後は同じコマンドで再開する。モデルmanifest、件数、本文hash、ベクトルの次元・有限値・単位長を検証してから参照先を原子的に切り替える。失敗時は元の索引を選択したままにする。処理中に元の投稿・チャンクが変わった場合も切り替えを拒否する。
 
-元のDBとモデルは削除しない。`sae model rollback myteam`は直前のDBを再選択する。Ruri索引に戻した場合、Gemma版ではFTS検索のみ利用できる。セマンティック検索も戻すには、保存したRuri版バイナリを使う。`rollback`をもう一度実行すると切り替え前の選択へ戻る。索引への更新と移行・復帰は同時実行しない。
+元のDBとモデルは削除しない。`sae model rollback myteam`は直前のDBを再選択する。Ruri索引に戻した場合、Gemma版ではFTS検索のみ利用できる。`rollback`をもう一度実行すると切り替え前の選択へ戻る。索引への更新と移行・復帰は同時実行しない。
 
 ### 同期状態の確認
 
@@ -158,7 +156,7 @@ sae --json status
 
 ## Exit code
 
-[sysexits.h](https://man.openbsd.org/sysexits.3) 慣例に準拠（amici #34 で全 CLI 共通化）。LLM / shell script はこの数値で retry policy を判別できる。
+[sysexits.h](https://man.openbsd.org/sysexits.3) 慣例に準拠。LLM / shell script はこの数値で retry policy を判別できる。
 
 名前列は `--json` の `error.code` 文字列 (sysexits 数値と分離した、agent 向けの安定名)。
 sysexits.h の symbolic name (`EX_USAGE`, `EX_SOFTWARE` 等) は数値の出典であって `error.code` 値とは別。
@@ -172,15 +170,7 @@ sysexits.h の symbolic name (`EX_USAGE`, `EX_SOFTWARE` 等) は数値の出典�
 | 73   | CANT_CREAT     | データ層エラー   | DB open 失敗、ファイル作成不可                           | 状況による  |
 | 74   | IO_ERROR       | I/O エラー       | ファイル読み書き失敗     | 状況による  |
 | 75   | TEMP_FAILURE   | 一時的エラー     | esa API rate limit、ネットワーク障害、model download 一時的失敗 (429, 5xx, timeout)、embedding モデル未インストールで `sae index` / `rebuild` が埋め込み不能 (`EmbedderUnavailable`、`sae model download` で解消) | する  |
-| 104  | UNKNOWN        | 分類不能         | 未型化のランタイムエラー (`anyhow::Error` 経由)、その他の想定外例外。分類済み 70 と区別する ADR-0066 L136 の意図に対応 | しない |
-
-> ⚠️ 破壊的変更（issue #91 / amici #34 migration）: 旧 schema (`1` / `2` / `4`) からの切り替え。スクリプト / CI で specific number に branch している場合は更新が必要。
-
-> ⚠️ 破壊的変更（issue #126 / ADR-0066 Group 2 baseline）: 日付形式不正が 64 → 65、catch-all (`SaeError::Other`) が 70 → 104 に変化。`--json` の `error.code` も同様に `USAGE_ERROR` → `DATA_ERROR`、`INTERNAL` → `UNKNOWN`。
-
-> ⚠️ 破壊的変更（issue #127 / `SaeError::Other` routing audit）: #126 で catch-all が 70 → 104 に動いた一方、以下の 2 種の失敗は **70 (INTERNAL) に分類される** — `sae index` / `sae search` での native backend 不在 (`SaeError::BackendUnavailable`)、`sae index` / `sae search` での embedder invariant 違反 (`SaeError::Internal`、例: batch count mismatch)。`sae model download` 側 (既に 70) と routing を揃え、agent が「ハードウェア / 環境不一致 or プログラム不変条件違反」シグナルとして検知できるようにする。**net 状態**: agent retry policy は `error.code` (= `"INTERNAL"` か `"UNKNOWN"`) で分岐すれば #126 / #127 双方の変更を吸収できる。
-
-> ⚠️ 破壊的変更（issue #136 / esa API 404 reclassify）: esa API が 404 (post not found) を返したときの exit code が `70` → `65`、`--json` の `error.code` が `"INTERNAL"` → `"DATA_ERROR"` に変化。`next_step` に「Verify the post number exists in esa, or run `sae search <keyword>` to find it.」が付くため、agent が「入力 post 番号間違い」と「サーバ起因 5xx」を判別できる。**net 状態**: 404 (入力データ起因) は 65、404 以外の HTTP error (5xx および 401/403/422 等) は 70 のまま。`error.code` で分岐していれば変更は自動吸収される。
+| 104  | UNKNOWN        | 分類不能         | 未型化のランタイムエラー (`anyhow::Error` 経由)、その他の想定外例外 | しない |
 
 ## ログ
 
@@ -192,8 +182,6 @@ sysexits.h の symbolic name (`EX_USAGE`, `EX_SOFTWARE` 等) は数値の出典�
 | 任意指定 | `RUST_LOG=<directives>` | env var の値が完全に default を上書き |
 
 モデル欠損・破損、隔離したモデルプローブの失敗、ベクトル検索の失敗は警告をstderrに出す。検索のFTSフォールバックはJSONの`degraded`と`notes`でも確認できる。
-
-> ⚠️ 破壊的変更（issue #85 / amici #36 migration）: 旧挙動「`RUST_LOG` 設定時も常に `sae=info` を layer」を廃止。`RUST_LOG` 設定時は env 優先、未設定時のみ default を使う。`RUST_LOG=sae=info` を export する運用へ移行が必要な場合は明示指定。
 
 ## 開発
 

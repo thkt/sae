@@ -8,7 +8,6 @@ Feature guards were added to unused `common`/`mtmd` imports, trigger-word helper
 and log variant so the embedding-only build is warning-free; the common-only
 `tensor_split` ownership field has a targeted dead-code annotation in that build.
 These guards do not change the enabled embedding API or inference.
-The same timing-field patch was present in the evaluated backend; it does not change inference.
 Build-only dependency adjustments disable bindgen's unused logging and
 Prettyplease formatter features (the builder keeps its default Rustfmt formatter)
 and make the CUDA discovery helper conditional on the existing CUDA feature.
@@ -19,9 +18,9 @@ Upstream public vocabulary/grammar test fixtures are retained. The adopted Gemma
 weights, private corpus, and evaluation vectors are not included in this directory.
 
 The llama.cpp submodule is fixed to
-`1b70350c92563449576bcbbf552994b1d1ed847d`. This exact pairing was used by the
-EmbeddingGemma 2 comparison in sae. Pinning the pairing prevents a binding
-update from silently replacing the model backend with another submodule revision.
+`1b70350c92563449576bcbbf552994b1d1ed847d`. Pinning the pairing prevents a
+binding update from silently replacing the model backend with another
+submodule revision.
 
 Initialize the source before building:
 
