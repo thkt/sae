@@ -129,7 +129,9 @@ sae model migrate myteam
 sae model rollback myteam
 ```
 
-埋め込みは **EmbeddingGemma 2のBF16版（768次元）** を使用し、rerankerは使わない。`SAE_RERANK`は無視する。制限付き環境でMetalデバイスが見えない場合も、同じモデルをCPUで検証・実行する。CPU実行はGPU実行より時間がかかる。モデルとtokenizerは固定版・SHA-256を検証して導入する。キャッシュは通常`~/.cache/sae/models/<identity>/`、`XDG_CACHE_HOME`指定時はその配下、`HF_HOME`指定時は`<HF_HOME>/sae/models/<identity>/`となる。`SAE_MODEL_DIR`で重みとtokenizerを置いたディレクトリを明示できる。
+埋め込みは **EmbeddingGemma 2のBF16版（768次元）** を使用し、rerankerは使わない。`SAE_RERANK`は無視する。制限付き環境でMetalデバイスが見えない場合も、同じモデルをCPUで検証・実行する。CPU実行はGPU実行より時間がかかる。モデルとtokenizerは固定版・SHA-256を検証して導入する。キャッシュはrecallと共通の`~/.cache/embedding-models/<artifact-sha256>/`を使う。基点は`HF_HOME`、絶対パスの`XDG_CACHE_HOME`、`~/.cache`の順に選ぶ。共通キーはモデルとtokenizerのSHA-256をこの順に改行で区切り、末尾にも改行を付けた文字列のSHA-256で、アプリ固有の索引識別情報は含めない。
+
+旧`sae/models/`・`recall/models/`配下のファイルはchecksum確認後に自動で再利用する。同じファイルシステムではハードリンクで容量を増やさず共有し、ハードリンクを作れない場合は検証付きコピーを使う。旧ファイルは旧版用に残し、同時取得はファイルロックで直列化する。`SAE_MODEL_DIR`で重みとtokenizerを置いたディレクトリを明示すると、そちらを優先し、旧キャッシュの自動取込みは行わない。
 
 #### 旧索引からの移行
 

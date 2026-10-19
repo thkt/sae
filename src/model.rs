@@ -2,7 +2,6 @@ use crate::native::backend_available;
 pub use crate::native::gpu_available;
 use crate::{embedding::Embed, native::Gemma};
 use anyhow::{Context, Result, ensure};
-use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
@@ -16,6 +15,9 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
+
+#[path = "model/cache.rs"]
+mod cache;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -132,40 +134,10 @@ pub fn hash_file(path: &Path) -> Result<String> {
     Ok(digest_hex(&h.finalize()))
 }
 pub fn cache_dir() -> PathBuf {
-    if let Some(p) = env::var_os("SAE_MODEL_DIR") {
-        return p.into();
-    }
-    let base = env::var_os("HF_HOME")
-        .map(PathBuf::from)
-        .map(|p| p.join("sae"))
-        .or_else(|| {
-            env::var_os("XDG_CACHE_HOME")
-                .map(PathBuf::from)
-                .filter(|p| p.is_absolute())
-                .map(|p| p.join("sae"))
-        })
-        .unwrap_or_else(|| {
-            env::var_os("HOME")
-                .map(PathBuf::from)
-                .unwrap_or_default()
-                .join(".cache/sae")
-        });
-    base.join("models").join(selected().identity())
+    cache::cache_dir("sae", selected())
 }
 pub fn cached_artifacts() -> Result<Option<PathBuf>> {
-    let root = cache_dir();
-    if !root.join("model.gguf").is_file() || !root.join("tokenizer.json").is_file() {
-        return Ok(None);
-    }
-    ensure!(
-        hash_file(&root.join("model.gguf"))? == selected().model_sha256,
-        "model checksum mismatch"
-    );
-    ensure!(
-        hash_file(&root.join("tokenizer.json"))? == selected().tokenizer_sha256,
-        "tokenizer checksum mismatch"
-    );
-    Ok(Some(root))
+    cache::cached_artifacts("sae", selected(), &cache_dir())
 }
 pub fn load_verified() -> Result<Arc<dyn Embed>> {
     let root = cached_artifacts()?.context("model not installed")?;
@@ -360,35 +332,13 @@ pub fn download_model_artifacts() -> Result<(), ModelDownloadError> {
     selected()
         .validate()
         .map_err(|error| ModelDownloadError::DownloadFailed(error.to_string()))?;
-    download_artifacts_at(&cache_dir(), selected())
+    cache::download_artifacts("sae", selected(), &cache_dir())
         .map_err(|error| ModelDownloadError::DownloadFailed(error.to_string()))
 }
 
+#[cfg(test)]
 fn download_artifacts_at(root: &Path, spec: &ModelSpec) -> Result<()> {
-    fs::create_dir_all(root)?;
-    let client = Client::builder()
-        .timeout(Duration::from_secs(600))
-        .build()?;
-    for (name, url, expected) in [
-        ("model.gguf", &spec.model_url, &spec.model_sha256),
-        (
-            "tokenizer.json",
-            &spec.tokenizer_url,
-            &spec.tokenizer_sha256,
-        ),
-    ] {
-        let destination = root.join(name);
-        if destination.exists() && hash_file(&destination)? == *expected {
-            continue;
-        }
-        install_artifact(
-            root,
-            name,
-            expected,
-            &mut client.get(url).send()?.error_for_status()?,
-        )?;
-    }
-    Ok(())
+    cache::download_artifacts_at(root, spec, &[])
 }
 
 fn verify_download(run: impl FnOnce() -> Result<bool>) -> Result<(), ModelDownloadError> {
@@ -561,7 +511,7 @@ mod tests {
     fn cache_location_precedence_is_isolated_from_other_tests() {
         let dir = tempdir().unwrap();
         let root = dir.path();
-        let identity = super::selected().identity();
+        let identity = super::cache::artifact_identity(super::selected());
         for (model, hf, xdg, home, expected) in [
             (
                 Some("explicit"),
@@ -575,28 +525,28 @@ mod tests {
                 Some("hf"),
                 Some("xdg"),
                 Some("home"),
-                root.join("hf/sae/models").join(&identity),
+                root.join("hf/embedding-models").join(&identity),
             ),
             (
                 None,
                 None,
                 Some("xdg"),
                 Some("home"),
-                root.join("xdg/sae/models").join(&identity),
+                root.join("xdg/embedding-models").join(&identity),
             ),
             (
                 None,
                 None,
                 Some("relative"),
                 Some("home"),
-                root.join("home/.cache/sae/models").join(&identity),
+                root.join("home/.cache/embedding-models").join(&identity),
             ),
             (
                 None,
                 None,
                 None,
                 None,
-                PathBuf::from(".cache/sae/models").join(&identity),
+                PathBuf::from(".cache/embedding-models").join(&identity),
             ),
         ] {
             let mut command = child_test("model::tests::cache_path_child");
@@ -798,7 +748,7 @@ mod tests {
             fs::read(cache.join("tokenizer.json")).unwrap(),
             b"verified tokenizer"
         );
-        assert_eq!(fs::read_dir(cache).unwrap().count(), 2);
+        assert_eq!(fs::read_dir(cache).unwrap().count(), 3);
     }
 
     #[test]
@@ -820,8 +770,8 @@ mod tests {
             assert!(!dir.path().join("tokenizer.json").exists());
             assert_eq!(
                 fs::read_dir(dir.path()).unwrap().count(),
-                1,
-                "no incomplete files survive"
+                2,
+                "only the retained model and persistent install lock survive"
             );
         }
     }
